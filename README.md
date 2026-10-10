@@ -6,9 +6,9 @@ Archive Scout 1.0.5 is the fast-indexing and flat-media release. Automatic index
 
 ## Downloads
 
-- [Download for Windows x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-Windows-x64.zip)
-- [Download for Linux x64](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-Linux-x64.zip)
-- [Download for macOS Intel and Apple Silicon](https://github.com/DearStrike4940/archive-scout/releases/download/v1.0.5/ArchiveScout-macOS-Universal.zip)
+- [Download for Windows x64](https://github.com/Memory-of-Time/archive-scout-testing/releases/download/latest/ArchiveScout-Windows-x64.zip)
+- [Download for Linux x64](https://github.com/Memory-of-Time/archive-scout-testing/releases/download/latest/ArchiveScout-Linux-x64.zip)
+- [Download for macOS Intel and Apple Silicon](https://github.com/Memory-of-Time/archive-scout-testing/releases/download/latest/ArchiveScout-macOS-Universal.zip)
 
 ## Core workflow
 
