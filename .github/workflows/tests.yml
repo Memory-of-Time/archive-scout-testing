@@ -57,10 +57,12 @@ jobs:
 
       - name: Verify imports and package metadata
         run: >-
-          python -c "import importlib.metadata, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
+          python -c "import importlib.metadata, pathlib, tomllib, archive_scout, archive_scout.app, archive_scout.cli, ahocorasick_rs;
           from selectolax.lexbor import LexborHTMLParser;
-          assert importlib.metadata.version('archive-scout') == '1.0.4';
-          print('Archive Scout native accelerator imports and metadata checks passed')"
+          expected = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))['project']['version'];
+          actual = importlib.metadata.version('archive-scout');
+          assert actual == expected, f'Installed version {actual!r} differs from project version {expected!r}';
+          print(f'Archive Scout {actual}: imports and package metadata checks passed')"
 
       - name: Run tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
