@@ -257,7 +257,7 @@ class ProjectConfig:
     minimum_score: int = 1
     max_file_mb: float = 25.0
     page_size: int = 100000
-    cdx_delay: float = 0.75
+    cdx_delay: float = 0.4  # 2.5 indexing requests/second; minimum 0.4s between starts
     download_delay: float = 0.125
     retries: int = 4
     rate_limit_base_pause: float = 30.0
@@ -437,7 +437,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     research_payload = payload.get("research") or {}
     network_payload = payload.get("network") or {}
     loaded_page_size = int(payload.get("page_size", 100000))
-    loaded_cdx_delay = float(payload.get("cdx_delay", 0.75))
+    loaded_cdx_delay = float(payload.get("cdx_delay", 0.4))
     loaded_page_blocks = int(network_payload.get("page_blocks", 0))
     loaded_cdx_workers = int(network_payload.get("cdx_workers", 10))
     loaded_workers = int(payload.get("workers", 10))
