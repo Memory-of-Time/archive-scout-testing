@@ -672,8 +672,7 @@ class HttpClient:
         return self.get_cdx_any(urls, params, max_bytes=max_bytes, prefer_text=False)
 
     def retry_wait(self, attempt: int, reason: str, retry_after: float | None = None) -> None:
-        base = max(float(retry_after or 0), min(120.0, 2**attempt))
-        wait_seconds = base * random.uniform(0.85, 1.2)
+        wait_seconds = max(float(retry_after or 0), min(2.0, 0.25 * (attempt + 1)))
         if self.retry_callback:
             self.retry_callback(attempt + 2, self.retries, reason, wait_seconds)
         self.stop_event.wait(wait_seconds)
@@ -775,23 +774,20 @@ def parse_cdx_rows_payload(payload: object) -> CDXRows:
             return ""
         return str(item[index] if item[index] is not None else "")
 
+    if len(positions) != len(header):
+        raise MalformedCDXResponse("CDX response contains duplicate header fields", splittable=True)
     rows: list[CDXRow] = []
     for item in body:
         if not isinstance(item, list) or len(item) != len(header):
-            continue
+            raise MalformedCDXResponse("incomplete CDX JSON row; page not accepted", splittable=True)
         timestamp = value(item, "timestamp")
         original = value(item, "original")
-        if timestamp and original:
-            rows.append(
-                (
-                    timestamp,
-                    original,
-                    value(item, "mimetype"),
-                    value(item, "statuscode"),
-                    value(item, "digest"),
-                    value(item, "length"),
-                )
-            )
+        if not timestamp or not original:
+            raise MalformedCDXResponse("CDX row has no timestamp/original; page not accepted", splittable=True)
+        rows.append((
+            timestamp, original, value(item, "mimetype"),
+            value(item, "statuscode"), value(item, "digest"), value(item, "length"),
+        ))
     return CDXRows(rows, resume_key)
 
 

@@ -55,7 +55,7 @@ from ..projects.backups import list_project_backups, restore_project_backup
 from .dashboard import read_dashboard_counts
 from .event_queue import CoalescingEventQueue
 from .theme import REVIEW_COLORS, apply_text_theme, apply_theme
-from .widgets import ToolTip
+from .widgets import ToolTip, ScrollablePage, WheelRouter
 
 MODE_LABELS = OPERATION_MODES
 MODE_HELP = {
@@ -148,6 +148,7 @@ class ArchiveScoutApp(tk.Tk):
         self.create_variables()
         self.resolved_theme, self.colors = apply_theme(self, self.theme_var.get(), float(self.font_scale_var.get()))
         self.create_ui()
+        WheelRouter.ensure(self)
         first_run = not self.state_path().exists()
         self.load_app_state()
         self.apply_interface_theme()
@@ -187,10 +188,10 @@ class ArchiveScoutApp(tk.Tk):
         self.workers_var = tk.StringVar(value="10")
         self.max_file_var = tk.StringVar(value="25")
         self.minimum_score_var = tk.StringVar(value="1")
-        self.cdx_delay_var = tk.StringVar(value="0.4")
+        self.cdx_delay_var = tk.StringVar(value="2.5")
         self.download_delay_var = tk.StringVar(value="0.125")
-        self.rate_limit_base_var = tk.StringVar(value="30")
-        self.rate_limit_max_var = tk.StringVar(value="300")
+        self.rate_limit_base_var = tk.StringVar(value="5")
+        self.rate_limit_max_var = tk.StringVar(value="5")
         self.rate_limit_wait_var = tk.StringVar(value="15")
         self.status_var = tk.StringVar(value="Ready")
         self.progress_var = tk.DoubleVar(value=0)
@@ -246,7 +247,7 @@ class ArchiveScoutApp(tk.Tk):
         self.ai_excerpt_chars_var = tk.StringVar(value="5000")
         self.research_query_var = tk.StringVar()
         self.research_backend_var = tk.StringVar(value="local-hash")
-        self.research_auto_var = tk.BooleanVar(value=True)
+        self.research_auto_var = tk.BooleanVar(value=False)
         self.research_limit_var = tk.StringVar(value="100")
         self.error_category_var = tk.StringVar(value="All")
         self.forum_profile_var = tk.StringVar(value="auto")
@@ -313,6 +314,7 @@ class ArchiveScoutApp(tk.Tk):
         self.create_keywords_tab()
         self.create_cdx_tab()
         self.create_media_tab()
+        self.create_reports_tab()
         self.create_analysis_tab()
         self.create_settings_tab()
         self.create_results_tab()
@@ -342,10 +344,11 @@ class ArchiveScoutApp(tk.Tk):
         self.bind_shortcuts()
 
     def create_dashboard_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=16)
+        page = ScrollablePage(self.notebook, padding=16, horizontal=True)
+        tab = page.body
         tab.columnconfigure((0, 1, 2, 3), weight=1)
         tab.rowconfigure(3, weight=1)
-        self.notebook.add(tab, text="Dashboard")
+        self.notebook.add(page, text="Dashboard")
         ttk.Label(tab, text="Project dashboard", style="Section.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Label(tab, textvariable=self.dashboard_project_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 12))
         cards = (
@@ -380,7 +383,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(quick, text=quick_text, justify="left", wraplength=430).pack(anchor="nw")
         ttk.Button(quick, text="Go to Sites and paths", command=lambda: self.show_page("Sites and paths")).pack(anchor="w", pady=(14, 4))
         ttk.Button(quick, text="Go to Network settings", command=lambda: self.show_page("Settings")).pack(anchor="w", pady=4)
-        self.dashboard_tab = tab
+        self.dashboard_tab = page
 
     def bind_shortcuts(self) -> None:
         modifier = "Command" if sys.platform == "darwin" else "Control"
@@ -392,7 +395,7 @@ class ArchiveScoutApp(tk.Tk):
         self.bind_all(f"<{modifier}-f>", lambda _e: self.show_page("Results and search"))
 
     def refresh_navigation(self) -> None:
-        allowed_simple = {"Dashboard", "Sites and paths", "Keyword sets", "Results and search", "AI relevance", "Research intelligence", "Errors", "Activity"}
+        allowed_simple = {"Dashboard", "Sites and paths", "Keyword sets", "Reports", "Results and search", "AI relevance", "Research intelligence", "Errors", "Activity"}
         for button in self.nav_buttons.values():
             button.destroy()
         self.nav_buttons.clear()
@@ -501,10 +504,11 @@ class ArchiveScoutApp(tk.Tk):
             messagebox.showerror(APP_NAME, f"Could not restore backup:\n{exc}")
 
     def create_targets_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
-        self.notebook.add(tab, text="Sites and paths")
+        self.notebook.add(page, text="Sites and paths")
         ttk.Label(tab, text="One Wayback target per line. Examples: example.com/* or forum.example.com/path/*").grid(row=0, column=0, sticky="w", pady=(0, 6))
         self.targets_text = tk.Text(tab, wrap="none", undo=True, font="TkFixedFont")
         self.targets_text.grid(row=1, column=0, sticky="nsew")
@@ -565,10 +569,11 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(buttons, text="Save", command=save, style="Accent.TButton").pack(side="left", padx=4)
 
     def create_keywords_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(2, weight=1)
-        self.notebook.add(tab, text="Keyword sets")
+        self.notebook.add(page, text="Keyword sets")
         controls = ttk.Frame(tab)
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         controls.columnconfigure(1, weight=1)
@@ -594,10 +599,11 @@ class ArchiveScoutApp(tk.Tk):
         self.keywords_text.configure(yscrollcommand=scroll.set)
 
     def create_cdx_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=12)
+        page = ScrollablePage(self.notebook, padding=12, horizontal=True)
+        tab = page.body
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(6, weight=1)
-        self.notebook.add(tab, text="CDX options")
+        self.notebook.add(page, text="CDX options")
         ttk.Label(tab, text="Start date:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(tab, textvariable=self.from_date_var, width=22).grid(row=0, column=1, sticky="w", padx=(10, 0), pady=4)
         ttk.Label(tab, text="End date:").grid(row=1, column=0, sticky="w", pady=4)
@@ -625,11 +631,12 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(tab, text="Preview CDX request", command=self.preview_cdx).grid(row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def create_media_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(3, weight=1)
-        self.notebook.add(tab, text="Media")
+        self.notebook.add(page, text="Media")
         options = ttk.Frame(tab)
         options.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Checkbutton(options, text="Also download media during a full text run", variable=self.media_enabled_var).grid(row=0, column=0, sticky="w")
@@ -675,12 +682,30 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(settings, text="Media layout: media/images and media/videos (flat)").grid(row=0, column=4, sticky="w")
 
 
+    def create_reports_tab(self) -> None:
+        """Reports workspace: no automatic enrichment or extra database scans."""
+        page = ScrollablePage(self.notebook, padding=16, horizontal=True)
+        body = page.body
+        body.columnconfigure(0, weight=1)
+        self.notebook.add(page, text="Reports")
+        ttk.Label(body, text="Reports", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="Indexed URL reports are written after index-only runs. Text match reports require a scan.",
+                  wraplength=640, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 10))
+        actions = ttk.Frame(body)
+        actions.grid(row=2, column=0, sticky="w")
+        ttk.Button(actions, text="Open reports folder", command=self.open_reports).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Regenerate current reports", command=lambda: self.start(self.build_config(require_keywords=False), "report")).pack(side="left")
+        ttk.Label(body, text="Heavy Research Intelligence and archive analysis remain separately initiated operations.",
+                  wraplength=640, style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        self.reports_tab = page
+
     def create_analysis_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(3, weight=1)
-        self.notebook.add(tab, text="Archive analysis")
+        self.notebook.add(page, text="Archive analysis")
 
         top = ttk.Frame(tab)
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
@@ -742,17 +767,18 @@ class ArchiveScoutApp(tk.Tk):
             self.analysis_merge_source_var.set(selected)
 
     def create_settings_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=14)
+        page = ScrollablePage(self.notebook, padding=14, horizontal=True)
+        tab = page.body
         tab.columnconfigure(1, weight=1)
         tab.columnconfigure(3, weight=1)
-        self.notebook.add(tab, text="Settings")
+        self.notebook.add(page, text="Settings")
 
         ttk.Label(tab, text="Performance", style="Section.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         performance = [
             ("Download workers (10 = fast default)", self.workers_var),
             ("Maximum text-page size (MB)", self.max_file_var),
             ("Minimum report score", self.minimum_score_var),
-            ("CDX request spacing (0.4 = 2.5/sec)", self.cdx_delay_var),
+            ("CDX request spacing (seconds)", self.cdx_delay_var),
             ("Download request spacing (0.125 = 8/sec)", self.download_delay_var),
             ("429/503 initial shared pause (seconds)", self.rate_limit_base_var),
             ("429/503 maximum shared pause (seconds)", self.rate_limit_max_var),
@@ -813,10 +839,11 @@ class ArchiveScoutApp(tk.Tk):
             self.import_source_var.set(selected)
 
     def create_results_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=8)
+        page = ScrollablePage(self.notebook, padding=8, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(2, weight=1)
-        self.notebook.add(tab, text="Results and search")
+        self.notebook.add(page, text="Results and search")
         filters = ttk.Frame(tab)
         filters.grid(row=0, column=0, sticky="ew")
         filters.columnconfigure(1, weight=1)
@@ -887,10 +914,11 @@ class ArchiveScoutApp(tk.Tk):
         pane.add(bottom, weight=1)
 
     def create_ai_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(4, weight=1)
-        self.notebook.add(tab, text="AI relevance")
+        self.notebook.add(page, text="AI relevance")
 
         ttk.Label(tab, text="AI relevance review", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
@@ -980,10 +1008,11 @@ class ArchiveScoutApp(tk.Tk):
         pane.add(bottom, weight=1)
 
     def create_research_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(4, weight=1)
-        self.notebook.add(tab, text="Research intelligence")
+        self.notebook.add(page, text="Research intelligence")
         ttk.Label(tab, text="Research Intelligence", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             tab,
@@ -1042,10 +1071,11 @@ class ArchiveScoutApp(tk.Tk):
         pane.add(bottom, weight=1)
 
     def create_history_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=8)
+        page = ScrollablePage(self.notebook, padding=8, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        self.notebook.add(tab, text="Scan history")
+        self.notebook.add(page, text="Scan history")
         columns = ("id", "set", "status", "started", "documents", "matches", "seconds", "operation")
         self.history_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="extended")
         for column in columns:
@@ -1061,11 +1091,12 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(buttons, text="Compare two scans", command=self.compare_selected_scans).grid(row=0, column=4, padx=2)
 
     def create_errors_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=8)
+        page = ScrollablePage(self.notebook, padding=8, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=2)
         tab.rowconfigure(3, weight=1)
-        self.notebook.add(tab, text="Errors")
+        self.notebook.add(page, text="Errors")
 
         controls = ttk.Frame(tab)
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -1102,10 +1133,11 @@ class ArchiveScoutApp(tk.Tk):
 
 
     def create_activity_tab(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
+        page = ScrollablePage(self.notebook, padding=10, horizontal=True)
+        tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        self.notebook.add(tab, text="Activity")
+        self.notebook.add(page, text="Activity")
         self.log_text = tk.Text(tab, wrap="word", state="disabled", font="TkFixedFont")
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(tab, orient="vertical", command=self.log_text.yview)

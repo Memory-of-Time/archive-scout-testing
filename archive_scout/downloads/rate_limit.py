@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-import random
+import random  # retained for historical mock compatibility; no adaptive jitter applied
 import threading
 import time
 from dataclasses import dataclass
@@ -87,8 +87,8 @@ class SharedHostGate:
 
     def __init__(
         self,
-        base_pause: float = 30.0,
-        max_pause: float = 300.0,
+        base_pause: float = 5.0,
+        max_pause: float = 5.0,
         coalesce_seconds: float = 2.0,
         decay_seconds: float = 300.0,
     ) -> None:
@@ -176,9 +176,8 @@ class SharedHostGate:
             if retry_after is not None and retry_after > 0:
                 pause = max(1.0, float(retry_after))
             else:
-                exponent = max(0, min(self.incidents - 1, 4))
-                pause = min(self.max_pause, self.base_pause * (2**exponent))
-                pause *= random.uniform(0.9, 1.1)
+                # Constant response-side fallback, not a learned/adaptive pause.
+                pause = self.base_pause
 
             self.blocked_until = max(self.blocked_until, now + pause)
             self.reason = reason

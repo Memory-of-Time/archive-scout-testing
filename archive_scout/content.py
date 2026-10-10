@@ -82,59 +82,102 @@ def title_from_html(raw: str) -> str:
 
 
 def decode_bytes(data: bytes, content_type: str = "") -> str:
+    """Decode text once, respecting BOM and declared legacy/wide encodings."""
+    for bom, encoding in (
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+        (b"\xff\xfe\x00\x00", "utf-32"),
+        (b"\x00\x00\xfe\xff", "utf-32"),
+        (b"\xff\xfe", "utf-16"),
+        (b"\xfe\xff", "utf-16"),
+    ):
+        if data.startswith(bom):
+            return data.decode(encoding)
     candidates: list[str] = []
-    charset_match = CHARSET_PATTERN.search(content_type)
-    if charset_match:
-        candidates.append(charset_match.group(1))
+    match = CHARSET_PATTERN.search(content_type)
+    if match:
+        candidates.append(match.group(1))
     head = data[:4096].decode("ascii", "ignore")
-    meta_match = CHARSET_PATTERN.search(head)
-    if meta_match:
-        candidates.append(meta_match.group(1))
+    match = CHARSET_PATTERN.search(head)
+    if match:
+        candidates.append(match.group(1))
     candidates.extend(["utf-8", "windows-1252", "latin-1"])
     for encoding in dict.fromkeys(candidates):
         try:
             return data.decode(encoding)
-        except (LookupError, UnicodeDecodeError):
+        except (LookupError, UnicodeError):
             continue
     return data.decode("utf-8", "replace")
 
 
-def looks_textual_bytes(data: bytes, content_type: str = "") -> bool:
-    mime = (content_type or "").split(";", 1)[0].lower()
-    if mime.startswith("text/") or any(token in mime for token in ("html", "xml", "json", "javascript")):
+def _binary_signature(data: bytes) -> bool:
+    """Detect unambiguous binary structures; avoid two-byte BM/ID3 false positives."""
+    if data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"%PDF-", b"PK\x03\x04", b"\x1f\x8b\x08")):
         return True
-    if mime.startswith(("image/", "audio/", "video/", "font/")):
-        return False
-    if b"\x00" in data[:4096]:
-        return False
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] in {b"WEBP", b"WAVE", b"AVI "}:
+        return True
+    if len(data) >= 26 and data.startswith(b"BM"):
+        file_size = int.from_bytes(data[2:6], "little")
+        pixel_offset = int.from_bytes(data[10:14], "little")
+        dib_header = int.from_bytes(data[14:18], "little")
+        if dib_header in {12, 40, 52, 56, 64, 108, 124} and 14 + dib_header <= pixel_offset <= file_size:
+            return True
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return True
+    if len(data) >= 10 and data.startswith(b"ID3") and data[3] <= 4 and all(b < 128 for b in data[6:10]):
+        return True
+    if data.startswith((b"OggS\x00", b"fLaC", b"\x1a\x45\xdf\xa3", b"\x7fELF", b"MZ\x90\x00")):
+        return True
+    return False
+
+
+def looks_textual_bytes(data: bytes, content_type: str = "") -> bool:
+    """Require plausible decoded text even for a misleading text/* declaration."""
     if not data:
         return True
-    sample = data[:4096]
+    sample = data[:8192]
+    if _binary_signature(sample):
+        return False
+    mime = (content_type or "").split(";", 1)[0].strip().casefold()
+    if mime.startswith(("image/", "audio/", "video/", "font/")):
+        return False
+    if sample.startswith((b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff", b"\x00\x00\xfe\xff")):
+        try:
+            decoded = decode_bytes(data[:min(len(data), 16384)], content_type)
+            return sum(ord(ch) < 9 or 13 < ord(ch) < 32 for ch in decoded[:4096]) / max(1, len(decoded[:4096])) < 0.04
+        except UnicodeError:
+            return False
+    # UTF-16/32 without BOM is accepted only with an explicit supported charset.
+    declared = CHARSET_PATTERN.search(content_type)
+    if declared and declared.group(1).casefold().replace("_", "-").startswith(("utf-16", "utf-32")):
+        try:
+            decoded = sample.decode(declared.group(1))
+            return "\ufffd" not in decoded and sum(ord(ch) < 9 or 13 < ord(ch) < 32 for ch in decoded) / max(1, len(decoded)) < .04
+        except (LookupError, UnicodeError):
+            return False
+    if b"\x00" in sample:
+        return False
     control = sum(byte < 9 or 13 < byte < 32 for byte in sample)
-    return control / len(sample) < 0.05
+    return control / len(sample) < 0.04
 
 
 def is_text_candidate(url: str, mimetype: str = "") -> bool:
     parsed = safe_urlsplit(url)
-    if parsed:
-        filename = parsed.path.rsplit("/", 1)[-1]
-        dot = filename.rfind(".")
-        extension = filename[dot:].lower() if dot > 0 else ""
-    else:
-        extension = ""
-    mime = (mimetype or "").split(";", 1)[0].lower()
+    filename = parsed.path.rsplit("/", 1)[-1] if parsed else ""
+    filename = urllib.parse.unquote(filename)
+    extension = filename[filename.rfind("."):].casefold() if "." in filename else ""
+    mime = (mimetype or "").split(";", 1)[0].strip().casefold()
+    # Strong MIME evidence can override a misleading file extension.
+    if mime.startswith("text/") or mime in {"application/json", "application/javascript", "application/xml", "application/xhtml+xml", "application/ld+json", "image/svg+xml"}:
+        return True
+    if mime.startswith(("image/", "audio/", "video/", "font/")):
+        return False
     if extension in TEXT_EXTENSIONS:
         return True
     if extension in BINARY_EXTENSIONS:
         return False
-    if mime.startswith("text/") or any(token in mime for token in ("html", "xml", "json", "javascript")):
-        return True
-    if mime.startswith(("image/", "audio/", "video/", "font/")):
-        return False
-    if any(token in mime for token in ("zip", "rar", "gzip", "pdf", "octet-stream", "shockwave", "msword")):
+    if mime in {"application/pdf", "application/zip", "application/octet-stream"}:
         return False
     return True
-
 
 def parse_page(raw: str, original: str) -> tuple[str, str, list[str]]:
     links: set[str] = set()

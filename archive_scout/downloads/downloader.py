@@ -21,7 +21,7 @@ from ..site_status import host_from_url, should_surface_site_issue, site_issue_m
 from ..scanning.jobs import ScanJob
 from ..scanning.keywords import compile_prefilter
 from ..scanning.scoring import analyze_content, prepare_analysis_fields
-from ..utils import atomic_write_text, hash_text, normalize_search, utc_now
+from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
 
@@ -226,7 +226,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
         for job in jobs
     }
     path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
-    atomic_write_text(path, raw)
+    atomic_write_bytes(path, bytes(data))
     return {
         "capture_id": int(row["id"]),
         "path": path,
@@ -234,7 +234,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
         "visible": visible,
         "links": links,
         "analyses": analyses,
-        "content_hash": hash_text(raw),
+        "content_hash": hashlib.sha256(bytes(data)).hexdigest(),
         "normalized_hash": hash_text(prepared_normalized_fields["body"]),
         "bytes_saved": len(data),
         "http_status": response["status"],
@@ -329,7 +329,7 @@ def download_archive(
         trust_environment=config.network.normalized().trust_environment,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
     )
-    completed = matched = failures = 0
+    completed = matched = failures = saved_this_pass = 0
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     try:
@@ -372,6 +372,7 @@ def download_archive(
                     try:
                         result = future.result()
                         save_success(database, result)
+                        saved_this_pass += 1
                         matched += int(any(
                             int(analysis.get("score") or 0) >= config.minimum_score
                             and not analysis.get("excluded") and not analysis.get("required_missing")
@@ -427,20 +428,22 @@ def download_archive(
                             callback(ProgressEvent("site_issue", issue_message))
                     completed += 1
                     elapsed = max(0.001, time.monotonic() - started)
-                    rate = completed / elapsed
+                    rate = saved_this_pass / elapsed
                     cumulative_completed = min(cumulative_total, completed_before + completed)
                     if callback:
                         callback(
                             ProgressEvent(
                                 "download",
-                                f"Downloaded/scanned {cumulative_completed:,}/{cumulative_total:,}; "
-                                f"this pass {completed:,}/{total:,}; matches {matched:,}; errors {failures:,}; {rate:.1f}/s",
+                                f"Processed {cumulative_completed:,}/{cumulative_total:,}; "
+                                f"this pass {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
+                                f"matches {matched:,}; errors {failures:,}; successful saves {rate:.1f}/s",
                                 cumulative_completed,
                                 cumulative_total,
                                 {
                                     "matched": matched,
                                     "failures": failures,
                                     "rate": rate,
+                                    "new_saves": saved_this_pass,
                                 },
                             )
                         )

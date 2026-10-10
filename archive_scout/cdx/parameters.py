@@ -94,13 +94,16 @@ def parse_cdx(payload: object) -> tuple[list[dict[str, str]], str | None]:
     if len(body) >= 2 and body[-2] == [] and isinstance(body[-1], list) and len(body[-1]) == 1:
         resume = str(body[-1][0])
         body = body[:-2]
+    if len(header) != len(set(map(str, header))) or not {"timestamp", "original"}.issubset(set(header)):
+        raise RuntimeError("CDX response is missing required fields or has duplicate headers")
     rows: list[dict[str, str]] = []
     for item in body:
-        if not item or not isinstance(item, list) or len(item) != len(header):
-            continue
+        if not isinstance(item, list) or len(item) != len(header):
+            raise RuntimeError("incomplete CDX response row; refusing partial inventory")
         row = dict(zip(header, item))
-        if row.get("timestamp") and row.get("original"):
-            rows.append(row)
+        if not row.get("timestamp") or not row.get("original"):
+            raise RuntimeError("CDX row has no capture timestamp or original URL")
+        rows.append(row)
     return rows, resume
 
 

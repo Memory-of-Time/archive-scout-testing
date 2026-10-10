@@ -133,6 +133,21 @@ def atomic_text_writer(path: Path):
             os.unlink(temp_name)
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Publish complete bytes atomically; never expose truncated successful captures."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     with atomic_text_writer(path) as handle:
         handle.write(text)

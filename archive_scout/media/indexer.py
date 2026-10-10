@@ -3,7 +3,6 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
-import random
 import re
 import sqlite3
 import threading
@@ -52,7 +51,7 @@ from ..database.repositories import (
 )
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
 from ..downloads.validation import classify_exception
-from ..events import ConnectivityPaused, ProgressEvent, Stopped
+from ..events import ProgressEvent, Stopped
 from ..utils import json_value, parse_cdx_parameter_lines, utc_now
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from .discovery import discover_media, hosts_related, safe_document_text, target_hosts
@@ -361,9 +360,8 @@ def _reuse_completed_main_index(
 
 
 def _wait_seconds(config: ProjectConfig, failures: int) -> float:
-    network = config.network.normalized()
-    base = min(network.retry_max_seconds, network.retry_base_seconds * 2 ** min(max(0, failures - 1), 6))
-    return base * random.uniform(0.85, 1.15)
+    """Fixed interruptible wait after failed media CDX, not adaptive pacing."""
+    return min(5.0, config.network.normalized().retry_base_seconds)
 
 
 def _defer_media_window(
@@ -404,23 +402,12 @@ def _defer_media_window(
         if len(plan.pending) > 1:
             plan.pending.append(plan.pending.pop(0))
         _save_media_state(database, target_id, year, signature, encode_plan(plan), False, seen, error_id)
-    network = config.network.normalized()
-    threshold = network.failure_pause_threshold
-    if plan.pending and all(item.failures >= threshold for item in plan.pending):
-        raise ConnectivityPaused(
-            "Wayback could not answer any remaining combined-media index window. "
-            "The exact media queue was saved and can be continued with Resume."
-        ) from exc
+    # Failed windows remain saved, and other windows stay eligible. Do not
+    # require a manual Resume when a remote connection is temporarily down.
     if len(plan.pending) > 1:
         if callback:
             callback(ProgressEvent("media_index", "Deferred one unresponsive combined-media window behind the remaining queue; it will retry automatically.", completed, total))
         return error_id
-    if not network.persistent_retries and current.failures >= max(3, config.retries):
-        raise ConnectivityPaused(f"media indexing retry limit reached; progress was saved: {exc}") from exc
-    if current.failures >= threshold:
-        raise ConnectivityPaused(
-            f"Wayback remained unreachable for this media window after {current.failures} recovery cycles. Progress was saved."
-        ) from exc
     wait = _wait_seconds(config, current.failures)
     if callback:
         callback(ProgressEvent("media_index", f"Wayback is temporarily unavailable. Media indexing remains active and retries in {wait:.1f}s.", completed, total))
@@ -866,18 +853,15 @@ def index_direct_media(
                             retryable=True,
                         )
                         _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
-                    if connection_failure_streak >= network.connection_failure_pause_threshold:
-                        raise ConnectivityPaused(
-                            f"Archive Scout could not establish a Wayback connection for media indexing after "
-                            f"{connection_failure_streak} complete multi-backend attempts. The exact queue was saved."
-                        ) from exc
-                    wait = min(15.0, network.connection_retry_seconds * 2 ** max(0, connection_failure_streak - 1))
+                    # The transport already tried the available backends;
+                    # preserve the queue and retry automatically until Stop.
+                    wait = min(5.0, network.connection_retry_seconds)
                     if callback:
                         callback(
                             ProgressEvent(
                                 "network",
                                 f"Wayback connection setup failed. Retrying the same saved media request in {wait:.1f}s "
-                                f"({connection_failure_streak}/{network.connection_failure_pause_threshold})…",
+                                f"(failed attempts: {connection_failure_streak})…",
                                 completed,
                                 total,
                             )
@@ -889,25 +873,6 @@ def index_direct_media(
                 if isinstance(exc, TransientRequestError):
                     transient_failure_streak += 1
                     network = target_config.network.normalized()
-                    no_progress_limit = min(
-                        network.failure_pause_threshold,
-                        4 if exc.timed_out else 6,
-                    )
-                    if transient_failure_streak >= no_progress_limit:
-                        current.failures += 1
-                        with database:
-                            error_id = record_error(
-                                database,
-                                "media_index",
-                                "transient_media_index_delay",
-                                f"{target} {label}: {transient_failure_streak} consecutive transient CDX failures without a successful response: {exc}",
-                                retryable=True,
-                            )
-                            _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
-                        raise ConnectivityPaused(
-                            f"Wayback returned no usable media CDX response after {transient_failure_streak} consecutive recovery attempts. "
-                            "The exact media queue was saved instead of looping indefinitely."
-                        ) from exc
                 if current.strategy == "paged" and current.page_count < 0:
                     current.strategy = "resume"
                     current.pagination_supported = False

@@ -92,6 +92,50 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
     return paths
 
 
+def recover_transient_text_errors(
+    config: ProjectConfig,
+    database: sqlite3.Connection,
+    scan_run_id: int,
+    jobs: list[ScanJob],
+    stop_event: threading.Event,
+    callback: Callable[[ProgressEvent], None] | None,
+) -> None:
+    """Keep transient replay errors eligible without resetting successful captures.
+
+    Only failed captures from the current query are reconsidered. Work is
+    selected in small database batches, and old successful bodies are never
+    redownloaded. Permanent 404/policy/content errors stay recorded rather
+    than entering an infinite request loop.
+    """
+    from .cdx.parameters import cdx_query_signature
+    from .events import Stopped
+    signature = cdx_query_signature(config)
+    while not stop_event.is_set():
+        rows = database.execute(
+            """SELECT DISTINCT c.id FROM captures c
+               WHERE c.query_signature=? AND c.state='error'
+                 AND EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
+                             AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
+               ORDER BY c.id LIMIT 1000""", (signature,),
+        ).fetchall()
+        if not rows:
+            return
+        ids = [int(row[0]) for row in rows]
+        pending_before = len(ids)
+        emit(callback, ProgressEvent("download_retry", f"Automatically retrying {pending_before:,} temporary replay failures"))
+        download_archive(config, database, scan_run_id, stop_event, callback,
+                         states=("error",), capture_ids=ids, scan_jobs=jobs)
+        remaining = int(database.execute(
+            """SELECT COUNT(*) FROM captures c WHERE c.id IN (
+                SELECT e.capture_id FROM errors e WHERE e.resolved=0
+                  AND e.ignored=0 AND e.retryable=1 AND e.capture_id IS NOT NULL)
+               AND c.query_signature=? AND c.state='error'""", (signature,),
+        ).fetchone()[0])
+        if remaining and stop_event.wait(1.0):
+            raise Stopped
+    raise Stopped
+
+
 def run_project(
     config: ProjectConfig,
     mode: str = "all",
@@ -298,6 +342,8 @@ def run_project(
                     callback,
                     config.retry_media_capture_ids or None,
                 )
+        if mode in {"all", "external_media_after_scan", "download", "resume"}:
+            recover_transient_text_errors(config, database, primary_run_id, jobs, stop_event, callback)
         finish_jobs(database, jobs, "complete")
         database.commit()
         paths = generate_job_reports(config, database, jobs)

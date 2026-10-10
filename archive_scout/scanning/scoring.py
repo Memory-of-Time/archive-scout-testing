@@ -116,7 +116,7 @@ def prepare_analysis_fields(
         "url": original,
         "title": title,
         "body": visible,
-        "source": raw[:500000],
+        "source": raw,
         "links": "\n".join(links),
     }
     return fields, {name: normalize_search(value) for name, value in fields.items()}

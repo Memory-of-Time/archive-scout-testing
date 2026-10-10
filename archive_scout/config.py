@@ -160,7 +160,7 @@ class AIConfig:
 @dataclass(slots=True)
 class ResearchConfig:
     enabled: bool = True
-    auto_build: bool = True
+    auto_build: bool = False
     vector_backend: str = "local-hash"
     vector_dimensions: int = 256
     candidate_limit: int = 3000
@@ -257,13 +257,13 @@ class ProjectConfig:
     minimum_score: int = 1
     max_file_mb: float = 25.0
     page_size: int = 100000
-    cdx_delay: float = 0.4  # 2.5 indexing requests/second; minimum 0.4s between starts
+    cdx_delay: float = 2.5
     download_delay: float = 0.125
     retries: int = 4
-    rate_limit_base_pause: float = 30.0
-    rate_limit_max_pause: float = 300.0
-    rate_limit_max_wait: float = 900.0
-    rate_limit_attempts: int = 8
+    rate_limit_base_pause: float = 5.0
+    rate_limit_max_pause: float = 5.0
+    rate_limit_max_wait: float = 0.0
+    rate_limit_attempts: int = 0
     connect_timeout: float = 30.0
     read_timeout: float = 180.0
     max_attempts: int = 4
@@ -370,8 +370,8 @@ class ProjectConfig:
             retries=min(12, max(1, int(self.retries))),
             rate_limit_base_pause=max(1.0, float(self.rate_limit_base_pause)),
             rate_limit_max_pause=max(float(self.rate_limit_base_pause), float(self.rate_limit_max_pause)),
-            rate_limit_max_wait=(900.0 if float(self.rate_limit_max_wait) <= 0 else max(30.0, float(self.rate_limit_max_wait))),
-            rate_limit_attempts=(8 if int(self.rate_limit_attempts) <= 0 else min(1000, int(self.rate_limit_attempts))),
+            rate_limit_max_wait=max(0.0, float(self.rate_limit_max_wait)),
+            rate_limit_attempts=min(1000, max(0, int(self.rate_limit_attempts))),
             connect_timeout=max(1.0, float(self.connect_timeout)),
             read_timeout=max(1.0, float(self.read_timeout)),
             max_attempts=min(20, max(1, int(self.max_attempts))),
@@ -437,7 +437,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     research_payload = payload.get("research") or {}
     network_payload = payload.get("network") or {}
     loaded_page_size = int(payload.get("page_size", 100000))
-    loaded_cdx_delay = float(payload.get("cdx_delay", 0.4))
+    loaded_cdx_delay = float(payload.get("cdx_delay", 2.5))
     loaded_page_blocks = int(network_payload.get("page_blocks", 0))
     loaded_cdx_workers = int(network_payload.get("cdx_workers", 10))
     loaded_workers = int(payload.get("workers", 10))
@@ -494,6 +494,11 @@ def load_project_config(path: Path) -> ProjectConfig:
         and str(network_payload.get("index_strategy", "auto")).casefold() == "auto"
     ):
         loaded_page_blocks = 9
+    # The 2026 service-oriented default is 2.5 seconds between CDX starts.
+    # Migrate only historical untouched 0.75-second defaults; an explicit
+    # custom interval other than that historical default is preserved.
+    if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) != VERSION:
+        loaded_cdx_delay = 2.5
     # v1.0.3 shipped conservative replay defaults (4 workers, 0.5 s
     # between request starts). Upgrade only that untouched pair to the v1.0.4
     # high-throughput replay profile: ten persistent connections and eight
@@ -523,10 +528,10 @@ def load_project_config(path: Path) -> ProjectConfig:
         cdx_delay=loaded_cdx_delay,
         download_delay=loaded_download_delay,
         retries=int(payload.get("retries", 4)),
-        rate_limit_base_pause=float(payload.get("rate_limit_base_pause", 30.0)),
-        rate_limit_max_pause=float(payload.get("rate_limit_max_pause", 300.0)),
-        rate_limit_max_wait=float(payload.get("rate_limit_max_wait", 900.0)),
-        rate_limit_attempts=int(payload.get("rate_limit_attempts", 8)),
+        rate_limit_base_pause=float(payload.get("rate_limit_base_pause", 5.0)),
+        rate_limit_max_pause=float(payload.get("rate_limit_max_pause", 5.0)),
+        rate_limit_max_wait=float(payload.get("rate_limit_max_wait", 0.0)),
+        rate_limit_attempts=int(payload.get("rate_limit_attempts", 0)),
         connect_timeout=float(payload.get("connect_timeout", 30.0)),
         read_timeout=float(payload.get("read_timeout", 180.0)),
         max_attempts=int(payload.get("max_attempts", 4)),

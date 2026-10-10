@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import calendar
 import json
-import random
 import sqlite3
 import threading
 import time
@@ -278,9 +277,12 @@ def window_label(start: str, end: str) -> str:
 
 
 def transient_backoff(config: ProjectConfig, failures: int) -> float:
-    network = config.network.normalized()
-    base = min(network.retry_max_seconds, network.retry_base_seconds * (2 ** min(max(0, failures - 1), 6)))
-    return base * random.uniform(0.85, 1.15)
+    """Fixed failure-only retry wait; no escalating application cooldown.
+
+    Service-directed Retry-After deadlines are enforced independently by the
+    shared host gate.  The window failure count is used for diagnostics only.
+    """
+    return min(5.0, config.network.normalized().retry_base_seconds)
 
 
 def save_state(
@@ -423,11 +425,8 @@ def _defer_transient_window(
         ) from exc
 
     threshold = network.failure_pause_threshold
-    if plan.pending and all(item.failures >= threshold for item in plan.pending):
-        raise ConnectivityPaused(
-            "Wayback could not answer any remaining CDX work after multiple independent connection methods. "
-            "Archive Scout saved the exact queue and paused cleanly; Resume will continue from this point."
-        ) from exc
+    # Transient outages are not a terminal operation state. Every window remains
+    # in the checkpoint and will be revisited automatically until stopped.
 
     if len(plan.pending) > 1:
         emit(
@@ -441,11 +440,7 @@ def _defer_transient_window(
         )
         return error_id
 
-    if current.failures >= threshold:
-        raise ConnectivityPaused(
-            f"Wayback remained unreachable for {window_label(current.start, current.end)} after {current.failures} recovery cycles. "
-            "The queue was saved without marking the project failed."
-        ) from exc
+    # Do not require a manual Resume after an intermittent outage.
 
     wait_seconds = transient_backoff(config, current.failures)
     emit(
@@ -943,16 +938,9 @@ def index_archive(
                                 {"streak": connection_failure_streak, "target": target, "window": label},
                             )
                             save_state(database, target_id, year, signature, encode_plan(plan), False, seen, error_id)
-                        if connection_failure_streak >= network.connection_failure_pause_threshold:
-                            raise ConnectivityPaused(
-                                f"Archive Scout could not establish a Wayback connection after "
-                                f"{connection_failure_streak} complete multi-backend attempts. "
-                                "The exact index queue was saved; Resume will continue without repeating completed pages."
-                            ) from exc
-                        wait_seconds = min(
-                            15.0,
-                            network.connection_retry_seconds * (2 ** max(0, connection_failure_streak - 1)),
-                        )
+                        # Preserve the saved checkpoint and retry autonomously. A
+                        # user Stop still interrupts waits immediately.
+                        wait_seconds = min(2.0, max(0.25, network.connection_retry_seconds))
                         emit(
                             callback,
                             ProgressEvent(
@@ -976,24 +964,10 @@ def index_archive(
                     if transient_failure_streak >= no_progress_limit:
                         current.failures += 1
                         with database:
-                            error_id = record_error(
-                                database,
-                                "index",
-                                "transient_index_delay",
-                                f"{target} {label}: {transient_failure_streak} consecutive transient CDX failures without a successful response: {exc}",
-                                retryable=True,
-                            )
-                            _record_network_event(
-                                database,
-                                "no_progress",
-                                str(exc),
-                                {"streak": transient_failure_streak, "target": target, "window": label},
-                            )
+                            error_id = record_error(database, "index", "transient_index_delay",
+                                f"{target} {label}: {transient_failure_streak} temporary failures: {exc}", retryable=True)
                             save_state(database, target_id, year, signature, encode_plan(plan), False, seen, error_id)
-                        raise ConnectivityPaused(
-                            f"Wayback returned no usable CDX response after {transient_failure_streak} consecutive recovery attempts. "
-                            "Archive Scout saved the exact queue and paused instead of looping indefinitely."
-                        ) from exc
+                        transient_failure_streak = 0
                     if current.strategy == "paged" and current.page_count < 0:
                         # A page-count request should be cheap. If it cannot be
                         # obtained, do not loop on it indefinitely: switch this

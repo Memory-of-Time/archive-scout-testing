@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import hashlib
 import os
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Callable, Iterator
 
-from ..content import parse_page
+from ..content import decode_bytes, parse_page
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
 from ..utils import hash_text, normalize_search
@@ -21,8 +22,9 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob]) -> dict
     if not path.exists():
         return {"kind": "missing", "row": row, "path": path}
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        content_hash = hash_text(raw)
+        saved_bytes = path.read_bytes()
+        raw = decode_bytes(saved_bytes)
+        content_hash = hashlib.sha256(saved_bytes).hexdigest()
         document_changed = content_hash != str(row.get("content_hash") or "")
         if not document_changed:
             try:
