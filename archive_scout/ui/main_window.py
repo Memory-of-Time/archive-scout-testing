@@ -375,7 +375,11 @@ class ArchiveScoutApp(tk.Tk):
         workspace.rowconfigure(0, weight=1)
         self.sidebar_page = ScrollablePage(workspace, padding=(6, 10), frame_style="Sidebar.TFrame")
         self.sidebar_page.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
-        self.sidebar_page.configure(width=212)
+        self.sidebar_page.configure(width=224)
+        # Child label/button requested widths must not resize the entire sidebar.
+        # Keep the navigation comfortably wide while giving smaller windows the
+        # remaining width for the selected workspace.
+        self.sidebar_page.grid_propagate(False)
         self.sidebar = self.sidebar_page.body
         self.sidebar.columnconfigure(0, weight=1)
         ttk.Label(self.sidebar, text="WORKSPACE", style="Sidebar.TLabel", font="TkHeadingFont").pack(fill="x", padx=10, pady=(0, 8))
@@ -792,46 +796,42 @@ class ArchiveScoutApp(tk.Tk):
         tab = page.body
         tab.columnconfigure(0, weight=1)
         tab.columnconfigure(1, weight=1)
-        tab.rowconfigure(3, weight=1)
+        tab.rowconfigure(2, weight=1)
         self.notebook.add(page, text="Media")
         options = ttk.Frame(tab)
         options.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Checkbutton(options, text="Also download media during a full text run", variable=self.media_enabled_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(options, text="Images", variable=self.media_images_var).grid(row=0, column=1, padx=(16, 0))
-        ttk.Checkbutton(options, text="Videos", variable=self.media_videos_var).grid(row=0, column=2, padx=(8, 0))
-        ttk.Checkbutton(options, text="Discover media linked inside saved pages", variable=self.media_embedded_var).grid(row=0, column=3, padx=(16, 0))
-        ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(row=1, column=0, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(options, text="Images", variable=self.media_images_var).grid(row=0, column=1, padx=(12, 0), sticky="w")
+        ttk.Checkbutton(options, text="Videos", variable=self.media_videos_var).grid(row=0, column=2, padx=(8, 0), sticky="w")
+        ttk.Checkbutton(options, text="Discover media linked inside saved pages", variable=self.media_embedded_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(row=1, column=2, sticky="w", pady=(7, 0))
         ttk.Label(
             tab,
             text="The ‘Index, download, scan, then download external embedded media’ operation waits until every saved text page has been scanned before it looks up and downloads external image/video links found in those pages.",
-            wraplength=720,
+            wraplength=520,
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        labels = ttk.Frame(tab)
-        labels.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 4))
-        labels.columnconfigure(0, weight=1)
-        labels.columnconfigure(1, weight=0)
-        ttk.Label(labels, text="Media sites/paths (blank uses Sites and paths)").grid(row=0, column=0, sticky="w")
-        ttk.Label(labels, text="Include extensions").grid(row=0, column=1, sticky="w", padx=(12, 0))
         editors = ttk.Frame(tab)
-        editors.grid(row=3, column=0, columnspan=2, sticky="nsew")
-        editors.columnconfigure(0, weight=1)
-        editors.columnconfigure(1, weight=0)
-        editors.columnconfigure(2, weight=0)
-        editors.rowconfigure(0, weight=1)
-        self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=36, height=10)
-        self.media_targets_text.grid(row=0, column=0, sticky="nsew")
-        self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=16, height=10)
-        self.media_include_text.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
-        right = ttk.Frame(editors)
-        right.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-        ttk.Label(right, text="Exclude extensions").grid(row=0, column=0, sticky="w")
-        self.media_exclude_text = tk.Text(right, wrap="none", font="TkFixedFont", width=16, height=10)
-        self.media_exclude_text.grid(row=1, column=0, sticky="nsew")
+        editors.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        editors.rowconfigure(1, weight=1)
+        for column in range(3):
+            editors.columnconfigure(column, weight=1, uniform="media_editors")
+        descriptions = (
+            "Media sites/paths (blank uses Sites and paths)",
+            "Include extensions",
+            "Exclude extensions",
+        )
+        for column, description in enumerate(descriptions):
+            ttk.Label(editors, text=description, wraplength=160).grid(
+                row=0, column=column, sticky="w", padx=(0 if column == 0 else 8, 0), pady=(0, 4)
+            )
+        self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
+        self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
+        self.media_exclude_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
+        for column, widget in enumerate((self.media_targets_text, self.media_include_text, self.media_exclude_text)):
+            widget.grid(row=1, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
         settings = ttk.Frame(tab)
-        settings.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        settings.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(settings, text="Snapshot:").grid(row=0, column=0)
         ttk.Combobox(settings, textvariable=self.media_strategy_var, values=("earliest", "latest", "all"), state="readonly", width=10).grid(row=0, column=1, padx=(5, 15))
         ttk.Label(settings, text="Maximum media size (MB):").grid(row=0, column=2)
