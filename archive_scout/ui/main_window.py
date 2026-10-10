@@ -19,7 +19,7 @@ from ..ai.relevance import AIReviewError, run_ai_review
 from ..ai.reports import generate_ai_reports
 from ..cdx.client import RateLimitDeferred
 from ..cdx.parameters import build_cdx_params, cdx_year_window
-from ..config import AIConfig, AnalysisConfig, KeywordSetConfig, MediaConfig, NetworkConfig, ProjectConfig, ResearchConfig, load_project_config, save_project_config
+from ..config import AIConfig, AnalysisConfig, KeywordSetConfig, MediaConfig, NetworkConfig, ProjectConfig, ResearchConfig, ReportConfig, REPORT_FIELD_NAMES, load_project_config, save_project_config
 from ..constants import APP_NAME, CDX_URL, DEFAULT_IMAGE_EXTENSIONS, DEFAULT_VIDEO_EXTENSIONS, OPERATION_MODES, REVIEW_STATUSES, SCOPE_LABELS, VERSION
 from ..database.connection import open_database
 from ..database.repositories import (
@@ -59,10 +59,10 @@ from .widgets import ToolTip, ScrollablePage, WheelRouter
 
 MODE_LABELS = OPERATION_MODES
 MODE_HELP = {
-    "all": "Queries CDX, downloads pending text captures, scans every selected keyword set, and writes reports.",
+    "all": "Queries CDX, downloads pending text captures, scans only the keyword set marked Use in next scan, and writes reports.",
     "external_media_after_scan": "Indexes the site, downloads and scans all selected text pages, then indexes only external media URLs found in those saved pages and downloads them after discovery finishes.",
     "index": "Queries CDX and stores capture metadata without downloading pages.",
-    "download": "Downloads pending text captures and scans them with every selected keyword set.",
+    "download": "Downloads pending text captures and scans them with the keyword set marked Use in next scan.",
     "resume": "Continues interrupted pending work without automatically retrying earlier errors.",
     "rescan": "Reads saved files locally and creates new scan runs without making Wayback requests.",
     "retry_errors": "Retries unresolved text-page and media errors. Valid local text files are rescanned before redownloading.",
@@ -112,6 +112,24 @@ def open_path(path: Path) -> None:
                 subprocess.Popen([command, str(path)] if command == "xdg-open" else [command, "open", str(path)])
                 return
         raise RuntimeError("No desktop file opener was found: " + str(path))
+
+
+def enforce_active_keyword_set_selection(
+    keyword_sets: list[dict], active_index: int, enabled: bool
+) -> None:
+    """Make the open GUI keyword set the only set eligible for the next scan.
+
+    Older/imported project files can contain several ``selected=True`` sets.
+    The GUI exposes one checkbox labelled "Use in next scan", so treating old
+    hidden selections as additional scan jobs is surprising and expensive.  A
+    checked active set therefore becomes exclusive; an unchecked active set
+    leaves no GUI-selected set for the next scan.  The sets themselves and all
+    their rules remain saved.
+    """
+    if not (0 <= int(active_index) < len(keyword_sets)):
+        return
+    for index, item in enumerate(keyword_sets):
+        item["selected"] = bool(enabled and index == int(active_index))
 
 
 class ArchiveScoutApp(tk.Tk):
@@ -219,6 +237,16 @@ class ArchiveScoutApp(tk.Tk):
         self.result_page_var = tk.StringVar(value="Page 1")
         self.keyword_set_var = tk.StringVar()
         self.keyword_set_selected_var = tk.BooleanVar(value=True)
+        self.report_sort_var = tk.StringVar(value="score")
+        self.report_max_var = tk.StringVar(value="0")
+        self.report_snippets_var = tk.StringVar(value="0")
+        self.report_chars_var = tk.StringVar(value="0")
+        self.report_links_var = tk.StringVar(value="0")
+        self.report_retain_var = tk.BooleanVar(value=True)
+        self.report_output_vars = {name: tk.BooleanVar(value=True) for name in REPORT_FIELD_NAMES}
+        self.report_field_vars = {name: {field: tk.BooleanVar(value=True) for field in fields}
+                                  for name, fields in REPORT_FIELD_NAMES.items()}
+        self.report_field_output = tk.StringVar(value="matches_ranked")
         self.media_enabled_var = tk.BooleanVar(value=False)
         self.media_images_var = tk.BooleanVar(value=True)
         self.media_videos_var = tk.BooleanVar(value=True)
@@ -301,9 +329,11 @@ class ArchiveScoutApp(tk.Tk):
         workspace.grid(row=2, column=0, sticky="nsew", padx=(14, 14), pady=6)
         workspace.columnconfigure(1, weight=1)
         workspace.rowconfigure(0, weight=1)
-        self.sidebar = ttk.Frame(workspace, style="Sidebar.TFrame", width=184, padding=(6, 10))
-        self.sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
-        self.sidebar.grid_propagate(False)
+        sidebar_scroll = ScrollablePage(workspace, padding=6, horizontal=False)
+        sidebar_scroll.configure(width=184)
+        sidebar_scroll.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        sidebar_scroll.grid_propagate(False)
+        self.sidebar = sidebar_scroll.body
         self.sidebar.columnconfigure(0, weight=1)
         ttk.Label(self.sidebar, text="WORKSPACE", style="Sidebar.TLabel", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=0, sticky="w", padx=10, pady=(0, 8))
 
@@ -362,9 +392,12 @@ class ArchiveScoutApp(tk.Tk):
             card.grid(row=2, column=column, sticky="ew", padx=(0 if column == 0 else 6, 6 if column < 3 else 0))
             ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
             ttk.Label(card, textvariable=variable, style="CardValue.TLabel").pack(anchor="w", pady=(5, 0))
+        self.dashboard_classification_var = tk.StringVar(value="Indexed classes: awaiting inventory")
+        ttk.Label(tab,textvariable=self.dashboard_classification_var,justify="left",wraplength=820,
+                  style="Muted.TLabel").grid(row=4,column=0,columnspan=4,sticky="ew",pady=(8,0))
         actions = ttk.LabelFrame(tab, text="Project maintenance", padding=12)
         actions.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(14, 0), padx=(0, 6))
-        ttk.Button(actions, text="Refresh dashboard", command=self.refresh_dashboard).pack(fill="x", pady=3)
+        ttk.Button(actions, text="Refresh dashboard", command=lambda: self.refresh_dashboard(force=True)).pack(fill="x", pady=3)
         ttk.Button(actions, text="Create backup", command=lambda: self.start(self.build_config(require_keywords=False), "backup")).pack(fill="x", pady=3)
         ttk.Button(actions, text="Restore a backup…", command=self.restore_backup_ui).pack(fill="x", pady=3)
         ttk.Button(actions, text="Check integrity", command=lambda: self.start(self.build_config(require_keywords=False), "integrity")).pack(fill="x", pady=3)
@@ -463,20 +496,36 @@ class ArchiveScoutApp(tk.Tk):
             active = bool(self.worker_thread and self.worker_thread.is_alive())
             if active or selected == "Dashboard":
                 self.refresh_dashboard()
-            interval = 1000 if active else (1500 if selected == "Dashboard" else 5000)
+            interval = 5000 if active else (1500 if selected == "Dashboard" else 5000)
             self.dashboard_refresh_job = self.after(interval, self.dashboard_refresh_loop)
         except tk.TclError:
             self.dashboard_refresh_job = None
 
-    def refresh_dashboard(self) -> None:
+    def refresh_dashboard(self, force: bool = False) -> None:
         root = Path(self.output_var.get()).expanduser()
         self.dashboard_project_var.set(str(root))
         try:
-            counts = read_dashboard_counts(root / "archive_scout.sqlite3")
+            import time as _time
+            active = bool(self.worker_thread and self.worker_thread.is_alive())
+            now = _time.monotonic()
+            last = getattr(self,"_last_classification_refresh",0.0)
+            # Full inventory aggregation is never run per capture or every dashboard tick.
+            # Poll it at most once/minute during download; the user can explicitly refresh.
+            include_class = force or now-last >= (60 if active else 15)
+            counts = read_dashboard_counts(root / "archive_scout.sqlite3", include_classification=include_class)
+            if include_class: self._last_classification_refresh=now
             self.dashboard_captures_var.set(f"{counts['captures']:,}")
             self.dashboard_documents_var.set(f"{counts['documents']:,}")
             self.dashboard_matches_var.set(f"{counts['matches']:,}")
             self.dashboard_errors_var.set(f"{counts['errors']:,}")
+            if include_class:
+                summary=(f"Indexed classes: Text {counts.get('text',0):,} · Images {counts.get('image',0):,} · "
+                     f"Videos {counts.get('video',0):,} · Audio {counts.get('audio',0):,} · "
+                     f"Descriptors {counts.get('media_descriptor',0):,} · "
+                     f"Other binary {counts.get('other_binary',0):,} · Unknown {counts.get('unknown',0):,}\n"
+                     f"Deferred to media {counts.get('deferred',0):,} · Skipped non-text/filter {counts.get('skipped',0):,} · "
+                     f"Failed {counts.get('failed',0):,}")
+                self.dashboard_classification_var.set(summary)
         except Exception as exc:
             if not (self.worker_thread and self.worker_thread.is_alive()):
                 self.dashboard_project_var.set(f"{root} — {exc}")
@@ -683,21 +732,122 @@ class ArchiveScoutApp(tk.Tk):
 
 
     def create_reports_tab(self) -> None:
-        """Reports workspace: no automatic enrichment or extra database scans."""
-        page = ScrollablePage(self.notebook, padding=16, horizontal=True)
-        body = page.body
-        body.columnconfigure(0, weight=1)
+        """v1.1.1-style report controls; report work runs only on explicit report phases."""
+        page = ScrollablePage(self.notebook, padding=12, horizontal=True)
+        tab = page.body
+        tab.columnconfigure(0, weight=1)
         self.notebook.add(page, text="Reports")
-        ttk.Label(body, text="Reports", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(body, text="Indexed URL reports are written after index-only runs. Text match reports require a scan.",
-                  wraplength=640, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 10))
-        actions = ttk.Frame(body)
-        actions.grid(row=2, column=0, sticky="w")
+        ttk.Label(tab, text="Report contents", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(tab, text="Choose generated files, fields, ordering and output limits. This never changes scan matches or downloaded bodies.",
+                  style="Muted.TLabel", wraplength=750).grid(row=1, column=0, sticky="ew", pady=6)
+        choices = ttk.LabelFrame(tab, text="Report settings", padding=10)
+        choices.grid(row=2, column=0, sticky="ew", pady=6)
+        options = (("Maximum matches (0=all)", self.report_max_var),
+                   ("Snippets/match (0=all)", self.report_snippets_var),
+                   ("Snippet characters (0=all)", self.report_chars_var),
+                   ("Links/match (0=all)", self.report_links_var))
+        for col, (caption, variable) in enumerate(options):
+            ttk.Label(choices, text=caption).grid(row=0, column=col, sticky="w", padx=5)
+            ttk.Entry(choices, textvariable=variable, width=16).grid(row=1, column=col, sticky="w", padx=5)
+        ttk.Label(choices, text="Sort matches").grid(row=0, column=4, sticky="w", padx=5)
+        ttk.Combobox(choices, textvariable=self.report_sort_var, values=("score", "oldest", "newest", "url"),
+                     state="readonly", width=12).grid(row=1, column=4, padx=5)
+        ttk.Label(choices, text="Complete scan evidence is always retained on this lean database (not configurable).",
+                  style="Muted.TLabel").grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        presets = ttk.Frame(tab)
+        presets.grid(row=3, column=0, sticky="w", pady=7)
+        for title, name in (("All files and fields", "all"), ("Matched URLs only", "matched"),
+                            ("Indexed URLs only", "indexed"), ("No generated reports", "none")):
+            ttk.Button(presets, text=title, command=lambda preset=name: self.set_report_preset(preset)).pack(side="left", padx=(0, 6))
+        outputs = ttk.LabelFrame(tab, text="Files to generate", padding=9)
+        outputs.grid(row=4, column=0, sticky="ew", pady=6)
+        supported = ("matches_ranked", "matched_urls", "wayback_urls", "interesting_links", "keyword_counts",
+                     "all_indexed_urls", "errors", "site_issues", "summary")
+        for index, name in enumerate(supported):
+            ttk.Checkbutton(outputs, text=name.replace("_", " ").title(), variable=self.report_output_vars[name]).grid(
+                row=index // 3, column=index % 3, sticky="w", padx=(0, 22), pady=3)
+        self.report_field_supported = supported
+        field_box = ttk.LabelFrame(tab, text="Include fields", padding=9)
+        field_box.grid(row=5, column=0, sticky="ew", pady=6)
+        ttk.Label(field_box, text="Report:").grid(row=0, column=0, sticky="w")
+        self.report_field_box = ttk.Combobox(field_box, textvariable=self.report_field_output,
+                                             values=supported, state="readonly", width=25)
+        self.report_field_box.grid(row=0, column=1, sticky="w", padx=8)
+        self.report_field_box.bind("<<ComboboxSelected>>", lambda _e: self.refresh_report_fields())
+        self.report_fields_frame = ttk.Frame(field_box)
+        self.report_fields_frame.grid(row=1, column=0, columnspan=5, sticky="ew", pady=6)
+        self.refresh_report_fields()
+        actions = ttk.Frame(tab)
+        actions.grid(row=6, column=0, sticky="w", pady=(8, 0))
         ttk.Button(actions, text="Open reports folder", command=self.open_reports).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Regenerate current reports", command=lambda: self.start(self.build_config(require_keywords=False), "report")).pack(side="left")
-        ttk.Label(body, text="Heavy Research Intelligence and archive analysis remain separately initiated operations.",
-                  wraplength=640, style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(actions, text="Regenerate using these settings",
+                   command=lambda: self.start(self.build_config(require_keywords=False), "report")).pack(side="left")
         self.reports_tab = page
+
+    def refresh_report_fields(self) -> None:
+        for child in self.report_fields_frame.winfo_children():
+            child.destroy()
+        output = self.report_field_output.get()
+        supported = {
+            "matches_ranked": set(REPORT_FIELD_NAMES["matches_ranked"]),
+            "matched_urls": {"original_url"},
+            "wayback_urls": {"wayback_url"},
+            "interesting_links": {"source_url", "link"},
+            "keyword_counts": {"count", "keyword"},
+            "all_indexed_urls": {"timestamp", "mime_type", "state", "original_url"},
+            "errors": set(REPORT_FIELD_NAMES["errors"]),
+            "site_issues": set(REPORT_FIELD_NAMES["site_issues"]),
+            "summary": set(REPORT_FIELD_NAMES["summary"]) - {"bodies_searched"},
+        }.get(output, set())
+        for index, (name, variable) in enumerate(self.report_field_vars.get(output, {}).items()):
+            available = name in supported
+            label = name.replace("_", " ") if available else name.replace("_", " ") + " (unavailable in schema 7)"
+            ttk.Checkbutton(self.report_fields_frame, text=label, variable=variable,
+                            state="normal" if available else "disabled").grid(
+                row=index // 3, column=index % 3, sticky="w", padx=(0, 12), pady=2)
+
+    def set_report_preset(self, preset: str) -> None:
+        chosen = {
+            "all": set(self.report_field_supported),
+            "matched": {"matched_urls"},
+            "indexed": {"all_indexed_urls"},
+            "none": set(),
+        }[preset]
+        for name in self.report_field_supported:
+            self.report_output_vars[name].set(name in chosen)
+        if preset == "all":
+            for fields in self.report_field_vars.values():
+                for variable in fields.values():
+                    variable.set(True)
+        self.refresh_report_fields()
+
+    def current_report_config(self) -> ReportConfig:
+        return ReportConfig(
+            outputs=[name for name, variable in self.report_output_vars.items() if variable.get()],
+            fields={name: [field for field, variable in fields.items() if variable.get()]
+                    for name, fields in self.report_field_vars.items()},
+            retain_scan_details=self.report_retain_var.get(),
+            sort_order=self.report_sort_var.get(),
+            max_matches=int(self.report_max_var.get()),
+            snippet_limit=int(self.report_snippets_var.get()),
+            snippet_chars=int(self.report_chars_var.get()),
+            link_limit=int(self.report_links_var.get()),
+        ).normalized()
+
+    def apply_report_config(self, report: ReportConfig) -> None:
+        report = report.normalized()
+        self.report_sort_var.set(report.sort_order)
+        self.report_max_var.set(str(report.max_matches))
+        self.report_snippets_var.set(str(report.snippet_limit))
+        self.report_chars_var.set(str(report.snippet_chars))
+        self.report_links_var.set(str(report.link_limit))
+        self.report_retain_var.set(report.retain_scan_details)
+        for name, variable in self.report_output_vars.items():
+            variable.set(name in report.outputs)
+        for name, fields in self.report_field_vars.items():
+            for field, variable in fields.items():
+                variable.set(field in report.fields_for(name))
+        self.refresh_report_fields()
 
     def create_analysis_tab(self) -> None:
         page = ScrollablePage(self.notebook, padding=10, horizontal=True)
@@ -1157,7 +1307,7 @@ class ArchiveScoutApp(tk.Tk):
     def save_current_keyword_set(self) -> None:
         if 0 <= self.current_keyword_set < len(self.keyword_sets):
             self.keyword_sets[self.current_keyword_set]["rules"] = self.lines_from(self.keywords_text)
-            self.keyword_sets[self.current_keyword_set]["selected"] = self.keyword_set_selected_var.get()
+            enforce_active_keyword_set_selection(self.keyword_sets, self.current_keyword_set, self.keyword_set_selected_var.get())
 
     def refresh_keyword_set_box(self, selected_index: int | None = None) -> None:
         names = [item["name"] for item in self.keyword_sets]
@@ -1194,6 +1344,7 @@ class ArchiveScoutApp(tk.Tk):
             candidate = f"{base} {suffix}"
             suffix += 1
         self.keyword_sets.append({"name": candidate, "rules": [], "selected": True})
+        enforce_active_keyword_set_selection(self.keyword_sets, len(self.keyword_sets)-1, True)
         self.refresh_keyword_set_box(len(self.keyword_sets)-1)
 
     def duplicate_keyword_set(self) -> None:
@@ -1202,6 +1353,7 @@ class ArchiveScoutApp(tk.Tk):
             return
         source = self.keyword_sets[self.current_keyword_set]
         self.keyword_sets.append({"name": source["name"] + " copy", "rules": list(source["rules"]), "selected": True})
+        enforce_active_keyword_set_selection(self.keyword_sets, len(self.keyword_sets)-1, True)
         self.refresh_keyword_set_box(len(self.keyword_sets)-1)
 
     def delete_keyword_set(self) -> None:
@@ -1224,7 +1376,8 @@ class ArchiveScoutApp(tk.Tk):
         else:
             name = p.stem
             rules = [line.strip() for line in p.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-        self.keyword_sets.append({"name": name, "rules": rules, "selected": True})
+        self.keyword_sets.append({"name": name, "rules": rules, "selected": False})
+        enforce_active_keyword_set_selection(self.keyword_sets, len(self.keyword_sets)-1, True)
         self.refresh_keyword_set_box(len(self.keyword_sets)-1)
 
     def export_keyword_set(self) -> None:
@@ -1339,6 +1492,7 @@ class ArchiveScoutApp(tk.Tk):
                 ai=ai,
                 research=research,
                 network=network,
+                report=self.current_report_config(),
                 target_settings=self.target_settings,
                 auto_backup=self.auto_backup_var.get(),
                 backup_keep=int(self.backup_keep_var.get()),
@@ -2279,7 +2433,10 @@ class ArchiveScoutApp(tk.Tk):
         self.output_var.set(str(config.output_dir))
         self.replace_text(self.targets_text, config.targets)
         self.keyword_sets = [item.to_payload() for item in config.normalized_keyword_sets()]
-        self.refresh_keyword_set_box(0)
+        active_indices = [i for i, item in enumerate(self.keyword_sets) if item.get("selected")]
+        if len(active_indices) > 1:
+            enforce_active_keyword_set_selection(self.keyword_sets, active_indices[0], True)
+        self.refresh_keyword_set_box(active_indices[0] if active_indices else 0)
         self.from_date_var.set(config.from_date)
         self.to_date_var.set(config.to_date)
         self.replace_text(self.cdx_filters_text, config.cdx_filters)
@@ -2307,6 +2464,7 @@ class ArchiveScoutApp(tk.Tk):
         self.network_retry_base_var.set(str(network.retry_base_seconds))
         self.network_retry_max_var.set(str(network.retry_max_seconds))
         self.network_failure_limit_var.set(str(network.failure_pause_threshold))
+        self.apply_report_config(config.report if isinstance(config.report, ReportConfig) else ReportConfig(**config.report))
         self.target_settings = dict(config.target_settings)
         self.auto_backup_var.set(config.auto_backup)
         self.backup_keep_var.set(str(config.backup_keep))

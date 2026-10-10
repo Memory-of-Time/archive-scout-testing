@@ -17,8 +17,8 @@ class V102IndexingTests(unittest.TestCase):
         page = dict(build_paged_cdx_params(config, 'example.com/*', '20000101000000', '20001231235959', 3))
         self.assertEqual(count['showNumPages'], 'true')
         self.assertEqual(page['page'], '3')
-        self.assertEqual(count['pageSize'], '9')
-        self.assertEqual(page['pageSize'], '9')
+        self.assertNotIn('pageSize', count)
+        self.assertNotIn('pageSize', page)
 
     def test_explicit_smaller_page_grouping_remains_supported(self):
         config = ProjectConfig(output_dir=Path('.'), targets=['example.com/*'], keywords=[]).normalized()

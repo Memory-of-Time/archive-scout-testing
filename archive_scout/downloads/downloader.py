@@ -11,6 +11,8 @@ from typing import Callable, Iterator
 
 from ..cdx.client import HttpClient, RateLimitDeferred
 from ..cdx.parameters import cdx_query_signature
+from ..database.classification import classify_indexed_captures
+from ..classification import classify_indexed_resource, classify_payload_kind
 from ..config import ProjectConfig
 from ..constants import REPLAY_URL
 from ..content import classify_replay_content, decode_bytes, is_text_candidate, looks_textual_bytes, parse_page
@@ -66,6 +68,8 @@ def prepare_download_rows(
     project-sized Python lists used by older releases and SQLite's platform-
     dependent parameter limit when a large retry selection is supplied.
     """
+    if not capture_ids:
+        classify_indexed_captures(database, cdx_query_signature(config))
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_download_queue")
     database.execute(
         """CREATE TEMP TABLE archive_scout_download_queue(
@@ -114,7 +118,11 @@ def prepare_download_rows(
         keyword_skips: list[tuple[str, int]] = []
         for row in chunk:
             capture_id = int(row["id"])
-            if not is_text_candidate(row["original_url"], row["mimetype"] or ""):
+            decision = classify_indexed_resource(row["original_url"], row["mimetype"] or "")
+            if decision.resource_class in {"image","video","audio","other_binary"} and decision.confident:
+                binary_ids.append(capture_id)
+                continue
+            if decision.resource_class == "media_descriptor" and decision.confident:
                 binary_ids.append(capture_id)
                 continue
             if config.download_scope == "keyword_urls" and url_prefilter is not None:
@@ -139,20 +147,20 @@ def prepare_download_rows(
                     "UPDATE captures SET state='skipped',updated_at=? WHERE id=?",
                     keyword_skips,
                 )
+                database.executemany(
+                    "UPDATE capture_routing SET routing='skipped_url_filter',updated_at=? WHERE capture_id=?",
+                    keyword_skips,
+                )
             if binary_ids:
                 database.executemany(
                     "UPDATE captures SET state='skipped',updated_at=? WHERE id=?",
                     ((now, capture_id) for capture_id in binary_ids),
                 )
-                for capture_id in binary_ids:
-                    record_error(
-                        database,
-                        "download",
-                        "binary_response",
-                        "capture is not a text candidate",
-                        capture_id=capture_id,
-                        retryable=False,
-                    )
+                database.executemany(
+                    """UPDATE capture_routing SET routing=?,updated_at=? WHERE capture_id=?""",
+                    (("deferred_to_media" if config.media.enabled else "skipped_non_text", now, capture_id)
+                     for capture_id in binary_ids),
+                )
     total = int(database.execute(
         "SELECT COUNT(*) FROM archive_scout_download_queue"
     ).fetchone()[0])
@@ -197,17 +205,33 @@ def select_download_rows(
     return list(rows)
 
 
-def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob], client: HttpClient) -> dict:
+class NonTextResponse(Exception):
+    """An archived payload was media; this is not a transport or download failure."""
+    def __init__(self, resource_class: str, reason: str, content_type: str):
+        super().__init__(reason)
+        self.resource_class=resource_class
+        self.reason=reason
+        self.content_type=content_type
+
+def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob], client: HttpClient, scan_now: bool = True) -> dict:
     original = row["original_url"]
     response = client.get(replay_url(row["timestamp"], original), config.max_file_bytes)
     content_type = response["headers"].get("content-type") or response["headers"].get("Content-Type") or row["mimetype"] or ""
     data = response["data"]
-    if not looks_textual_bytes(data, content_type):
-        raise RuntimeError("downloaded response was not textual")
-    raw = decode_bytes(data, content_type)
+    decision = classify_payload_kind(data, content_type, original)
+    if decision.resource_class not in {"text", "media_descriptor"}:
+        raise NonTextResponse(decision.resource_class, decision.reason, content_type)
+    raw = decode_bytes(data if scan_now else data[:20000], content_type)
     replay_problem = classify_replay_content(raw, response["final_url"])
     if replay_problem:
         raise RuntimeError(replay_problem)
+    if not scan_now:
+        path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
+        atomic_write_bytes(path, bytes(data))
+        return {"capture_id": int(row["id"]), "path": path,
+                "bytes_saved": len(data), "content_hash": hashlib.sha256(data).hexdigest(),
+                "http_status": response["status"], "final_url": response["final_url"],
+                "deferred_scan": True}
     title, visible, links = parse_page(raw, original)
     # Avoid a second full HTML parser pass in the download hot path. The page
     # parser above already found ordinary attributes; this lightweight source
@@ -243,6 +267,19 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
 
 
 def save_success(database: sqlite3.Connection, result: dict) -> None:
+    if result.get("deferred_scan"):
+        with database:
+            database.execute(
+                """UPDATE captures SET state='downloaded_unscanned',http_status=?,final_url=?,
+                       bytes_saved=?,updated_at=? WHERE id=?""",
+                (result["http_status"],result["final_url"],result["bytes_saved"],utc_now(),result["capture_id"]),
+            )
+            database.execute(
+                """UPDATE capture_routing SET resource_class='text',evidence='payload:validated_text',
+                       confident=1,routing='downloaded_awaiting_scan',updated_at=? WHERE capture_id=?""",
+                (utc_now(),result["capture_id"]),
+            )
+        return
     with database:
         document_id = upsert_document(
             database,
@@ -297,6 +334,8 @@ def download_archive(
                 f"No matching captures remain to download; project progress {completed_before:,}/{cumulative_total:,}.",
                 completed_before, cumulative_total,
             ))
+        from ..scanning.pending import scan_pending_saved
+        scan_pending_saved(database,config,jobs,stop_event,callback)
         return
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
@@ -358,7 +397,7 @@ def download_archive(
                         ((now, int(row["id"])) for row in rows),
                     )
                 for row in rows:
-                    futures[pool.submit(fetch_parse_scan, row, config, jobs, client)] = row
+                    futures[pool.submit(fetch_parse_scan, row, config, jobs, client, False)] = row
     
             submit_available()
             while futures:
@@ -373,11 +412,38 @@ def download_archive(
                         result = future.result()
                         save_success(database, result)
                         saved_this_pass += 1
-                        matched += int(any(
-                            int(analysis.get("score") or 0) >= config.minimum_score
-                            and not analysis.get("excluded") and not analysis.get("required_missing")
-                            for analysis in result["analyses"].values()
-                        ))
+                        if "analyses" in result:
+                            matched += int(any(
+                                int(analysis.get("score") or 0) >= config.minimum_score
+                                and not analysis.get("excluded") and not analysis.get("required_missing")
+                                for analysis in result["analyses"].values()
+                            ))
+                    except NonTextResponse as exc:
+                        with database:
+                            database.execute("UPDATE captures SET state='skipped',updated_at=? WHERE id=?", (utc_now(),row["id"]))
+                            database.execute(
+                                """INSERT INTO capture_routing(capture_id,resource_class,evidence,confident,routing,updated_at)
+                                   VALUES(?,?,?,?,?,?) ON CONFLICT(capture_id) DO UPDATE SET
+                                   resource_class=excluded.resource_class,evidence=excluded.evidence,
+                                   confident=excluded.confident,routing=excluded.routing,updated_at=excluded.updated_at""",
+                                (row["id"], exc.resource_class,exc.reason,1,
+                                 "deferred_to_media" if config.media.enabled else "skipped_non_text",utc_now()),
+                            )
+                            if config.media.enabled and exc.resource_class in {"image","video"}:
+                                from ..media.indexer import media_query_signature
+                                from ..media.extensions import extension_from_url
+                                from ..database.repositories import get_or_create_media_target, upsert_media_captures
+                                target = get_or_create_media_target(database, "__deferred_text_replay__")
+                                suffix = extension_from_url(str(row["original_url"]))
+                                if suffix not in {".png",".jpg",".jpeg",".gif",".webp",".bmp",".avif",".mp4",".webm",".avi",".mov",".mkv",".flv",".swf",".wmv"}:
+                                    suffix = ".png" if exc.resource_class == "image" else ".mp4"
+                                upsert_media_captures(
+                                    database,[({"original": row["original_url"],"timestamp":row["timestamp"],
+                                               "mimetype":exc.content_type,"statuscode":row["statuscode"],
+                                               "digest":row["digest"],"length":row["length"]},
+                                               exc.resource_class,suffix)], target,
+                                    media_query_signature(config),source_type="text_replay_deferred",
+                                )
                     except RateLimitDeferred:
                         stop_event.set()
                         with database:
@@ -404,6 +470,10 @@ def download_archive(
                             database.execute(
                                 "UPDATE captures SET state='error',http_status=?,updated_at=? WHERE id=?",
                                 (status, utc_now(), row["id"]),
+                            )
+                            database.execute(
+                                "UPDATE capture_routing SET routing='failed',updated_at=? WHERE capture_id=?",
+                                (utc_now(), row["id"]),
                             )
                             record_error(
                                 database,
@@ -450,3 +520,6 @@ def download_archive(
                     submit_available()
     finally:
         client.close()
+    # Decouple complete HTML/source scanning from network request workers.
+    from ..scanning.pending import scan_pending_saved
+    scan_pending_saved(database,config,jobs,stop_event,callback)

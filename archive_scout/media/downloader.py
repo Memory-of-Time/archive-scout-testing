@@ -196,6 +196,15 @@ def download_media(
     if states:
         clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)
+    # Resolve MIME-vs-extension conflicts from proven text replay evidence
+    # before opening media replay slots. Never skip a different timestamp.
+    with database:
+        database.execute(
+            """UPDATE media_captures SET state='skipped' WHERE state='pending'
+               AND EXISTS (SELECT 1 FROM captures c JOIN capture_routing r ON r.capture_id=c.id
+                 WHERE c.original_url=media_captures.original_url AND c.timestamp=media_captures.timestamp
+                   AND r.resource_class='text' AND r.evidence='payload:validated_text')"""
+        )
     media_root = config.output_dir / "media"
     (media_root / "images").mkdir(parents=True, exist_ok=True)
     (media_root / "videos").mkdir(parents=True, exist_ok=True)

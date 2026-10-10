@@ -38,7 +38,7 @@ class DashboardTests(unittest.TestCase):
     def test_missing_database_returns_zeroes(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "missing.sqlite3"
-            self.assertEqual(read_dashboard_counts(path), {"captures": 0, "documents": 0, "matches": 0, "errors": 0})
+            self.assertEqual({key: read_dashboard_counts(path)[key] for key in ("captures", "documents", "matches", "errors")}, {"captures": 0, "documents": 0, "matches": 0, "errors": 0})
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ class V105ReleaseTests(unittest.TestCase):
             output_dir=Path('.'), targets=['example.com/*'], keywords=[],
             network=NetworkConfig(index_strategy='auto'),
         ).normalized()
-        self.assertEqual(preferred_index_strategy(config, 'example.com/*'), 'paged')
-        self.assertEqual(config.network.page_blocks, 9)
+        self.assertEqual(preferred_index_strategy(config, 'example.com/*'), 'resume')
+        self.assertEqual(config.network.page_blocks, 0)
         self.assertEqual(config.network.cdx_workers, 10)
         self.assertEqual(config.cdx_delay, 2.5)
         self.assertIn('/web/timemap/json', cdx_paged_endpoints(config)[0])
@@ -43,13 +43,13 @@ class V105ReleaseTests(unittest.TestCase):
             strategy='paged', page=11, page_count=100, page_blocks=50,
         )
         _resolve_strategy(window, config, 'example.com/*')
-        self.assertEqual(window.page_blocks, 9)
+        self.assertEqual(window.page_blocks, 50)
         media_window = PendingWindow(
             '20010101000000', '20011231235959',
             strategy='paged', page=11, page_count=100, page_blocks=50,
         )
         _resolve_media_strategy(media_window, config, 'example.com/*')
-        self.assertEqual(media_window.page_blocks, 9)
+        self.assertEqual(media_window.page_blocks, 50)
 
     def test_parallel_index_pipeline_queues_one_thousand_pages(self):
         window = PendingWindow(

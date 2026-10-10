@@ -1,4 +1,22 @@
+## 1.2.1 (2026-10-10) — Lean acquisition + post-acquisition scanning
+
+- Restored v1.1.1-style automatic index strategy, exclusive keyword set selection, accessible GUI and customizable Reports (candidate improvements).
+- Added schema-8 lightweight capture classification and routing evidence, payload overrides, automatic media deferral and classification-aware inventory report fields.
+- Moved full keyword/source scanning out of replay workers into a durable bounded local scanner stage; replay pacing unchanged.
+- Fixed misleading non-text open errors and expensive every-tick classification aggregation; retained complete source and original bytes.
+- Verified 213 tests (three skipped) and 300/300 localhost captures at 8.001 committed fresh saves/s during acquisition; live-service long runs unverified.
+
 # Changelog
+
+## 1.2.1 — Lean feature restoration (candidate)
+
+- Restored v1.1.1's automatic resume-key preference while retaining explicit parallel Timemap paging and completed/in-progress saved page queues. Fixed 2.5-second index request spacing and 0.125-second replay spacing remain unchanged.
+- The GUI now selects only the currently active keyword set when using "Use in next scan," eliminating unintended additional scans; older keyword sets and rules are retained.
+- Reintroduced report output selection, presets, ordering, field selection and presentation limits using bounded post-operation generation. Disabled outputs are not generated.
+- Improved main/sidebar scrolling, visible field boundaries and responsive report access.
+- No new work on the replay acquisition hot path; default research auto-build remains disabled.
+- Schema 7 and lean text/media classification are unchanged: this candidate does **not** yet restore all v1.1.1 classification/evidence tables, Hitlist resume, report formats, or complete GUI feature parity.
+- See `docs/FEATURE_PARITY.md` and `docs/V121_PERFORMANCE.md`. Real Wayback endurance and hosted Windows/macOS workflows remain unverified.
 
 ## 1.2.0 — Lean rebuild candidate
 

@@ -41,6 +41,15 @@ CREATE INDEX IF NOT EXISTS captures_original_idx ON captures(original_url,timest
 CREATE INDEX IF NOT EXISTS captures_signature_idx ON captures(query_signature,timestamp);
 CREATE INDEX IF NOT EXISTS captures_download_idx ON captures(query_signature,state,download_attempts,id);
 CREATE INDEX IF NOT EXISTS captures_download_length_idx ON captures(query_signature,state,download_attempts,length,id);
+CREATE TABLE IF NOT EXISTS capture_routing(
+    capture_id INTEGER PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    resource_class TEXT NOT NULL DEFAULT 'unknown',
+    evidence TEXT NOT NULL DEFAULT 'not_classified',
+    confident INTEGER NOT NULL DEFAULT 0,
+    routing TEXT NOT NULL DEFAULT 'pending',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS capture_routing_kind_idx ON capture_routing(resource_class,routing);
 CREATE TABLE IF NOT EXISTS documents(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     capture_id INTEGER NOT NULL UNIQUE,
@@ -636,6 +645,12 @@ def migrate_v6_to_v7(database: sqlite3.Connection) -> None:
     database.execute("UPDATE schema_info SET version=7")
 
 
+def migrate_v7_to_v8(database: sqlite3.Connection) -> None:
+    # Adds optional classification evidence without rewriting captures or payloads.
+    database.executescript(BASE_SCHEMA_SQL)
+    database.execute("UPDATE schema_info SET version=8")
+
+
 def initialize_schema(database: sqlite3.Connection) -> None:
     database.execute("PRAGMA foreign_keys=ON")
     has_schema = database.execute(
@@ -654,20 +669,27 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v4_to_v5(database)
             migrate_v5_to_v6(database)
             migrate_v6_to_v7(database)
+            migrate_v7_to_v8(database)
         elif version == 3:
             migrate_v3_to_v4(database)
             migrate_v4_to_v5(database)
             migrate_v5_to_v6(database)
             migrate_v6_to_v7(database)
+            migrate_v7_to_v8(database)
         elif version == 4:
             migrate_v4_to_v5(database)
             migrate_v5_to_v6(database)
             migrate_v6_to_v7(database)
+            migrate_v7_to_v8(database)
         elif version == 5:
             migrate_v5_to_v6(database)
             migrate_v6_to_v7(database)
+            migrate_v7_to_v8(database)
         elif version == 6:
             migrate_v6_to_v7(database)
+            migrate_v7_to_v8(database)
+        elif version == 7:
+            migrate_v7_to_v8(database)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
         else:

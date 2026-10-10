@@ -20,7 +20,7 @@ def main() -> int:
     with (args.output / "tests.log").open("w", encoding="utf-8") as handle:
         result = unittest.TextTestRunner(stream=handle, verbosity=2).run(suite)
     payload = {
-        "version": "1.2.0",
+        "version": "1.2.1",
         "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "platform": platform.platform(), "python": sys.version,
         "tests_run": result.testsRun,

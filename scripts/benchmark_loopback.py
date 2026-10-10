@@ -56,7 +56,11 @@ def run(count:int=90)->dict:
                     a=next((t for n,t in samples if n>=low),0.0) if low else 0
                     b=next((t for n,t in samples if n>=high),None)
                     windows.append({'phase':label,'saves_per_second':round((high-low)/(b-a),3) if b and b>a else None})
+                acquisition_seconds=samples[-1][1] if samples else elapsed
                 return {'validated':count,'elapsed_seconds':round(elapsed,3),'saves_per_second':round(count/elapsed,3),
+                        'acquisition_seconds':round(acquisition_seconds,3),
+                        'acquisition_saves_per_second':round(count/max(.001,acquisition_seconds),3),
+                        'scan_drain_seconds':round(max(0,elapsed-acquisition_seconds),3),
                         'segment_rates':windows,'sha256_verified':True,'scope':'localhost HTTP, not live Wayback'}
             finally:db.close()
     finally:server.shutdown();server.server_close();thread.join(timeout=3)

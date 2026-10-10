@@ -506,29 +506,16 @@ def _resolve_strategy(current: PendingWindow, config: ProjectConfig, target: str
     desired = preferred_index_strategy(config, target)
     if current.strategy not in {"resume", "paged"}:
         current.strategy = desired
-    elif desired == "resume" and current.strategy == "paged":
-        # Safely abandon an unfinished v1.0.2 numbered-page queue. Previously
-        # indexed rows remain in SQLite and no-op upserts make replaying the
-        # beginning of this date window cheap; continuing thousands of page
-        # numbers can be orders of magnitude slower.
-        current.strategy = "resume"
-        # Resume-key traversal still supports adaptive date-window splitting on
-        # transient oversized/timeout responses; only the old numbered queue is
-        # being discarded here.
-        current.pagination_supported = True
-        current.page = 0
-        current.page_count = -1
-        current.retry_pages.clear()
-        current.page_failures.clear()
-        current.resume_key = None
+    # An unfinished numbered-page queue is durable progress.  An *automatic*
+    # preference change must never discard its cursor or completed pages.
+    # Explicit user-selected strategies apply to new windows; preserve the
+    # in-flight page plan until its checkpoint can be completed safely.
     if not current.pagination_supported and current.strategy == "paged":
         current.strategy = "resume"
     network = config.network.normalized()
     if network.index_strategy == "auto" and current.strategy == "paged":
-        # Auto mode is the fixed reference-downloader profile.  Do not let a
-        # legacy/custom numbered-page block value silently turn the ten-worker
-        # Timemap pipeline back into large, low-concurrency page bodies.
-        current.page_blocks = 9
+        # Preserve the original page grouping on an unfinished saved plan.
+        current.page_blocks = max(1, current.page_blocks or 9)
     elif current.page_blocks <= 0:
         current.page_blocks = network.page_blocks
 

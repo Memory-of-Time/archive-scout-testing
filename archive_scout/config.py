@@ -17,6 +17,164 @@ def normalize_extension(value: str) -> str:
     return value if value.startswith(".") else "." + value
 
 
+REPORT_FIELD_NAMES: dict[str, tuple[str, ...]] = {
+    "matches_ranked": (
+        "rank", "score", "scan_run", "timestamp", "title", "original_url",
+        "wayback_url", "local_file", "mime_type", "review_status", "tags",
+        "note", "keyword_hits", "snippets", "interesting_links",
+    ),
+    "matched_urls": ("original_url",),
+    "wayback_urls": ("wayback_url",),
+    "interesting_links": ("source_url", "link"),
+    "keyword_counts": ("count", "keyword"),
+    "all_indexed_urls": (
+        "timestamp", "mime_type", "resource_class", "classification_reason",
+        "routing_decision", "body_coverage", "state", "payload_availability",
+        "skip_reason", "original_url",
+    ),
+    "errors": (
+        "last_seen", "operation", "category", "attempts", "retryable",
+        "http_status", "timestamp", "source", "message",
+    ),
+    "site_issues": (
+        "last_seen", "host", "stage", "category", "http_status", "occurrences", "message",
+    ),
+    "summary": (
+        "heading", "generated", "output_directory", "operation", "scan_run",
+        "keyword_set", "keyword_rules", "source_operation", "scan_started",
+        "scan_completed", "targets", "date_range", "indexed_captures", "bodies_searched",
+        "ranked_matches", "unresolved_errors", "site_issues", "states",
+    ),
+    "media_indexed": ("timestamp", "media_kind", "extension", "state", "original_url"),
+    "media_downloaded": ("timestamp", "media_kind", "bytes_saved", "local_file", "original_url"),
+    "media_wayback_urls": ("wayback_url",),
+    "media_errors": ("last_seen", "category", "attempts", "timestamp", "original_url", "message"),
+    "media_summary": (
+        "heading", "generated", "indexed_media", "downloaded", "pending",
+        "errors", "unresolved_media_errors", "snapshot_strategy",
+        "included_extensions", "excluded_extensions",
+    ),
+    "analysis_summary": (
+        "heading", "documents_processed", "forum_threads", "forum_posts", "extractions",
+        "legacy_assets", "external_assets_found", "exact_duplicate_groups",
+        "near_duplicate_groups", "grouped_documents", "snapshot_pairs",
+        "changed_snapshot_pairs", "first_appearances", "provenance_edges",
+    ),
+    "forum_threads": (
+        "canonical_key", "canonical_url", "title", "profile", "first_timestamp",
+        "last_timestamp", "post_count", "document_count",
+    ),
+    "extractions": ("document_id", "extractor", "type", "field", "value", "context"),
+    "legacy_assets": ("document_id", "url", "type", "player", "external", "archive_status", "context"),
+    "duplicate_groups": ("group_id", "method", "representative_document_id", "document_id", "similarity"),
+    "provenance": ("source_url", "source_timestamp", "mirror_url", "mirror_timestamp", "method", "similarity"),
+    "snapshot_diffs": ("earlier_url", "earlier_timestamp", "later_timestamp", "summary_json"),
+    "first_appearances": ("query", "original_url", "first_timestamp", "last_timestamp"),
+}
+
+REPORT_OUTPUT_NAMES = tuple(REPORT_FIELD_NAMES)
+RANKED_REPORT_FIELDS = REPORT_FIELD_NAMES["matches_ranked"]
+SUMMARY_REPORT_FIELDS = REPORT_FIELD_NAMES["summary"]
+MEDIA_SUMMARY_FIELDS = REPORT_FIELD_NAMES["media_summary"]
+
+
+def _ordered_enabled(values: list[str], allowed: tuple[str, ...]) -> list[str]:
+    enabled = {str(value).strip() for value in values if str(value).strip()}
+    return [name for name in allowed if name in enabled]
+
+
+def _default_report_fields() -> dict[str, list[str]]:
+    return {name: list(fields) for name, fields in REPORT_FIELD_NAMES.items()}
+
+
+@dataclass(slots=True)
+class ReportConfig:
+    """Presentation controls; never delete historical evidence or review state.
+
+    Optional lean storage affects only enrichment of future scans. Acquisition
+    and Hitlist do not create these scan payloads in either mode.
+    """
+
+    outputs: list[str] = field(default_factory=lambda: list(REPORT_OUTPUT_NAMES))
+    fields: dict[str, list[str]] = field(default_factory=_default_report_fields)
+    retain_scan_details: bool = True
+    sort_order: str = "score"
+    max_matches: int = 0
+    snippet_limit: int = 0
+    snippet_chars: int = 0
+    link_limit: int = 0
+
+    def normalized(self) -> "ReportConfig":
+        source = self.fields if isinstance(self.fields, dict) else {}
+        return ReportConfig(
+            outputs=_ordered_enabled(self.outputs, REPORT_OUTPUT_NAMES),
+            fields={
+                name: _ordered_enabled(list(source.get(name, REPORT_FIELD_NAMES[name])), REPORT_FIELD_NAMES[name])
+                for name in REPORT_OUTPUT_NAMES
+            },
+            retain_scan_details=bool(self.retain_scan_details),
+            sort_order=self.sort_order if self.sort_order in {"score", "oldest", "newest", "url"} else "score",
+            max_matches=max(0, int(self.max_matches)),
+            snippet_limit=max(0, int(self.snippet_limit)),
+            snippet_chars=max(0, int(self.snippet_chars)),
+            link_limit=max(0, int(self.link_limit)),
+        )
+
+    def output_enabled(self, name: str) -> bool:
+        return name in self.outputs
+
+    def fields_for(self, name: str) -> list[str]:
+        return list(self.fields.get(name, ()))
+
+    def field_enabled(self, output: str, field_name: str) -> bool:
+        return field_name in self.fields.get(output, ())
+
+    @property
+    def ranked_fields(self) -> list[str]:
+        return self.fields_for("matches_ranked")
+
+    @property
+    def summary_fields(self) -> list[str]:
+        return self.fields_for("summary")
+
+    @property
+    def media_summary_fields(self) -> list[str]:
+        return self.fields_for("media_summary")
+
+    @property
+    def store_keyword_counts(self) -> bool:
+        return self.retain_scan_details or (
+            self.output_enabled("keyword_counts") and bool(self.fields_for("keyword_counts"))
+        ) or (
+            self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "keyword_hits")
+        )
+
+    @property
+    def store_keyword_fields(self) -> bool:
+        return self.retain_scan_details or (self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "keyword_hits"))
+
+    @property
+    def store_keyword_details(self) -> bool:
+        return self.store_keyword_counts or self.store_keyword_fields
+
+    @property
+    def store_snippets(self) -> bool:
+        return self.retain_scan_details or (self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "snippets"))
+
+    @property
+    def store_interesting_links(self) -> bool:
+        standalone = self.output_enabled("interesting_links") and bool(self.fields_for("interesting_links"))
+        ranked = self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "interesting_links")
+        return self.retain_scan_details or standalone or ranked
+
+    @property
+    def create_default_reviews(self) -> bool:
+        return self.retain_scan_details or (self.output_enabled("matches_ranked") and self.field_enabled("matches_ranked", "review_status"))
+
+    def to_payload(self) -> dict:
+        return asdict(self.normalized())
+
+
 @dataclass(slots=True)
 class KeywordSetConfig:
     name: str
@@ -197,7 +355,7 @@ class NetworkConfig:
     trust_environment: bool = True
     endpoint_mode: str = "auto"
     index_strategy: str = "auto"
-    page_blocks: int = 9
+    page_blocks: int = 0
     cdx_workers: int = 10
     persistent_retries: bool = True
     retry_base_seconds: float = 5.0
@@ -276,6 +434,7 @@ class ProjectConfig:
     ai: AIConfig | dict = field(default_factory=AIConfig)
     research: ResearchConfig | dict = field(default_factory=ResearchConfig)
     network: NetworkConfig | dict = field(default_factory=NetworkConfig)
+    report: ReportConfig | dict = field(default_factory=ReportConfig)
     target_settings: dict[str, dict] = field(default_factory=dict)
     auto_backup: bool = True
     backup_keep: int = 5
@@ -338,6 +497,8 @@ class ProjectConfig:
         research = research.normalized()
         network = self.network if isinstance(self.network, NetworkConfig) else NetworkConfig(**self.network)
         network = network.normalized()
+        report = self.report if isinstance(self.report, ReportConfig) else ReportConfig(**self.report)
+        report = report.normalized()
         target_settings: dict[str, dict] = {}
         for raw_target, raw_settings in (self.target_settings or {}).items():
             target = normalize_target(str(raw_target))
@@ -384,6 +545,7 @@ class ProjectConfig:
             ai=ai,
             research=research,
             network=network,
+            report=report,
             target_settings=target_settings,
             auto_backup=bool(self.auto_backup),
             backup_keep=min(50, max(1, int(self.backup_keep))),
@@ -417,6 +579,7 @@ class ProjectConfig:
         payload["ai"] = config.ai.to_payload() if isinstance(config.ai, AIConfig) else dict(config.ai)
         payload["research"] = config.research.to_payload() if isinstance(config.research, ResearchConfig) else dict(config.research)
         payload["network"] = config.network.to_payload() if isinstance(config.network, NetworkConfig) else dict(config.network)
+        payload["report"] = config.report.to_payload() if isinstance(config.report, ReportConfig) else dict(config.report)
         payload["version"] = VERSION
         return payload
 
@@ -436,6 +599,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     ai_payload = payload.get("ai") or {}
     research_payload = payload.get("research") or {}
     network_payload = payload.get("network") or {}
+    report_payload = payload.get("report") or {}
     loaded_page_size = int(payload.get("page_size", 100000))
     loaded_cdx_delay = float(payload.get("cdx_delay", 2.5))
     loaded_page_blocks = int(network_payload.get("page_blocks", 0))
@@ -586,6 +750,16 @@ def load_project_config(path: Path) -> ProjectConfig:
             entity_extraction=bool(research_payload.get("entity_extraction", True)),
             duplicate_clustering=bool(research_payload.get("duplicate_clustering", True)),
             ai_evidence_limit=int(research_payload.get("ai_evidence_limit", 24)),
+        ),
+        report=ReportConfig(
+            outputs=list(report_payload.get("outputs", REPORT_OUTPUT_NAMES)),
+            fields=dict(report_payload.get("fields") or _default_report_fields()),
+            retain_scan_details=bool(report_payload.get("retain_scan_details", True)),
+            sort_order=str(report_payload.get("sort_order", "score")),
+            max_matches=int(report_payload.get("max_matches", 0)),
+            snippet_limit=int(report_payload.get("snippet_limit", 0)),
+            snippet_chars=int(report_payload.get("snippet_chars", 0)),
+            link_limit=int(report_payload.get("link_limit", 0)),
         ),
         network=NetworkConfig(
             backend=str(network_payload.get("backend", "auto")),

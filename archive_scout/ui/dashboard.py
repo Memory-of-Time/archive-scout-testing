@@ -9,10 +9,12 @@ EMPTY_DASHBOARD = {
     "documents": 0,
     "matches": 0,
     "errors": 0,
+    "text": 0,"image":0,"video":0,"audio":0,"media_descriptor":0,
+    "other_binary":0,"unknown":0,"deferred":0,"skipped":0,"failed":0,
 }
 
 
-def read_dashboard_counts(database_path: Path) -> dict[str, int]:
+def read_dashboard_counts(database_path: Path, *, include_classification: bool = True) -> dict[str, int]:
     """Read dashboard totals without migrating or mutating the project database."""
     if not database_path.exists():
         return dict(EMPTY_DASHBOARD)
@@ -31,11 +33,24 @@ def read_dashboard_counts(database_path: Path) -> dict[str, int]:
         ).fetchone()
         if row is None:
             return dict(EMPTY_DASHBOARD)
-        return {
+        result = {
             "captures": int(row[0] or 0),
             "documents": int(row[1] or 0),
             "matches": int(row[2] or 0),
             "errors": int(row[3] or 0),
         }
+        if not include_classification:
+            return result
+        try:
+            from ..database.classification import classification_counts
+            counts=classification_counts(database)
+            for kind in ("text","image","video","audio","media_descriptor","other_binary","unknown"):
+                result[kind]=counts.get(kind,0)
+            result["deferred"]=counts.get("route_deferred_to_media",0)
+            result["skipped"]=counts.get("route_skipped_non_text",0)+counts.get("route_skipped_url_filter",0)
+            result["failed"]=counts.get("route_failed",0)
+        except sqlite3.OperationalError:
+            pass
+        return result
     finally:
         database.close()

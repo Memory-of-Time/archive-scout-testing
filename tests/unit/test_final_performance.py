@@ -33,9 +33,9 @@ class FinalPerformanceTests(unittest.TestCase):
             network=NetworkConfig(index_strategy=strategy, cdx_workers=10),
         ).normalized()
 
-    def test_auto_indexing_uses_timemap_page_count_then_parallel_pages(self):
+    def test_explicit_paged_indexing_uses_timemap_page_count_then_parallel_pages(self):
         with tempfile.TemporaryDirectory() as temp:
-            config = self._config(Path(temp))
+            config = self._config(Path(temp), strategy="paged")
             database = open_database(config.output_dir)
             calls: list[tuple[tuple[str, ...], dict[str, str], bool]] = []
 
@@ -54,10 +54,10 @@ class FinalPerformanceTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertIn("/web/timemap/json", calls[0][0][0])
             self.assertEqual(calls[0][1]["showNumPages"], "true")
-            self.assertEqual(calls[0][1]["pageSize"], "9")
+            self.assertNotIn("pageSize", calls[0][1])
             self.assertFalse(calls[0][2])
             self.assertEqual(calls[1][1]["page"], "0")
-            self.assertEqual(calls[1][1]["pageSize"], "9")
+            self.assertNotIn("pageSize", calls[1][1])
             self.assertFalse(calls[1][2])
 
     def test_explicit_paged_strategy_remains_available(self):
@@ -66,7 +66,7 @@ class FinalPerformanceTests(unittest.TestCase):
             self.assertEqual(preferred_index_strategy(config, "example.com/*"), "paged")
         with tempfile.TemporaryDirectory() as temp:
             config = self._config(Path(temp), strategy="auto")
-            self.assertEqual(preferred_index_strategy(config, "example.com/*"), "paged")
+            self.assertEqual(preferred_index_strategy(config, "example.com/*"), "resume")
 
     def test_unfinished_numbered_queue_stays_parallel_in_auto_mode(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -102,8 +102,8 @@ class FinalPerformanceTests(unittest.TestCase):
             page = dict(build_media_paged_params(
                 config, "example.com/*", "20010101000000", "20011231235959", extensions, 3, config.network.page_blocks
             ))
-            self.assertEqual(count["pageSize"], "9")
-            self.assertEqual(page["pageSize"], "9")
+            self.assertNotIn("pageSize", count)
+            self.assertNotIn("pageSize", page)
             self.assertEqual(page["page"], "3")
 
     def test_unfinished_media_numbered_queue_stays_parallel(self):
@@ -128,7 +128,7 @@ class FinalPerformanceTests(unittest.TestCase):
     def test_media_auto_indexing_uses_timemap_parallel_page_pipeline(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            base = self._config(root)
+            base = self._config(root, strategy="paged")
             config = ProjectConfig(
                 **{
                     **{name: getattr(base, name) for name in base.__dataclass_fields__},
@@ -154,9 +154,9 @@ class FinalPerformanceTests(unittest.TestCase):
             database.close()
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0]["showNumPages"], "true")
-            self.assertEqual(calls[0]["pageSize"], "9")
+            self.assertNotIn("pageSize", calls[0])
             self.assertEqual(calls[1]["page"], "0")
-            self.assertEqual(calls[1]["pageSize"], "9")
+            self.assertNotIn("pageSize", calls[1])
 
     def test_urlkey_text_rows_preserve_urls_with_spaces_and_resume_key(self):
         params = [("fl", "urlkey,timestamp,mimetype,statuscode,digest,length,original")]

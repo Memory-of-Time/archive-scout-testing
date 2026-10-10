@@ -421,26 +421,16 @@ def _resolve_media_strategy(current: PendingWindow, config: ProjectConfig, targe
     desired = preferred_index_strategy(config, target)
     if current.strategy not in {"paged", "resume"}:
         current.strategy = desired
-    elif desired == "resume" and current.strategy == "paged":
-        # Convert unfinished numbered media queues from v1.0.2 to row-scaled
-        # resume traversal. Existing captures stay in SQLite and unchanged rows
-        # are no-op upserts, so no indexed work is lost.
-        current.strategy = "resume"
-        # Keep adaptive date-window splitting available after abandoning only
-        # the old numbered-page queue.
-        current.pagination_supported = True
-        current.page = 0
-        current.page_count = -1
-        current.retry_pages.clear()
-        current.page_failures.clear()
-        current.resume_key = None
+    # An unfinished numbered-page queue is durable progress.  An *automatic*
+    # preference change must never discard its cursor or completed pages.
+    # Explicit user-selected strategies apply to new windows; preserve the
+    # in-flight page plan until its checkpoint can be completed safely.
     if not current.pagination_supported and current.strategy == "paged":
         current.strategy = "resume"
     network = config.network.normalized()
     if network.index_strategy == "auto" and current.strategy == "paged":
-        # Direct-media auto indexing uses the same fixed fast Timemap profile as
-        # main URL indexing, regardless of an older saved custom block count.
-        current.page_blocks = 9
+        # Preserve the original grouping of an unfinished media page plan.
+        current.page_blocks = max(1, current.page_blocks or 9)
     elif current.page_blocks <= 0:
         current.page_blocks = network.page_blocks
 

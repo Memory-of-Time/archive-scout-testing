@@ -9,6 +9,8 @@ from typing import Callable
 
 from .cdx.client import RateLimitDeferred
 from .cdx.indexer import index_archive
+from .cdx.parameters import cdx_query_signature
+from .database.classification import classify_indexed_captures
 from .analysis.workflow import run_analysis
 from .config import KeywordSetConfig, ProjectConfig, save_project_config
 from .database.connection import open_database
@@ -274,6 +276,7 @@ def run_project(
             return {"merge_summary": merge_report}
         if mode == "index":
             index_archive(config, database, stop_event, callback)
+            classify_indexed_captures(database, cdx_query_signature(config), stop_event)
             paths = generate_index_reports(config, database)
             paths["project"] = config.output_dir / "project.json"
             finish_operation_run(database, operation_run_id, "complete", "Index complete")

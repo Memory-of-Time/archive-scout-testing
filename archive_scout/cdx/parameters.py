@@ -142,11 +142,10 @@ def preferred_index_strategy(config: ProjectConfig, target: str) -> str:
     strategy = config.network.normalized().index_strategy
     if strategy != "auto":
         return strategy
-    # v1.0.5 follows the fast downloader's acquisition model: ask Timemap for
-    # the page count once, then keep a bounded pool of numbered page requests
-    # continuously occupied. Resume-key traversal remains the automatic fallback
-    # when page counting/pagination is unavailable or one page stays pathological.
-    return "paged"
+    # The v1.1.1 automatic strategy uses data-bearing resume traversal for
+    # unknown inventories, avoiding page-count and sparse-year query overhead.
+    # Explicit paged mode and persisted paged plans remain available for dense sites.
+    return "resume"
 
 
 def build_num_pages_params(

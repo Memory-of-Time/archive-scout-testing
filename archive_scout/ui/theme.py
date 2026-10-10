@@ -111,8 +111,9 @@ def apply_theme(root: tk.Tk, requested: str = "system", font_scale: float = 1.0)
     style.configure("SidebarActive.TButton", background=colors["accent"], foreground="#ffffff", borderwidth=0, anchor="w", padding=(14, 9), font=("TkDefaultFont", 10, "bold"))
     style.map("SidebarActive.TButton", background=[("active", colors["accent_active"])])
     style.configure("Status.TLabel", background=colors["panel"], foreground=colors["text"], padding=(8, 5))
-    style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["text"], insertcolor=colors["text"], bordercolor=colors["border"])
-    style.configure("TCombobox", fieldbackground=colors["input"], foreground=colors["text"], background=colors["panel"], arrowcolor=colors["text"])
+    style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["text"], insertcolor=colors["text"], bordercolor=colors["border"], borderwidth=1, relief="solid", padding=(5,4))
+    style.map("TEntry", bordercolor=[("focus", colors["accent"])])
+    style.configure("TCombobox", fieldbackground=colors["input"], foreground=colors["text"], background=colors["panel"], arrowcolor=colors["text"], borderwidth=1, relief="solid", padding=(4,3))
     style.map("TCombobox", fieldbackground=[("readonly", colors["input"])], foreground=[("readonly", colors["text"])])
     style.configure("Treeview", background=colors["panel"], fieldbackground=colors["panel"], foreground=colors["text"], rowheight=max(24, int(24 * scale)), bordercolor=colors["border"])
     style.map("Treeview", background=[("selected", colors["accent"])], foreground=[("selected", "#ffffff")])
@@ -137,7 +138,9 @@ def apply_text_theme(widget: tk.Misc, colors: dict[str, str]) -> None:
                     selectforeground="#ffffff",
                     highlightbackground=colors["border"],
                     highlightcolor=colors["accent"],
-                    relief="flat",
+                    relief="solid",
+                    borderwidth=1,
+                    highlightthickness=1,
                 )
             except tk.TclError:
                 pass
