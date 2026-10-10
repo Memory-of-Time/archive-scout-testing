@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0 — Lean rebuild candidate
+
+- Authentic v1.0.5 source core; selected v1.1.1 GUI widgets and dedicated Reports page.
+- Fixed 2.5-second CDX pacing; retained fixed 0.125-second replay pacing, bounded worker pools and paged Timemap indexing.
+- Strict CDX JSON row validation, complete source scans, content classification corrections and exact original-byte atomic saves.
+- Non-adaptive throttle fallback and automatic recoverable indexing/text download retries; durable retry selection.
+- Correct successful-save rate rather than request attempt rate.
+- Added cross-platform tests runner and lean-rebuild regressions, CI evidence upload and clean repository identity checks.
+- Preserved schema 7, documented missing schema-13 feature parity; **not** safe for newer schema-13 project downgrades.
+
+
 ## 1.0.5
 
 - Changed automatic CDX indexing to the fast Timemap numbered-page pipeline: fixed pageSize=9, ten concurrent page workers, Timemap JSON first, and a rolling queue of up to 1,000 pages. Auto mode forces the reference page grouping even when an older saved queue carried a different numbered-page block value.
