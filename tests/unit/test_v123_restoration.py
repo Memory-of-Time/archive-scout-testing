@@ -59,7 +59,11 @@ class HitlistRestorationTests(unittest.TestCase):
                 self.assertEqual(result['matches'],1)
                 self.assertEqual(result['local_checked'],1)
                 self.assertEqual(path.read_bytes(),body)
-                self.assertEqual(database.execute('SELECT path FROM documents').fetchone()[0],str(path.resolve()))
+                stored_path = database.execute('SELECT path FROM documents').fetchone()[0]
+                # Windows 8.3 aliases and macOS /var -> /private/var are the same file.
+                # Verify physical identity rather than imposing one path spelling.
+                self.assertTrue(os.path.samefile(stored_path, path),
+                                f'Imported document is not the original source: {stored_path!r}')
             finally:
                 database.close()
 
