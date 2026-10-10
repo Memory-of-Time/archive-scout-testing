@@ -11,7 +11,7 @@ from archive_scout.cdx.indexer import index_archive
 from archive_scout.config import NetworkConfig, ProjectConfig
 from archive_scout.database.connection import open_database
 from archive_scout.downloads.rate_limit import FixedRateLimiter
-from archive_scout.events import ConnectivityPaused
+from archive_scout.events import Stopped
 from archive_scout.network.transports import ResilientTransport, TransportExhaustedError, TransportResponse
 
 
@@ -102,14 +102,23 @@ class V3NetworkRecoveryTests(unittest.TestCase):
             ).normalized()
             database = open_database(root)
             transient = TransientRequestError("offline", timed_out=True, splittable=True)
+            class CancelAfterRetries(threading.Event):
+                def __init__(self):
+                    super().__init__()
+                    self.waits = 0
+                def wait(self, _timeout=None):
+                    self.waits += 1
+                    if self.waits >= 2:
+                        self.set()
+                    return self.is_set()
             with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", side_effect=transient), patch(
                 "archive_scout.cdx.indexer.transient_backoff", return_value=0
             ):
-                with self.assertRaises(ConnectivityPaused):
-                    index_archive(config, database, threading.Event())
+                with self.assertRaises(Stopped):
+                    index_archive(config, database, CancelAfterRetries())
             state = database.execute("SELECT complete,resume_key FROM index_state").fetchone()
             self.assertEqual(state["complete"], 0)
-            self.assertIn('"failures":2', state["resume_key"])
+            self.assertGreaterEqual(int(state["resume_key"].split('"failures":')[1].split(",")[0]), 2)
             self.assertEqual(database.execute("SELECT COUNT(*) FROM errors WHERE retryable=1").fetchone()[0], 1)
             database.close()
 

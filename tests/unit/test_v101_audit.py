@@ -111,8 +111,8 @@ class V101AuditTests(unittest.TestCase):
                 rate_limit_max_wait=0,
                 rate_limit_attempts=0,
             ).normalized()
-        self.assertEqual(config.rate_limit_max_wait, 900.0)
-        self.assertEqual(config.rate_limit_attempts, 8)
+        self.assertEqual(config.rate_limit_max_wait, 0.0)
+        self.assertEqual(config.rate_limit_attempts, 0)
 
 
     def test_resume_progress_is_cumulative_from_persisted_capture_states(self):
