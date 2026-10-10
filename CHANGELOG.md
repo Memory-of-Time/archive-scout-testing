@@ -1,3 +1,12 @@
+## 1.2.2 (2026-10-10) — CDX response efficiency and GUI/dashboard corrections
+
+- Reinstated v1.1.1's native Timemap endpoint format preference and one-response JSON detection. CDX fallback warnings now report the actual parse fault instead of asserting that every nonmatching response was incomplete.
+- Download Activity reports rolling 30-second fresh committed saves/s, with invocation-average speed separately identified; no new database queries in replay workers.
+- Dashboard cards refresh only on an explicit Refresh dashboard click. Saved documents counts downloaded and downloaded-unscanned text captures; ranked matches counts distinct pages with qualifying positive keyword matches, excluding zero-score/excluded/incomplete-rule results.
+- Fixed unthemed white scrolling canvases in dark mode, preserved OS-native font scaling, reduced unnecessary media editor width, and constrained long media help text.
+- Kept database schema 8, fixed 2.5-second CDX and 0.125-second replay request spacing, existing indexing checkpoints and all download/scan routing.
+- Added Windows-safe fixture cleanup and regression tests. Local loopback results are not sustained live Wayback claims.
+
 ## 1.2.1 (2026-10-10) — Lean acquisition + post-acquisition scanning
 
 - Restored v1.1.1-style automatic index strategy, exclusive keyword set selection, accessible GUI and customizable Reports (candidate improvements).

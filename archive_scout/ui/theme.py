@@ -78,7 +78,13 @@ def palette_for(root: tk.Misc, requested: str) -> tuple[str, dict[str, str]]:
 def apply_theme(root: tk.Tk, requested: str = "system", font_scale: float = 1.0) -> tuple[str, dict[str, str]]:
     resolved, colors = palette_for(root, requested)
     scale = min(1.75, max(0.8, float(font_scale)))
-    root.tk.call("tk", "scaling", scale)
+    # Preserve native OS/Tk DPI scaling. Setting scaling=1.0 made 10pt text
+    # render near 10 pixels on Windows, producing tiny, inaccessible controls.
+    native = getattr(root, "_archive_scout_native_scaling", None)
+    if native is None:
+        native = float(root.tk.call("tk", "scaling"))
+        root._archive_scout_native_scaling = native
+    root.tk.call("tk", "scaling", native * scale)
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
@@ -128,6 +134,13 @@ def apply_theme(root: tk.Tk, requested: str = "system", font_scale: float = 1.0)
 
 def apply_text_theme(widget: tk.Misc, colors: dict[str, str]) -> None:
     for child in widget.winfo_children():
+        if isinstance(child, tk.Canvas):
+            # Tk canvases are not themed by ttk's style system. An unstyled
+            # canvas shows as a large white rectangle in dark mode.
+            try:
+                child.configure(background=colors["bg"], highlightbackground=colors["border"])
+            except tk.TclError:
+                pass
         if isinstance(child, (tk.Text, tk.Listbox)):
             try:
                 child.configure(

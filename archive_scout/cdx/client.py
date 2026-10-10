@@ -469,6 +469,26 @@ class HttpClient:
         with self.endpoint_lock:
             self.endpoint_cooldown_until[endpoint] = time.monotonic() + 20.0
 
+    @staticmethod
+    def _cdx_format_attempts(endpoint: str, prefer_text: bool) -> tuple[str, str]:
+        """Choose the native Timemap representation before trying an alternative.
+
+        Timemap /json endpoints may ignore output=txt. Do not resend a
+        successful inventory solely because its endpoint returned native JSON.
+        """
+        path = urllib.parse.urlsplit(endpoint).path.rstrip("/").casefold()
+        if path.endswith("/web/timemap/json"):
+            return ("json", "text")
+        if path.endswith("/web/timemap/cdx"):
+            return ("text", "json")
+        return ("text", "json") if prefer_text else ("json", "text")
+
+    @staticmethod
+    def _cdx_json_body(data: bytes) -> bool:
+        """Recognize a JSON body on a text-preferred endpoint without a re-GET."""
+        prefix = bytes(data[:128]).lstrip(b"\xef\xbb\xbf \r\n\t")
+        return prefix.startswith((b"[", b"{"))
+
     def get_cdx_any(
         self,
         urls: Iterable[str],
@@ -484,7 +504,7 @@ class HttpClient:
         text_params = cdx_text_fallback_params(params)
 
         for endpoint in endpoints:
-            attempts = ("text", "json") if prefer_text else ("json", "text")
+            attempts = self._cdx_format_attempts(endpoint, prefer_text)
             first_error: BaseException | None = None
             for format_name in attempts:
                 request_params = text_params if format_name == "text" else params
@@ -493,7 +513,11 @@ class HttpClient:
                     accept = "text/plain,*/*" if format_name == "text" else "application/json,text/plain,*/*"
                     response = self.get(full_url, max_bytes, accept)
                     if format_name == "text":
-                        payload = parse_cdx_text_response(response["data"], endpoint, request_params)
+                        payload = (
+                            parse_json_response(response["data"], endpoint)
+                            if self._cdx_json_body(response["data"])
+                            else parse_cdx_text_response(response["data"], endpoint, request_params)
+                        )
                     else:
                         payload = parse_json_response(response["data"], endpoint)
                     self._remember_endpoint_success(endpoint)
@@ -508,7 +532,7 @@ class HttpClient:
                     first_error = first_error or exc
                     if self.retry_callback:
                         other = "JSON" if format_name == "text" else "line-oriented text"
-                        self.retry_callback(1, 1, f"CDX {format_name} response was incomplete; retrying as {other}", 0.0)
+                        self.retry_callback(1, 1, f"CDX {format_name} response invalid ({str(exc)[:130]}); retrying as {other}", 0.0)
                     continue
                 except TransientRequestError as exc:
                     first_error = first_error or exc
@@ -598,7 +622,7 @@ class HttpClient:
         text_params = cdx_text_fallback_params(params)
 
         for endpoint in endpoints:
-            attempts = ("text", "json") if prefer_text else ("json", "text")
+            attempts = self._cdx_format_attempts(endpoint, prefer_text)
             first_error: BaseException | None = None
             for format_name in attempts:
                 request_params = text_params if format_name == "text" else params
@@ -607,7 +631,11 @@ class HttpClient:
                     accept = "text/plain,*/*" if format_name == "text" else "application/json,text/plain,*/*"
                     response = self.get(full_url, max_bytes, accept)
                     if format_name == "text":
-                        result = parse_cdx_text_rows(response["data"], endpoint, request_params)
+                        result = (
+                            parse_cdx_rows_payload(parse_json_response(response["data"], endpoint))
+                            if self._cdx_json_body(response["data"])
+                            else parse_cdx_text_rows(response["data"], endpoint, request_params)
+                        )
                     else:
                         result = parse_cdx_rows_payload(parse_json_response(response["data"], endpoint))
                     self._remember_endpoint_success(endpoint)
@@ -622,7 +650,7 @@ class HttpClient:
                     first_error = first_error or exc
                     if self.retry_callback:
                         other = "JSON" if format_name == "text" else "line-oriented text"
-                        self.retry_callback(1, 1, f"CDX {format_name} response was incomplete; retrying as {other}", 0.0)
+                        self.retry_callback(1, 1, f"CDX {format_name} response invalid ({str(exc)[:130]}); retrying as {other}", 0.0)
                     continue
                 except TransientRequestError as exc:
                     first_error = first_error or exc

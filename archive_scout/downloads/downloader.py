@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from collections import deque
 import hashlib
 import sqlite3
 import threading
@@ -369,6 +370,7 @@ def download_archive(
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
     )
     completed = matched = failures = saved_this_pass = 0
+    recent_commits: deque[float] = deque()
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     try:
@@ -412,6 +414,7 @@ def download_archive(
                         result = future.result()
                         save_success(database, result)
                         saved_this_pass += 1
+                        recent_commits.append(time.monotonic())
                         if "analyses" in result:
                             matched += int(any(
                                 int(analysis.get("score") or 0) >= config.minimum_score
@@ -498,7 +501,14 @@ def download_archive(
                             callback(ProgressEvent("site_issue", issue_message))
                     completed += 1
                     elapsed = max(0.001, time.monotonic() - started)
-                    rate = saved_this_pass / elapsed
+                    # This measures successfully committed *recent* saves,
+                    # not an invocation average diluted by hours of indexing,
+                    # waiting, or older network faults. No database reads.
+                    now = time.monotonic()
+                    while recent_commits and recent_commits[0] <= now - 30.0:
+                        recent_commits.popleft()
+                    rate = len(recent_commits) / min(30.0, elapsed)
+                    invocation_rate = saved_this_pass / elapsed
                     cumulative_completed = min(cumulative_total, completed_before + completed)
                     if callback:
                         callback(
@@ -506,13 +516,16 @@ def download_archive(
                                 "download",
                                 f"Processed {cumulative_completed:,}/{cumulative_total:,}; "
                                 f"this pass {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
-                                f"matches {matched:,}; errors {failures:,}; successful saves {rate:.1f}/s",
+                                f"matches {matched:,}; errors {failures:,}; recent successful saves {rate:.1f}/s (30s); "
+                                f"whole-pass average {invocation_rate:.1f}/s",
                                 cumulative_completed,
                                 cumulative_total,
                                 {
                                     "matched": matched,
                                     "failures": failures,
                                     "rate": rate,
+                                    "rolling_save_rate_30s": rate,
+                                    "invocation_save_rate": invocation_rate,
                                     "new_saves": saved_this_pass,
                                 },
                             )

@@ -1,6 +1,13 @@
-# Archive Scout 1.2.1 — Lean Engine & Feature Restoration
+# Archive Scout 1.2.2 — Lean Engine, CDX & Dashboard Fixes
 
 This **patch-updated runnable source repository** starts with the original September 12, 2026 v1.0.5 downloader/indexer/database and selectively restores compatible interface improvements from v1.1.1. Its scope is correctness, fixed pacing, low overhead and stable long-run operation. It is **not** a claim of exact v1.1.1 feature parity or verified sustained live Internet Archive performance.
+
+## v1.2.2 highlights
+
+- CDX's native Timemap format is selected first; valid JSON returned by a text-preferred endpoint is accepted in the same request. Invalid/truncated inventories remain rejected. Global fixed 2.5-second CDX pacing is unchanged.
+- The Activity download speed is a **rolling 30-second rate of newly committed saves**, with the whole-pass average separately labeled. Fixed 0.125-second replay pacing remains unchanged.
+- The Dashboard is **manual refresh only**: `Saved documents` counts completed text downloads (including locally unscanned bodies), and `Ranked matches` counts unique pages with qualifying keyword matches, not number of hits or repeated scan sets.
+- The dark interface's scroll canvases are now themed (no white background), native display DPI scaling is preserved, and Media extension editors are compact. The main editor can expand into the available space.
 
 ## Install and launch
 
@@ -46,7 +53,7 @@ This code uses **schema 8** (with automatic migrations from supported schema 2�
 
 ## v1.1.1 feature parity
 
-The exact v1.1.1 repository was audited. **Not all of its feature-specific database/API changes were ported.** In particular, v1.1.1 Hitlist resume, full operation-specific schema-13 analysis fields, newer FTS model, and operation-scoped evidence tables still require a deliberate compatibility design. Per-file report choice, filtering, sorting, and indexed classification fields are restored in 1.2.1. See `docs/FEATURE_PARITY.md` and `docs/LEAN_REBUILD_AUDIT.md`. The v1.1.1 main window cannot be copied wholesale without pulling in its larger engine and schema.
+The exact v1.1.1 repository was audited. **Not all of its feature-specific database/API changes were ported.** In particular, v1.1.1 Hitlist resume, full operation-specific schema-13 analysis fields, newer FTS model, and operation-scoped evidence tables still require a deliberate compatibility design. Per-file report choice, filtering, sorting, and indexed classification fields are restored in 1.2.1 and refined in 1.2.2. See `docs/FEATURE_PARITY.md` and `docs/LEAN_REBUILD_AUDIT.md`. The v1.1.1 main window cannot be copied wholesale without pulling in its larger engine and schema.
 
 ## Verification boundaries
 

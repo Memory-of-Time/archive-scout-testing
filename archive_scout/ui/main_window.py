@@ -169,10 +169,11 @@ class ArchiveScoutApp(tk.Tk):
         WheelRouter.ensure(self)
         first_run = not self.state_path().exists()
         self.load_app_state()
+        self.invalidate_dashboard()  # Display selected project; leave all counts unqueried.
         self.apply_interface_theme()
-        self.output_var.trace_add("write", lambda *_args: self.after_idle(self.refresh_dashboard))
+        self.output_var.trace_add("write", lambda *_args: self.invalidate_dashboard())
         self.after(100, self.process_events)
-        self.dashboard_refresh_job = self.after(250, self.dashboard_refresh_loop)
+        self.dashboard_refresh_job = None  # Dashboard snapshots are manual only.
         if first_run:
             self.after(450, self.show_welcome)
 
@@ -230,10 +231,10 @@ class ArchiveScoutApp(tk.Tk):
         self.backup_keep_var = tk.StringVar(value="5")
         self.import_source_var = tk.StringVar()
         self.dashboard_project_var = tk.StringVar(value="No project opened")
-        self.dashboard_captures_var = tk.StringVar(value="0")
-        self.dashboard_documents_var = tk.StringVar(value="0")
-        self.dashboard_matches_var = tk.StringVar(value="0")
-        self.dashboard_errors_var = tk.StringVar(value="0")
+        self.dashboard_captures_var = tk.StringVar(value="—")
+        self.dashboard_documents_var = tk.StringVar(value="—")
+        self.dashboard_matches_var = tk.StringVar(value="—")
+        self.dashboard_errors_var = tk.StringVar(value="—")
         self.result_page_var = tk.StringVar(value="Page 1")
         self.keyword_set_var = tk.StringVar()
         self.keyword_set_selected_var = tk.BooleanVar(value=True)
@@ -390,14 +391,20 @@ class ArchiveScoutApp(tk.Tk):
         for column, (title, variable) in enumerate(cards):
             card = ttk.Frame(tab, padding=14, style="Panel.TFrame")
             card.grid(row=2, column=column, sticky="ew", padx=(0 if column == 0 else 6, 6 if column < 3 else 0))
-            ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
-            ttk.Label(card, textvariable=variable, style="CardValue.TLabel").pack(anchor="w", pady=(5, 0))
-        self.dashboard_classification_var = tk.StringVar(value="Indexed classes: awaiting inventory")
+            name_label = ttk.Label(card, text=title, style="CardTitle.TLabel")
+            name_label.pack(anchor="w")
+            count_label = ttk.Label(card, textvariable=variable, style="CardValue.TLabel")
+            count_label.pack(anchor="w", pady=(5, 0))
+            if title == "Saved documents":
+                ToolTip(name_label, "Saved text downloads, including bodies waiting for local scanning; update only with Refresh dashboard.")
+            elif title == "Ranked matches":
+                ToolTip(name_label, "Distinct pages with a qualifying keyword match; repeated scan sets and keyword hits count once.")
+        self.dashboard_classification_var = tk.StringVar(value="Click Refresh dashboard to load persisted totals.")
         ttk.Label(tab,textvariable=self.dashboard_classification_var,justify="left",wraplength=820,
                   style="Muted.TLabel").grid(row=4,column=0,columnspan=4,sticky="ew",pady=(8,0))
         actions = ttk.LabelFrame(tab, text="Project maintenance", padding=12)
         actions.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(14, 0), padx=(0, 6))
-        ttk.Button(actions, text="Refresh dashboard", command=lambda: self.refresh_dashboard(force=True)).pack(fill="x", pady=3)
+        ttk.Button(actions, text="Refresh dashboard", command=self.refresh_dashboard).pack(fill="x", pady=3)
         ttk.Button(actions, text="Create backup", command=lambda: self.start(self.build_config(require_keywords=False), "backup")).pack(fill="x", pady=3)
         ttk.Button(actions, text="Restore a backup…", command=self.restore_backup_ui).pack(fill="x", pady=3)
         ttk.Button(actions, text="Check integrity", command=lambda: self.start(self.build_config(require_keywords=False), "integrity")).pack(fill="x", pady=3)
@@ -424,7 +431,6 @@ class ArchiveScoutApp(tk.Tk):
         self.bind_all(f"<{modifier}-o>", lambda _e: self.load_project())
         self.bind_all(f"<{modifier}-Return>", lambda _e: self.start())
         self.bind_all("<Escape>", lambda _e: self.stop() if self.worker_thread and self.worker_thread.is_alive() else None)
-        self.bind_all("<F5>", lambda _e: self.refresh_dashboard())
         self.bind_all(f"<{modifier}-f>", lambda _e: self.show_page("Results and search"))
 
     def refresh_navigation(self) -> None:
@@ -454,8 +460,6 @@ class ArchiveScoutApp(tk.Tk):
         selected = self.notebook.tab(self.notebook.select(), "text")
         for name, button in self.nav_buttons.items():
             button.configure(style="SidebarActive.TButton" if name == selected else "Sidebar.TButton")
-        if selected == "Dashboard":
-            self.refresh_dashboard()
 
     def show_page(self, name: str) -> None:
         for tab_id in self.notebook.tabs():
@@ -490,45 +494,37 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(frame, text="The Simple workspace keeps the common workflow visible. Advanced mode exposes CDX, media, analysis, network, review, repair, and migration controls. Archive Scout saves its indexing queue continuously and can switch between multiple HTTP connection methods when one stack cannot reach the Internet Archive.", wraplength=550, justify="left").pack(anchor="w")
         ttk.Button(frame, text="Open the dashboard", style="Accent.TButton", command=dialog.destroy).pack(anchor="e", pady=(24, 0))
 
-    def dashboard_refresh_loop(self) -> None:
-        try:
-            selected = self.notebook.tab(self.notebook.select(), "text") if self.notebook.select() else ""
-            active = bool(self.worker_thread and self.worker_thread.is_alive())
-            if active or selected == "Dashboard":
-                self.refresh_dashboard()
-            interval = 5000 if active else (1500 if selected == "Dashboard" else 5000)
-            self.dashboard_refresh_job = self.after(interval, self.dashboard_refresh_loop)
-        except tk.TclError:
-            self.dashboard_refresh_job = None
+    def invalidate_dashboard(self) -> None:
+        """Invalidate previous project snapshots without triggering database I/O."""
+        self.dashboard_project_var.set(str(Path(self.output_var.get()).expanduser()))
+        for variable in (self.dashboard_captures_var, self.dashboard_documents_var,
+                         self.dashboard_matches_var, self.dashboard_errors_var):
+            variable.set("—")
+        if hasattr(self, "dashboard_classification_var"):
+            self.dashboard_classification_var.set("Click Refresh dashboard to load persisted totals.")
 
     def refresh_dashboard(self, force: bool = False) -> None:
+        """User-initiated database snapshot. Never called by a timer or progress."""
         root = Path(self.output_var.get()).expanduser()
         self.dashboard_project_var.set(str(root))
         try:
-            import time as _time
-            active = bool(self.worker_thread and self.worker_thread.is_alive())
-            now = _time.monotonic()
-            last = getattr(self,"_last_classification_refresh",0.0)
-            # Full inventory aggregation is never run per capture or every dashboard tick.
-            # Poll it at most once/minute during download; the user can explicitly refresh.
-            include_class = force or now-last >= (60 if active else 15)
-            counts = read_dashboard_counts(root / "archive_scout.sqlite3", include_classification=include_class)
-            if include_class: self._last_classification_refresh=now
+            counts = read_dashboard_counts(root / "archive_scout.sqlite3", include_classification=True)
             self.dashboard_captures_var.set(f"{counts['captures']:,}")
             self.dashboard_documents_var.set(f"{counts['documents']:,}")
             self.dashboard_matches_var.set(f"{counts['matches']:,}")
             self.dashboard_errors_var.set(f"{counts['errors']:,}")
-            if include_class:
-                summary=(f"Indexed classes: Text {counts.get('text',0):,} · Images {counts.get('image',0):,} · "
-                     f"Videos {counts.get('video',0):,} · Audio {counts.get('audio',0):,} · "
-                     f"Descriptors {counts.get('media_descriptor',0):,} · "
-                     f"Other binary {counts.get('other_binary',0):,} · Unknown {counts.get('unknown',0):,}\n"
-                     f"Deferred to media {counts.get('deferred',0):,} · Skipped non-text/filter {counts.get('skipped',0):,} · "
-                     f"Failed {counts.get('failed',0):,}")
-                self.dashboard_classification_var.set(summary)
+            summary = (
+                f"Indexed classes: Text {counts.get('text',0):,} · Images {counts.get('image',0):,} · "
+                f"Videos {counts.get('video',0):,} · Audio {counts.get('audio',0):,} · "
+                f"Descriptors {counts.get('media_descriptor',0):,} · "
+                f"Other binary {counts.get('other_binary',0):,} · Unknown {counts.get('unknown',0):,}\n"
+                f"Deferred to media {counts.get('deferred',0):,} · "
+                f"Skipped non-text/filter {counts.get('skipped',0):,} · "
+                f"Failed {counts.get('failed',0):,}"
+            )
+            self.dashboard_classification_var.set(summary)
         except Exception as exc:
-            if not (self.worker_thread and self.worker_thread.is_alive()):
-                self.dashboard_project_var.set(f"{root} — {exc}")
+            self.dashboard_project_var.set(f"{root} — dashboard refresh failed: {exc}")
 
     def restore_backup_ui(self) -> None:
         root = Path(self.output_var.get()).expanduser()
@@ -545,7 +541,7 @@ class ArchiveScoutApp(tk.Tk):
         try:
             safety = restore_project_backup(root, Path(selected))
             messagebox.showinfo(APP_NAME, f"Backup restored. Safety copy:\n{safety}")
-            self.refresh_dashboard()
+            self.invalidate_dashboard()
             self.refresh_history()
             self.refresh_results(reset_page=True)
             self.refresh_errors()
@@ -692,35 +688,35 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Checkbutton(options, text="Images", variable=self.media_images_var).grid(row=0, column=1, padx=(16, 0))
         ttk.Checkbutton(options, text="Videos", variable=self.media_videos_var).grid(row=0, column=2, padx=(8, 0))
         ttk.Checkbutton(options, text="Discover media linked inside saved pages", variable=self.media_embedded_var).grid(row=0, column=3, padx=(16, 0))
-        ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(row=0, column=4, padx=(8, 0))
+        ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(row=1, column=0, sticky="w", pady=(7, 0))
         ttk.Label(
             tab,
             text="The ‘Index, download, scan, then download external embedded media’ operation waits until every saved text page has been scanned before it looks up and downloads external image/video links found in those pages.",
-            wraplength=1080,
+            wraplength=720,
             style="Muted.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         labels = ttk.Frame(tab)
         labels.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 4))
         labels.columnconfigure(0, weight=1)
-        labels.columnconfigure(1, weight=1)
+        labels.columnconfigure(1, weight=0)
         ttk.Label(labels, text="Media sites/paths (blank uses Sites and paths)").grid(row=0, column=0, sticky="w")
-        ttk.Label(labels, text="Include extensions, one per line").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(labels, text="Include extensions").grid(row=0, column=1, sticky="w", padx=(12, 0))
         editors = ttk.Frame(tab)
         editors.grid(row=3, column=0, columnspan=2, sticky="nsew")
         editors.columnconfigure(0, weight=1)
-        editors.columnconfigure(1, weight=1)
-        editors.columnconfigure(2, weight=1)
+        editors.columnconfigure(1, weight=0)
+        editors.columnconfigure(2, weight=0)
         editors.rowconfigure(0, weight=1)
-        self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont")
+        self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=36, height=10)
         self.media_targets_text.grid(row=0, column=0, sticky="nsew")
-        self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont")
+        self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=16, height=10)
         self.media_include_text.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
         right = ttk.Frame(editors)
         right.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
-        ttk.Label(right, text="Exclude extensions, one per line").grid(row=0, column=0, sticky="w")
-        self.media_exclude_text = tk.Text(right, wrap="none", font="TkFixedFont")
+        ttk.Label(right, text="Exclude extensions").grid(row=0, column=0, sticky="w")
+        self.media_exclude_text = tk.Text(right, wrap="none", font="TkFixedFont", width=16, height=10)
         self.media_exclude_text.grid(row=1, column=0, sticky="nsew")
         settings = ttk.Frame(tab)
         settings.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -728,7 +724,9 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Combobox(settings, textvariable=self.media_strategy_var, values=("earliest", "latest", "all"), state="readonly", width=10).grid(row=0, column=1, padx=(5, 15))
         ttk.Label(settings, text="Maximum media size (MB):").grid(row=0, column=2)
         ttk.Entry(settings, textvariable=self.media_max_var, width=10).grid(row=0, column=3, padx=(5, 15))
-        ttk.Label(settings, text="Media layout: media/images and media/videos (flat)").grid(row=0, column=4, sticky="w")
+        ttk.Label(settings, text="Media layout: media/images and media/videos (flat)").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(8, 0)
+        )
 
 
     def create_reports_tab(self) -> None:

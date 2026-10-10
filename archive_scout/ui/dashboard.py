@@ -15,7 +15,12 @@ EMPTY_DASHBOARD = {
 
 
 def read_dashboard_counts(database_path: Path, *, include_classification: bool = True) -> dict[str, int]:
-    """Read dashboard totals without migrating or mutating the project database."""
+    """Explicit-refresh snapshot of persisted project totals.
+
+    Documents counts *completed text downloads*, including those pending a
+    local scan. Matches counts unique pages with qualifying positive keyword
+    results, never the number of hits or repeated scan-set rows. No polling.
+    """
     if not database_path.exists():
         return dict(EMPTY_DASHBOARD)
     database = sqlite3.connect(database_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)
@@ -26,8 +31,9 @@ def read_dashboard_counts(database_path: Path, *, include_classification: bool =
             """
             SELECT
                 (SELECT COUNT(*) FROM captures),
-                (SELECT COUNT(*) FROM documents),
-                (SELECT COUNT(*) FROM document_matches),
+                (SELECT COUNT(*) FROM captures WHERE state IN ('downloaded', 'downloaded_unscanned')),
+                (SELECT COUNT(DISTINCT document_id) FROM document_matches
+                 WHERE score > 0 AND excluded=0 AND required_missing=0),
                 (SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0)
             """
         ).fetchone()
