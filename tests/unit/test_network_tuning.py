@@ -14,11 +14,32 @@ class NetworkTuningTests(unittest.TestCase):
     def test_new_projects_use_safe_edge_network_defaults(self):
         config = ProjectConfig(output_dir=Path("."), targets=["example.com/*"], keywords=[]).normalized()
         self.assertEqual(config.page_size, 100000)
-        self.assertEqual(config.cdx_delay, 0.75)
+        self.assertEqual(config.cdx_delay, 0.4)  # 2.5 CDX request starts/second
         self.assertEqual(config.network.page_blocks, 9)
         self.assertEqual(config.network.cdx_workers, 10)
         self.assertEqual(config.workers, 10)
         self.assertEqual(config.download_delay, 0.125)
+
+    def test_missing_saved_index_spacing_uses_new_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "project.json"
+            path.write_text(json.dumps({
+                "output_dir": temp,
+                "targets": ["example.com/*"],
+                "keywords": [],
+            }), encoding="utf-8")
+            self.assertEqual(load_project_config(path).cdx_delay, 0.4)
+
+    def test_existing_project_index_spacing_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "project.json"
+            path.write_text(json.dumps({
+                "output_dir": temp,
+                "targets": ["example.com/*"],
+                "keywords": [],
+                "cdx_delay": 0.75,
+            }), encoding="utf-8")
+            self.assertEqual(load_project_config(path).cdx_delay, 0.75)
 
     def test_paged_and_resume_requests_use_larger_batches(self):
         config = ProjectConfig(
