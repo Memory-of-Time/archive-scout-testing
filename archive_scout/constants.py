@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-VERSION = "1.2.2"
-SCHEMA_VERSION = 8
+VERSION = "1.2.3"
+SCHEMA_VERSION = 9
 APP_NAME = "Archive Scout"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"
 CDX_TIMEMAP_URL = "https://web.archive.org/web/timemap/cdx"
@@ -39,6 +39,7 @@ REVIEW_STATUSES = (
     "unreviewed", "relevant", "possibly_relevant", "false_positive", "duplicate", "dead_end", "needs_follow_up"
 )
 OPERATION_MODES = {
+    "Search with Hitlist": "hitlist",
     "Index, download, scan, and report": "all",
     "Index, download, scan, then download external embedded media": "external_media_after_scan",
     "Index URLs only": "index",

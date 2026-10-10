@@ -13,7 +13,7 @@ from archive_scout.database.connection import open_database
 
 class V3PagedIndexingTests(unittest.TestCase):
     def _config(self, root: Path) -> ProjectConfig:
-        return ProjectConfig(
+        return ProjectConfig(text_collapse_scope="year", 
             output_dir=root,
             targets=["example.com/*"],
             keywords=["example"],

@@ -1,3 +1,11 @@
+## 1.2.3 (2026-10-10) — Scoped v1.1.1 restoration
+
+- Restored compatible v1.1.1 GUI presentation, editor borders, controlled scrolling, History/Errors details and pagination, report controls, optional dashboard refresh/ETA, and local Search with Hitlist.
+- Restored selected-range/resume-first indexing and bounded native JSON paging, with durable per-page and range checkpoints. Existing saved year scope and page layouts are preserved.
+- Added archived external redirect download opt-in, hop-by-hop policy checks, destination display/reporting, and deterministic rejection of live redirects without network cooldowns.
+- Schema 9 adds checkpoint/search tables to the supplied schema 8; existing routing, payload evidence, media and scored scanning remain unchanged. No adaptive rate limiting or new network pause policy.
+- Added restoration, migration, GUI, redirect transport and frozen CLI checks. Local verification does not establish live-service or overnight throughput.
+
 ## 1.2.2 (2026-10-10) — CDX response efficiency and GUI/dashboard corrections
 
 - Reinstated v1.1.1's native Timemap endpoint format preference and one-response JSON detection. CDX fallback warnings now report the actual parse fault instead of asserting that every nonmatching response was incomplete.

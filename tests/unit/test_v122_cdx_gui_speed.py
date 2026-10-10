@@ -80,13 +80,18 @@ class CDXFormatTests(unittest.TestCase):
 
 
 class GUISourceContracts(unittest.TestCase):
-    def test_dashboard_refresh_is_explicit_only(self):
-        import inspect
-        source = inspect.getsource(ArchiveScoutApp)
-        self.assertNotIn('dashboard_refresh_loop', source)
-        self.assertNotIn('self.after_idle(self.refresh_dashboard)', source)
-        self.assertNotIn('self.bind_all("<F5>", lambda _e: self.refresh_dashboard())', source)
-        self.assertEqual(source.count('self.refresh_dashboard('), 0)
+    def test_manual_dashboard_does_not_poll_and_auto_refresh_is_coalesced(self):
+        from archive_scout.ui.dashboard_refresh import DashboardRefreshController
+        controller = DashboardRefreshController(mode='manual')
+        self.assertFalse(controller.automatic_due(0, visible=True, operation_active=True))
+        self.assertIsNone(controller.begin(0))
+        token = controller.begin(0, manual=True)
+        self.assertIsNotNone(token)
+        self.assertIsNone(controller.begin(1, manual=True))
+        self.assertTrue(controller.finish(token))
+        controller.configure('auto', 10)
+        self.assertFalse(controller.automatic_due(5, visible=True, operation_active=True))
+        self.assertTrue(controller.automatic_due(10, visible=True, operation_active=True))
 
 
 class GUIThemeTests(unittest.TestCase):
@@ -108,6 +113,9 @@ class GUIThemeTests(unittest.TestCase):
             self.assertAlmostEqual(float(root.tk.call('tk','scaling')), original_scaling, places=2)
         finally:
             root.destroy()
+            del page, root
+            import gc
+            gc.collect()
 
 
 if __name__ == '__main__':

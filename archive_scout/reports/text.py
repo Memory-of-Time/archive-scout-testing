@@ -25,7 +25,7 @@ REPORT_NAMES = (
 )
 
 RANKED_SELECT = """
-    SELECT m.*,d.path,d.title,d.size_bytes,c.original_url,c.timestamp,c.mimetype,c.state,
+    SELECT m.*,d.path,d.title,d.size_bytes,c.original_url,c.timestamp,c.mimetype,c.state,c.final_url,
            COALESCE(r.status,'unreviewed') AS review_status,
            COALESCE((SELECT text FROM notes n WHERE n.match_id=m.id ORDER BY n.id LIMIT 1),'') AS note,
            COALESCE((SELECT GROUP_CONCAT(t.name, ', ') FROM match_tags mt JOIN tags t ON t.id=mt.tag_id WHERE mt.match_id=m.id),'') AS tags
@@ -234,6 +234,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
                 "title": f"TITLE: {row['title'] or '(untitled)'}",
                 "original_url": f"ORIGINAL URL: {row['original_url']}",
                 "wayback_url": f"WAYBACK URL: {replay_url(row['timestamp'], row['original_url'])}",
+                "redirect_destination": f"REDIRECT DESTINATION: {row['final_url'] or ''}",
                 "local_file": f"LOCAL FILE: {row['path']}",
                 "mime_type": f"MIME TYPE: {row['mimetype'] or '(unknown)'}",
                 "review_status": f"REVIEW STATUS: {row['review_status']}",

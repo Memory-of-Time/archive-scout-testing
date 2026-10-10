@@ -19,7 +19,7 @@ class IndexRecoveryTests(unittest.TestCase):
     def test_full_year_starts_as_one_resumable_window(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -41,7 +41,7 @@ class IndexRecoveryTests(unittest.TestCase):
     def test_timeout_is_split_into_smaller_windows_and_continues(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -72,7 +72,7 @@ class IndexRecoveryTests(unittest.TestCase):
     def test_split_window_plan_survives_stop_and_resume(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -108,7 +108,7 @@ class IndexRecoveryTests(unittest.TestCase):
     def test_rate_limit_deferral_is_retried_without_ending_the_run(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -132,7 +132,7 @@ class IndexRecoveryTests(unittest.TestCase):
     def test_failed_index_does_not_create_empty_scan_runs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -154,7 +154,7 @@ class IndexRecoveryTests(unittest.TestCase):
     def test_stop_is_not_recorded_as_an_index_error(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -222,7 +222,7 @@ class IndexRecoveryTests(unittest.TestCase):
             )
             database.commit()
             database.close()
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=[],
                 keywords=[],

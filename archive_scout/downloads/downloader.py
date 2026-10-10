@@ -27,6 +27,8 @@ from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
+from .redirects import make_replay_redirect_validator
+from ..network.transports import RedirectPolicyError
 
 
 def replay_url(timestamp: str, original: str, modifier: str = "id_") -> str:
@@ -216,7 +218,13 @@ class NonTextResponse(Exception):
 
 def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob], client: HttpClient, scan_now: bool = True) -> dict:
     original = row["original_url"]
-    response = client.get(replay_url(row["timestamp"], original), config.max_file_bytes)
+    url = replay_url(row["timestamp"], original)
+    if isinstance(client, HttpClient):
+        response = client.get(url, config.max_file_bytes,
+                              redirect_validator=make_replay_redirect_validator(config, original))
+    else:
+        # Existing offline integrations can supply a fixture-only client.
+        response = client.get(url, config.max_file_bytes)
     content_type = response["headers"].get("content-type") or response["headers"].get("Content-Type") or row["mimetype"] or ""
     data = response["data"]
     decision = classify_payload_kind(data, content_type, original)
@@ -465,14 +473,17 @@ def download_archive(
                         raise
                     except Exception as exc:
                         failures += 1
-                        category, status, retryable = classify_exception(exc)
+                        if isinstance(exc, RedirectPolicyError):
+                            category, status, retryable = exc.category, None, False
+                        else:
+                            category, status, retryable = classify_exception(exc)
                         issue_message = site_issue_message(
                             category, str(row["original_url"]), "text download", status
                         )
                         with database:
                             database.execute(
-                                "UPDATE captures SET state='error',http_status=?,updated_at=? WHERE id=?",
-                                (status, utc_now(), row["id"]),
+                                "UPDATE captures SET state='error',http_status=?,final_url=COALESCE(?,final_url),updated_at=? WHERE id=?",
+                                (status, getattr(exc, "destination", None), utc_now(), row["id"]),
                             )
                             database.execute(
                                 "UPDATE capture_routing SET routing='failed',updated_at=? WHERE capture_id=?",

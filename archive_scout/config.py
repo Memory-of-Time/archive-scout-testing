@@ -20,7 +20,7 @@ def normalize_extension(value: str) -> str:
 REPORT_FIELD_NAMES: dict[str, tuple[str, ...]] = {
     "matches_ranked": (
         "rank", "score", "scan_run", "timestamp", "title", "original_url",
-        "wayback_url", "local_file", "mime_type", "review_status", "tags",
+        "wayback_url", "redirect_destination", "local_file", "mime_type", "review_status", "tags",
         "note", "keyword_hits", "snippets", "interesting_links",
     ),
     "matched_urls": ("original_url",),
@@ -438,6 +438,13 @@ class ProjectConfig:
     target_settings: dict[str, dict] = field(default_factory=dict)
     auto_backup: bool = True
     backup_keep: int = 5
+    hitlist_keywords: list[str] = field(default_factory=list)
+    text_collapse_scope: str = "range"
+    download_external_redirects: bool = False
+    hitlist_file: str = ""
+    dashboard_refresh_mode: str = "manual"
+    dashboard_refresh_seconds: int = 10
+    dashboard_eta_enabled: bool = False
     import_source: str = ""
 
     def normalized_keyword_sets(self) -> list[KeywordSetConfig]:
@@ -549,6 +556,13 @@ class ProjectConfig:
             target_settings=target_settings,
             auto_backup=bool(self.auto_backup),
             backup_keep=min(50, max(1, int(self.backup_keep))),
+            hitlist_keywords=list(dict.fromkeys(str(value).strip() for value in self.hitlist_keywords if str(value).strip())),
+            download_external_redirects=bool(self.download_external_redirects),
+            text_collapse_scope="year" if str(self.text_collapse_scope).casefold()=="year" else "range",
+            hitlist_file=str(self.hitlist_file).strip(),
+            dashboard_refresh_mode="auto" if str(self.dashboard_refresh_mode).casefold() == "auto" else "manual",
+            dashboard_refresh_seconds=min(3600,max(5,int(self.dashboard_refresh_seconds))),
+            dashboard_eta_enabled=bool(self.dashboard_eta_enabled),
             import_source=str(self.import_source).strip(),
         )
 
@@ -779,5 +793,12 @@ def load_project_config(path: Path) -> ProjectConfig:
         target_settings=dict(payload.get("target_settings") or {}),
         auto_backup=bool(payload.get("auto_backup", True)),
         backup_keep=int(payload.get("backup_keep", 5)),
+        hitlist_keywords=list(payload.get("hitlist_keywords") or []),
+        download_external_redirects=bool(payload.get("download_external_redirects", False)),
+        text_collapse_scope=str(payload.get("text_collapse_scope") or ("range" if payload.get("version")=="1.2.3" else "year")),
+        hitlist_file=str(payload.get("hitlist_file", "")),
+        dashboard_refresh_mode=str(payload.get("dashboard_refresh_mode", "manual")),
+        dashboard_refresh_seconds=int(payload.get("dashboard_refresh_seconds", 10)),
+        dashboard_eta_enabled=bool(payload.get("dashboard_eta_enabled", False)),
         import_source=str(payload.get("import_source", "")),
     ).normalized()

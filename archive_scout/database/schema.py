@@ -5,6 +5,80 @@ import sqlite3
 from ..constants import SCHEMA_VERSION
 
 BASE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS index_coverage(
+    target_id INTEGER NOT NULL,
+    query_signature TEXT NOT NULL,
+    range_start TEXT NOT NULL,
+    range_end TEXT NOT NULL,
+    plan_json TEXT,
+    strategy TEXT NOT NULL DEFAULT 'resume',
+    layout_signature TEXT NOT NULL DEFAULT '',
+    complete INTEGER NOT NULL DEFAULT 0,
+    seen INTEGER NOT NULL DEFAULT 0,
+    error_id INTEGER,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(target_id,query_signature,range_start,range_end),
+    FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS index_pages(
+    query_signature TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    layout_signature TEXT NOT NULL,
+    page INTEGER NOT NULL,
+    row_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'complete',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(query_signature,target_id,window_start,window_end,layout_signature,page),
+    FOREIGN KEY(target_id) REFERENCES targets(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS quick_search_runs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    keywords_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    last_capture_id INTEGER NOT NULL DEFAULT 0,
+    indexed_checked INTEGER NOT NULL DEFAULT 0,
+    local_checked INTEGER NOT NULL DEFAULT 0,
+    unavailable_count INTEGER NOT NULL DEFAULT 0,
+    discarded_count INTEGER NOT NULL DEFAULT 0,
+    missing_count INTEGER NOT NULL DEFAULT 0,
+    non_text_count INTEGER NOT NULL DEFAULT 0,
+    incomplete_count INTEGER NOT NULL DEFAULT 0,
+    match_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    coverage_version INTEGER NOT NULL DEFAULT 0,
+    capture_limit INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS quick_search_runs_fingerprint_idx ON quick_search_runs(fingerprint,id DESC);
+CREATE TABLE IF NOT EXISTS quick_search_hits(
+    run_id INTEGER NOT NULL,
+    capture_id INTEGER NOT NULL,
+    keyword TEXT NOT NULL,
+    fields TEXT NOT NULL DEFAULT '',
+    count INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(run_id,capture_id,keyword),
+    FOREIGN KEY(run_id) REFERENCES quick_search_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(capture_id) REFERENCES captures(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS quick_search_coverage(
+    run_id INTEGER NOT NULL,
+    capture_id INTEGER NOT NULL,
+    body_revision INTEGER NOT NULL,
+    coverage_mask INTEGER NOT NULL,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(run_id,capture_id),
+    FOREIGN KEY(run_id) REFERENCES quick_search_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY(capture_id) REFERENCES captures(id) ON DELETE CASCADE
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS quick_search_hits_capture_idx ON quick_search_hits(run_id,capture_id);
+
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS schema_info(version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS project_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -690,10 +764,13 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v7_to_v8(database)
         elif version == 7:
             migrate_v7_to_v8(database)
+        elif version == 8:
+            database.executescript(BASE_SCHEMA_SQL)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")
         else:
             database.executescript(BASE_SCHEMA_SQL)
+    database.execute("UPDATE schema_info SET version=?", (SCHEMA_VERSION,))
     try:
         database.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(title,body_text,original_url)"

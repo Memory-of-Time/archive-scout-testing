@@ -19,6 +19,7 @@ from ..downloads.rate_limit import FixedRateLimiter, SharedHostGate
 from ..events import Stopped
 from ..json_codec import JSONDecodeErrors, loads as json_loads
 from ..network.transports import (
+    RedirectPolicyError,
     ResilientTransport,
     TransportExhaustedError,
     is_transport_connection_failure,
@@ -162,7 +163,7 @@ class HttpClient:
     def close(self) -> None:
         self.transport.close()
 
-    def get(self, url: str, max_bytes: int, accept: str = "*/*") -> dict:
+    def get(self, url: str, max_bytes: int, accept: str = "*/*", *, redirect_validator=None) -> dict:
         headers = {
             "User-Agent": self.user_agent,
             "Accept": accept,
@@ -183,7 +184,8 @@ class HttpClient:
                     if not self.host_gate.permit_is_current(permit):
                         self.host_gate.finish_request(permit, recovered=False)
                         continue
-                    response = self.transport.request(url, headers, max_bytes, self.stop_event)
+                    options = {"redirect_validator": redirect_validator} if redirect_validator is not None else {}
+                    response = self.transport.request(url, headers, max_bytes, self.stop_event, **options)
                 status = int(response.status)
 
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
@@ -259,6 +261,11 @@ class HttpClient:
                     "backend": response.backend,
                     "elapsed": response.elapsed,
                 }
+            except RedirectPolicyError:
+                # The archive answered; a local destination policy refusal is
+                # not an outage and must release a successful recovery probe.
+                self.host_gate.finish_request(permit, recovered=True)
+                raise
             except (RateLimitDeferred, Stopped):
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
@@ -707,6 +714,101 @@ class HttpClient:
         if self.stop_event.is_set():
             raise Stopped
 
+    def get_cdx_json_any(
+        self,
+        urls: Iterable[str],
+        params: list[tuple[str, str]],
+        max_bytes: int = 64 * 1024 * 1024,
+    ) -> object:
+        """Fetch one native JSON representation per endpoint.
+
+        Numbered Timemap paging is a JSON protocol.  It must not turn one bad
+        page into a second text request for the same page; the page scheduler
+        owns retries and durable failed-page state.
+        """
+        return self._get_cdx_native_json(urls, params, max_bytes, compact=False)
+
+    def get_cdx_json_rows_any(
+        self,
+        urls: Iterable[str],
+        params: list[tuple[str, str]],
+        max_bytes: int = 64 * 1024 * 1024,
+    ) -> CDXRows:
+        """Compact-row native JSON fetch used by numbered Timemap pages."""
+        result = self._get_cdx_native_json(urls, params, max_bytes, compact=True)
+        if not isinstance(result, CDXRows):
+            raise RuntimeError("native CDX JSON row parser returned an unexpected result")
+        return result
+
+    def _get_cdx_native_json(
+        self,
+        urls: Iterable[str],
+        params: list[tuple[str, str]],
+        max_bytes: int,
+        *,
+        compact: bool,
+    ) -> object | CDXRows:
+        endpoints = self._ordered_endpoints(urls)
+        if not endpoints:
+            raise ValueError("at least one endpoint is required")
+        failures: list[tuple[str, TransientRequestError]] = []
+        for endpoint in endpoints:
+            full_url = endpoint + "?" + urllib.parse.urlencode(params, doseq=True)
+            try:
+                response = self.get(full_url, max_bytes, "application/json,*/*")
+                payload = parse_json_response(response["data"], endpoint)
+                result = parse_cdx_rows_payload(payload) if compact else payload
+                self._remember_endpoint_success(endpoint)
+                return result
+            except MemoryError as exc:
+                raise TransientRequestError(
+                    f"CDX JSON parsing exceeded available memory at {endpoint}",
+                    splittable=True,
+                    endpoint=endpoint,
+                ) from exc
+            except MalformedCDXResponse as exc:
+                exc.endpoint = endpoint
+                failure = exc
+            except RateLimitDeferred:
+                raise
+            except TransientRequestError as exc:
+                exc.endpoint = endpoint
+                if (
+                    exc.connection_failed
+                    or exc.read_timed_out
+                    or exc.timed_out
+                    or "safe in-memory budget" in str(exc)
+                ):
+                    self._remember_endpoint_failure(endpoint)
+                    raise
+                failure = exc
+            except RuntimeError as exc:
+                if str(exc).startswith("HTTP ") or str(exc).startswith("response exceeds"):
+                    raise
+                failure = MalformedCDXResponse(
+                    f"CDX JSON response was unusable at {endpoint}: {exc}",
+                    splittable=True,
+                    endpoint=endpoint,
+                )
+            self._remember_endpoint_failure(endpoint)
+            failures.append((endpoint, failure))
+            if self.retry_callback and len(endpoints) > 1:
+                self.retry_callback(
+                    1,
+                    len(endpoints),
+                    f"Endpoint unavailable: {endpoint}; trying alternate CDX service",
+                    0.0,
+                )
+
+        summary = "; ".join(f"{endpoint}: {exc}" for endpoint, exc in failures)
+        raise TransientRequestError(
+            f"all native JSON CDX endpoints failed: {summary}",
+            timed_out=any(exc.timed_out for _, exc in failures),
+            read_timed_out=any(exc.read_timed_out for _, exc in failures),
+            connection_failed=bool(failures) and all(exc.connection_failed for _, exc in failures),
+            splittable=any(exc.splittable for _, exc in failures),
+        ) from (failures[-1][1] if failures else None)
+
 
 
 def request_cdx_rows(
@@ -1020,3 +1122,35 @@ def parse_retry_after(value: str | None) -> float | None:
         return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
     except Exception:
         return None
+
+def _uses_builtin_cdx_getter(client: object) -> bool:
+    getter = getattr(type(client), "get_cdx_any", None)
+    return (
+        getattr(getter, "__module__", "") == __name__
+        and getattr(getter, "__name__", "") == "get_cdx_any"
+    )
+
+def request_cdx_json_payload(
+    client: object,
+    urls: Iterable[str],
+    params: list[tuple[str, str]],
+    max_bytes: int = 64 * 1024 * 1024,
+) -> object:
+    """Use native JSON in production while retaining the established mock API."""
+    strict_getter = getattr(client, "get_cdx_json_any", None)
+    if callable(strict_getter) and _uses_builtin_cdx_getter(client):
+        return strict_getter(urls, params, max_bytes=max_bytes)
+    return client.get_cdx_any(urls, params, max_bytes=max_bytes, prefer_text=False)
+
+def request_cdx_json_rows(
+    client: object,
+    urls: Iterable[str],
+    params: list[tuple[str, str]],
+    max_bytes: int = 64 * 1024 * 1024,
+) -> CDXRows:
+    """Fetch a numbered page as native JSON without representation fallback."""
+    strict_getter = getattr(client, "get_cdx_json_rows_any", None)
+    if callable(strict_getter) and _uses_builtin_cdx_getter(client):
+        return strict_getter(urls, params, max_bytes=max_bytes)
+    payload = client.get_cdx_any(urls, params, max_bytes=max_bytes, prefer_text=False)
+    return parse_cdx_rows_payload(payload)

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from archive_scout.cdx.client import HttpClient, TransientRequestError
+from archive_scout.cdx.client import HttpClient, TransientRequestError, MalformedCDXResponse
 from archive_scout.cdx.indexer import index_archive, index_windows
 from archive_scout.cdx.parallel import fetch_cdx_pages
 from archive_scout.cdx.parameters import cdx_query_signature
@@ -16,6 +16,7 @@ from archive_scout.config import MediaConfig, NetworkConfig, ProjectConfig, load
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target, upsert_captures
 from archive_scout.downloads.rate_limit import FixedRateLimiter
+from archive_scout.events import IndexResponsePaused
 from archive_scout.media.indexer import index_media
 from archive_scout.network.transports import TransportResponse
 from archive_scout.utils import utc_now
@@ -59,7 +60,7 @@ class _ParallelClient:
 
 class FastIndexingTests(unittest.TestCase):
     def test_broad_paged_query_uses_one_year_window(self):
-        config = ProjectConfig(
+        config = ProjectConfig(text_collapse_scope="year", 
             output_dir=Path("."),
             targets=["example.com/*"],
             keywords=[],
@@ -86,7 +87,7 @@ class FastIndexingTests(unittest.TestCase):
     def test_failed_page_is_requeued_without_repeating_successful_pages(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],
@@ -117,10 +118,10 @@ class FastIndexingTests(unittest.TestCase):
             self.assertEqual(database.execute("SELECT complete FROM index_state").fetchone()[0], 1)
             database.close()
 
-    def test_repeated_slow_page_falls_back_to_smaller_resume_windows(self):
+    def test_repeated_unusable_page_preserves_exact_failed_queue_and_resumes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],
@@ -132,6 +133,7 @@ class FastIndexingTests(unittest.TestCase):
             database = open_database(root)
             page_calls: dict[int, int] = {}
             resume_calls = 0
+            recovered = False
 
             def fake_get(_self, _urls, params, max_bytes=64 * 1024 * 1024, prefer_text=False):
                 nonlocal resume_calls
@@ -142,25 +144,34 @@ class FastIndexingTests(unittest.TestCase):
                 if "page" in values:
                     page = int(values["page"])
                     page_calls[page] = page_calls.get(page, 0) + 1
-                    if page == 1:
-                        raise TransientRequestError("persistent slow page", timed_out=True, splittable=True)
+                    if page == 1 and not recovered:
+                        raise MalformedCDXResponse("persistent invalid numbered-page response", splittable=True)
                     return [HEADER, [f"2001010100000{page}", f"http://example.com/{page}", "text/html", "200", str(page), "1"]]
                 resume_calls += 1
                 return []
 
             with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", new=fake_get):
-                index_archive(config, database, threading.Event())
+                with self.assertRaises(IndexResponsePaused):
+                    index_archive(config, database, threading.Event())
 
-            self.assertEqual(page_calls.get(1), 2)
-            self.assertGreater(resume_calls, 0)
+            self.assertEqual(page_calls.get(1), 5)
+            self.assertEqual(resume_calls, 0)
             self.assertEqual(database.execute("SELECT COUNT(*) FROM captures").fetchone()[0], 2)
+            self.assertEqual(database.execute("SELECT complete FROM index_state").fetchone()[0], 0)
+            recovered = True
+            with patch("archive_scout.cdx.client.HttpClient.get_cdx_any", new=fake_get):
+                index_archive(config, database, threading.Event())
+            self.assertEqual(page_calls[0], 1)
+            self.assertEqual(page_calls[2], 1)
+            self.assertEqual(page_calls[1], 6)
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM captures").fetchone()[0], 3)
             self.assertEqual(database.execute("SELECT complete FROM index_state").fetchone()[0], 1)
             database.close()
 
     def test_page_count_timeout_switches_to_resumable_windows(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],
@@ -225,7 +236,7 @@ class FastIndexingTests(unittest.TestCase):
     def test_media_reuses_completed_main_index_without_network(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],

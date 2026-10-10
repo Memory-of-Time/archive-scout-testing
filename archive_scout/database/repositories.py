@@ -468,11 +468,17 @@ def list_errors(
     category: str = "",
     limit: int = 2000,
     offset: int = 0,
+    status: str | None = None,
 ) -> list[sqlite3.Row]:
     clauses: list[str] = []
     params: list[object] = []
-    if unresolved_only:
-        clauses.extend(["e.resolved=0", "e.ignored=0"])
+    if status is None:
+        if unresolved_only:
+            clauses.extend(["e.resolved=0", "e.ignored=0"])
+    else:
+        clauses.extend({"open": ["e.resolved=0", "e.ignored=0"],
+                        "resolved": ["e.resolved=1", "e.ignored=0"],
+                        "ignored": ["e.ignored=1"]}.get(status.casefold(), []))
     if category:
         clauses.append("e.category=?")
         params.append(category)
@@ -562,7 +568,7 @@ def _result_filters(
 def _result_select(clauses: list[str]) -> str:
     return (
         """
-        SELECT m.*,d.path,d.title,d.size_bytes,c.original_url,c.timestamp,c.mimetype,
+        SELECT m.*,d.path,d.title,d.size_bytes,c.original_url,c.timestamp,c.mimetype,c.final_url,
                COALESCE(r.status,'unreviewed') AS review_status,r.reviewer,r.reviewed_at,
                COALESCE((SELECT text FROM notes n WHERE n.match_id=m.id ORDER BY n.id LIMIT 1),'') AS note,
                COALESCE((SELECT GROUP_CONCAT(t.name, ', ') FROM match_tags mt JOIN tags t ON t.id=mt.tag_id WHERE mt.match_id=m.id),'') AS tags

@@ -120,15 +120,14 @@ def cdx_endpoints(config: ProjectConfig) -> tuple[str, ...]:
 
 
 def cdx_paged_endpoints(config: ProjectConfig) -> tuple[str, ...]:
-    from ..constants import CDX_URL, CDX_TIMEMAP_JSON_URL, CDX_TIMEMAP_URL
+    from ..constants import CDX_URL, CDX_TIMEMAP_JSON_URL
     mode = config.network.normalized().endpoint_mode
     if mode == "cdx":
         return (CDX_URL,)
-    if mode == "timemap":
-        return (CDX_TIMEMAP_JSON_URL, CDX_TIMEMAP_URL)
-    # Match the fast reference downloader: Timemap JSON is the normal numbered
-    # page source, with CDX retained as a transparent recovery path.
-    return (CDX_TIMEMAP_JSON_URL, CDX_URL, CDX_TIMEMAP_URL)
+    # Numbered automatic paging follows the reference downloader exactly: one
+    # native Timemap JSON service. A failed page remains one durable page retry;
+    # it is not silently reissued against different endpoint semantics.
+    return (CDX_TIMEMAP_JSON_URL,)
 
 
 def is_broad_cdx_query(config: ProjectConfig, target: str) -> bool:
@@ -211,3 +210,13 @@ def parse_num_pages(payload: object) -> int:
             if str(value).strip().isdigit():
                 return max(0, int(str(value).strip()))
     raise RuntimeError(f"unexpected CDX page-count response: {payload!r}")
+
+def cdx_layout_signature(config: ProjectConfig, start: str, end: str, strategy: str, page_blocks: int = 0) -> str:
+    payload = {
+        "start": start, "end": end, "strategy": strategy,
+        "endpoint_mode": config.network.normalized().endpoint_mode,
+        "page_blocks": int(page_blocks), "page_size": int(config.page_size),
+        "sort": "urlkey,timestamp",
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]

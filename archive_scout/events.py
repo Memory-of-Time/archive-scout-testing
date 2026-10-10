@@ -12,6 +12,12 @@ class ConnectivityPaused(RuntimeError):
     """A recoverable network pause with the exact queue safely persisted."""
 
 
+class IndexResponsePaused(ConnectivityPaused):
+    """A query-specific response failure; completed pages remain saved."""
+
+    scope = "query"
+
+
 @dataclass(slots=True)
 class ProgressEvent:
     stage: str

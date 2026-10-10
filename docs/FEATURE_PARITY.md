@@ -1,3 +1,7 @@
+# v1.2.3 compatible feature restoration
+
+The latest scope and compatibility mapping are documented in [V1.2.3_RESTORATION.md](V1.2.3_RESTORATION.md). The following older audit is retained for provenance and describes the pre-v1.2.3 state.
+
 # v1.1.1 feature parity and compatibility
 
 The complete user-supplied `archive-scout-1.1.1.zip` was inspected. This document distinguishes **working lean features** from features that are **not restored**. Do not interpret the candidate as a drop-in v1.1.1 replacement.

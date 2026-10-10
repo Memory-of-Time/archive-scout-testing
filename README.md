@@ -1,60 +1,51 @@
-# Archive Scout 1.2.2 — Lean Engine, CDX & Dashboard Fixes
+# Archive Scout 1.2.3
 
-This **patch-updated runnable source repository** starts with the original September 12, 2026 v1.0.5 downloader/indexer/database and selectively restores compatible interface improvements from v1.1.1. Its scope is correctness, fixed pacing, low overhead and stable long-run operation. It is **not** a claim of exact v1.1.1 feature parity or verified sustained live Internet Archive performance.
+This release builds on the supplied `archive-scout-testing-main.zip` (v1.2.2). It restores the compatible v1.1.1 interface, indexing behavior, and missing local tools while retaining the supplied repository's text/media classification, acquisition and local scanning engines.
 
-## v1.2.2 highlights
+## Changes
 
-- CDX's native Timemap format is selected first; valid JSON returned by a text-preferred endpoint is accepted in the same request. Invalid/truncated inventories remain rejected. Global fixed 2.5-second CDX pacing is unchanged.
-- The Activity download speed is a **rolling 30-second rate of newly committed saves**, with the whole-pass average separately labeled. Fixed 0.125-second replay pacing remains unchanged.
-- The Dashboard is **manual refresh only**: `Saved documents` counts completed text downloads (including locally unscanned bodies), and `Ranked matches` counts unique pages with qualifying keyword matches, not number of hits or repeated scan sets.
-- The dark interface's scroll canvases are now themed (no white background), native display DPI scaling is preserved, and Media extension editors are compact. The main editor can expand into the available space.
+- v1.1.1 layout and aesthetic, visible editor borders, controlled wheel scrolling, responsive panels, per-file report controls, read-only evidence details, and paginated History/Errors views with copy/export details.
+- Resume-first automatic indexing, full selected-range queries for new projects, native JSON numbered pages when needed, bounded parallel requests, independently committed completed-page checkpoints, and range coverage. Existing projects retain their saved year-collapse behavior and in-progress page sizes.
+- Search with Hitlist searches indexed URLs and complete saved text, including downloaded files awaiting scanning. Its separate durable coverage resumes interrupted searches, freezes the inventory boundary, and checks saved-file hashes before reusing coverage. It does not download, create score runs, or change classification.
+- Recorded redirect destination in results and optional ranked report fields. Settings can enable archived redirect destinations outside selected sites; this is off by default. Every replay redirect hop is checked before contact, and live-web destinations remain blocked.
+- Manual dashboard refresh remains the default. Optional automatic refresh is bounded and coalesced; optional ETA is a display estimate.
+
+The fixed user-selected request spacing, existing automatic connection recovery, service Retry-After handling, text/media rules, original byte validation, existing scored scanner, Media, AI and Research Intelligence remain in place. No adaptive rate limiter is added.
+
+## Apply the patch
+
+Use the extracted repository from the supplied `archive-scout-testing-main.zip` as the base. Keep a backup of that source folder and of existing project folders. Extract the patch ZIP into the repository root (beside `pyproject.toml`) and replace matching files. No repository files need deletion. Do not apply this patch directly to an older v1.1.1/schema-13 source tree.
 
 ## Install and launch
 
-Requires Python 3.11 or 3.12 (3.13 source tests also ran), Tk and Internet access for Wayback operations.
+Python 3.11 or 3.12 and Tk are required. Wayback operations require Internet access.
 
 ```bash
 python -m pip install .
 archive-scout-gui
-```
-
-For CLI and automation:
-
-```bash
 archive-scout --help
 ```
 
-Run the cross-platform test suite and release verification:
+Hitlist is available in Results and search, the Operation menu, and the CLI:
 
 ```bash
-python -m compileall -q archive_scout tests scripts
-python scripts/run_tests.py --output validation/test-results
-python scripts/verify_release.py
+archive-scout run /path/to/project.json --mode hitlist --format jsonl
 ```
 
-Use the root-level `.github/workflows/tests.yml` for Linux, Windows and macOS CI. Windows ZIP / macOS app builders remain in `scripts/`; no executables are bundled with source.
+Set `hitlist_keywords` or `hitlist_file` in the project configuration, or enter them in the GUI. A hitlist file contains one literal search phrase per line; the normal scoring keyword sets remain separate. Outputs are `reports/hitlist_<run-id>/matches.csv` and `summary.txt`.
 
-## Architectural commitments
+## Projects and validation
 
-- Original v1.0.5 parallel Timemap page-count / 10-worker paged indexing, with resumable fallback and strict malformed-response rejection.
-- **2.5-second shared CDX request-start spacing** and **0.125-second shared replay request-start spacing** by default. These are ceilings on *attempts*, not guarantees of fresh successful saves.
-- Ten acquisition workers by default; compact SQLite selection and bounded request staging.
-- Entire document source is searched, including content beyond the former 500,000-character cutoff.
-- MIME/extension/binary signature checks before accepting downloaded text; originals are saved atomically as bytes with content-hash evidence.
-- Automatic continued retries for transient indexing and text replay failures. Actual service Retry-After controls host eligibility; other routine waits are not adaptive global rate controllers.
-- Normal scan results, reports, media, backup/repair/diagnostics, AI and Research Intelligence features originally included with v1.0.5 remain available.
-- v1.1.1-derived responsive page scrolling, normalized wheel handling, better panel overflow, and a dedicated Reports workspace. Heavy research auto-build is off for *new projects* but existing preferences are respected.
+Schema 9 adds Hitlist and indexing checkpoint tables to schema 8. Supported schema 2–8 projects migrate with a safety database backup; payloads and classification tables are retained. Schema-13 v1.1.1 projects are not a supported migration source. New projects use selected-range text collapse; older configurations without that setting retain year collapse. Stored custom settings and current text/media routing remain authoritative.
 
-**Important:** The classifier protects strong binary signatures and records metadata/payload routing evidence but is not an exhaustive format decoder. Some ambiguous mislabeled content remains unresolved and needs more fixture coverage. Explicit text/media inclusion/exclusion settings still govern coverage.
+```bash
+python -m pip check
+python -m compileall -q archive_scout tests scripts
+python scripts/verify_release.py
+python scripts/run_tests.py --output validation/test-results
+python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
+```
 
-## Project compatibility
+The existing Tests workflow checks Python 3.11/3.12 on Linux, Windows and both macOS architectures and uploads its results. Build All Platforms retains its signing and packaging rules. Run Tests successfully before Build All Platforms; publishing/signing settings are separate from source validation.
 
-This code uses **schema 8** (with automatic migrations from supported schema 2–7), not the schema-13 database used by v1.1.1. Back up every project before migrating. Do **not** point this version at a schema-13 project. The original v1.0.5 migration path remains available for earlier projects, subject to its tests.
-
-## v1.1.1 feature parity
-
-The exact v1.1.1 repository was audited. **Not all of its feature-specific database/API changes were ported.** In particular, v1.1.1 Hitlist resume, full operation-specific schema-13 analysis fields, newer FTS model, and operation-scoped evidence tables still require a deliberate compatibility design. Per-file report choice, filtering, sorting, and indexed classification fields are restored in 1.2.1 and refined in 1.2.2. See `docs/FEATURE_PARITY.md` and `docs/LEAN_REBUILD_AUDIT.md`. The v1.1.1 main window cannot be copied wholesale without pulling in its larger engine and schema.
-
-## Verification boundaries
-
-Unit/integration tests are fixture-based. The workflow is provided, but hosted Windows/macOS results and long-running public Wayback throughput must be verified separately. No actual 100k+/million-capture live operation or week-long run is claimed.
+Local tests use fixtures, injected faults and localhost HTTP. They do not establish sustained live Wayback throughput near eight validated saves per second, million-capture completeness, overnight consistency, or hosted platform build success. See `docs/V1.2.3_RESTORATION.md` and the separate validation evidence supplied with this patch.

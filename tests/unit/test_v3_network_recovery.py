@@ -85,7 +85,7 @@ class V3NetworkRecoveryTests(unittest.TestCase):
     def test_unreachable_wayback_pauses_cleanly_and_persists_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["x"],

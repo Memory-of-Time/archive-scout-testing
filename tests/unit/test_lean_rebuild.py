@@ -24,7 +24,7 @@ from archive_scout.utils import atomic_write_bytes
 
 class LeanRebuildTests(unittest.TestCase):
     def test_default_clocks_and_parallel_index_settings(self):
-        config = ProjectConfig(Path('.'), targets=['example.com/*'], keywords=['needle']).normalized()
+        config = ProjectConfig(Path('.'), text_collapse_scope="year", targets=['example.com/*'], keywords=['needle']).normalized()
         self.assertEqual(config.cdx_delay, 2.5)
         self.assertEqual(config.download_delay, 0.125)
         self.assertEqual(config.network.cdx_workers, 10)
@@ -33,7 +33,7 @@ class LeanRebuildTests(unittest.TestCase):
     def test_failed_index_waits_do_not_escalate(self):
         from archive_scout.cdx.indexer import transient_backoff
         from archive_scout.media.indexer import _wait_seconds
-        config = ProjectConfig(Path('.'), targets=['example.com/*'], keywords=['needle']).normalized()
+        config = ProjectConfig(Path('.'), text_collapse_scope="year", targets=['example.com/*'], keywords=['needle']).normalized()
         self.assertEqual(transient_backoff(config, 1), transient_backoff(config, 10_000))
         self.assertEqual(_wait_seconds(config, 1), _wait_seconds(config, 10_000))
 
@@ -74,7 +74,7 @@ class LeanRebuildTests(unittest.TestCase):
                         'headers':{'content-type':'text/html; charset=windows-1252'},
                         'status':200,'final_url':'https://web.archive.org/web/20010101000000id_/http://example.org/a'}
         with tempfile.TemporaryDirectory() as temp:
-            config = ProjectConfig(Path(temp), targets=['example.org/*'], keywords=['needle']).normalized()
+            config = ProjectConfig(Path(temp), text_collapse_scope="year", targets=['example.org/*'], keywords=['needle']).normalized()
             row = {'id':1,'timestamp':'20010101000000','original_url':'http://example.org/a','mimetype':'text/html'}
             job = ScanJob.create(1,'Test',['needle'])
             result = fetch_parse_scan(row,config,[job],Client())
@@ -94,7 +94,7 @@ class LeanRebuildTests(unittest.TestCase):
     def test_retry_recovers_without_manual_resume_after_transient_index_errors(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
-            config=ProjectConfig(root, targets=['example.org/*'],keywords=[],from_date='20010101',to_date='20010101',cdx_delay=0,
+            config=ProjectConfig(root, text_collapse_scope="year", targets=['example.org/*'],keywords=[],from_date='20010101',to_date='20010101',cdx_delay=0,
                 network=NetworkConfig(index_strategy='resume',connection_failure_pause_threshold=2)).normalized()
             db=open_database(root)
             offline=TransientRequestError('temporary offline',connection_failed=True,splittable=False)

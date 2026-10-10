@@ -74,7 +74,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_full_resume_index_commits_fifty_thousand_rows_and_finishes(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],
@@ -112,7 +112,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_complete_connection_failure_pauses_after_three_saved_attempts(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],
@@ -154,7 +154,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_paged_complete_connection_failure_uses_the_saved_connection_circuit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],
@@ -221,7 +221,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_large_explicit_retry_selection_avoids_sqlite_variable_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -281,7 +281,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_download_candidates_are_streamed_from_a_sqlite_queue(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -415,7 +415,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
                     """,
                     ((capture_id, now, now) for capture_id in capture_ids),
                 )
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["example"],
@@ -461,7 +461,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
                     """,
                     ((media_id, now, now) for media_id in media_ids),
                 )
-            config = ProjectConfig(output_dir=root, targets=["example.com/*"], keywords=[]).normalized()
+            config = ProjectConfig(text_collapse_scope="year", output_dir=root, targets=["example.com/*"], keywords=[]).normalized()
             with patch("archive_scout.media.downloader.download_media") as mocked:
                 retry_media_errors(
                     config, database, threading.Event(), media_capture_ids=media_ids
@@ -472,7 +472,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_unexpected_local_index_error_is_not_retried_forever(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(
+            config = ProjectConfig(text_collapse_scope="year", 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=[],

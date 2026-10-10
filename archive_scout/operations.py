@@ -33,7 +33,10 @@ from .research.index import build_research_index
 from .scanning.jobs import ScanJob
 from .scanning.rescanner import rescan_keyword_sets
 
+from .scanning.hitlist import load_hitlist, search_with_hitlist
+
 SUPPORTED_MODES = {
+    "hitlist",
     "all", "external_media_after_scan", "index", "download", "resume", "rescan", "retry_errors", "report", "integrity",
     "repair", "backup", "diagnostics", "import_folder",
     "media_all", "media_index", "media_download", "media_retry",
@@ -210,6 +213,14 @@ def run_project(
     callback = operation_callback
     try:
         save_project_config(config)
+        if mode == "hitlist":
+            keywords = load_hitlist(config.hitlist_keywords, config.hitlist_file)
+            if not keywords:
+                keywords = load_hitlist(config.keywords)
+            result = search_with_hitlist(config.output_dir, database, keywords, stop_event, callback)
+            finish_operation_run(database, operation_run_id, "complete", "Hitlist search complete")
+            database.commit()
+            return {"hitlist_csv": Path(result["csv"]), "hitlist_summary": Path(result["summary"])}
         if mode == "backup":
             path = create_project_backup(config.output_dir, reason="manual", keep=config.backup_keep)
             emit(callback, ProgressEvent("backup", f"Backup written to {path}"))
