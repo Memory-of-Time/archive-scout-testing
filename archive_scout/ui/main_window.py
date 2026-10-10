@@ -187,7 +187,7 @@ class ArchiveScoutApp(tk.Tk):
         self.workers_var = tk.StringVar(value="10")
         self.max_file_var = tk.StringVar(value="25")
         self.minimum_score_var = tk.StringVar(value="1")
-        self.cdx_delay_var = tk.StringVar(value="0.75")
+        self.cdx_delay_var = tk.StringVar(value="0.4")
         self.download_delay_var = tk.StringVar(value="0.125")
         self.rate_limit_base_var = tk.StringVar(value="30")
         self.rate_limit_max_var = tk.StringVar(value="300")
@@ -752,7 +752,7 @@ class ArchiveScoutApp(tk.Tk):
             ("Download workers (10 = fast default)", self.workers_var),
             ("Maximum text-page size (MB)", self.max_file_var),
             ("Minimum report score", self.minimum_score_var),
-            ("CDX request spacing (seconds)", self.cdx_delay_var),
+            ("CDX request spacing (0.4 = 2.5/sec)", self.cdx_delay_var),
             ("Download request spacing (0.125 = 8/sec)", self.download_delay_var),
             ("429/503 initial shared pause (seconds)", self.rate_limit_base_var),
             ("429/503 maximum shared pause (seconds)", self.rate_limit_max_var),
