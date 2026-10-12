@@ -430,11 +430,7 @@ def _can_split_cdx_window(current: PendingWindow, exc: TransientRequestError) ->
 
 
 def transient_backoff(config: ProjectConfig, failures: int) -> float:
-    """Fixed failure-only retry wait; no escalating application cooldown.
-
-    Service-directed Retry-After deadlines are enforced independently by the
-    shared host gate.  The window failure count is used for diagnostics only.
-    """
+    """Failure-only short wait; never escalate healthy-request pacing."""
     return min(5.0, config.network.normalized().retry_base_seconds)
 
 
@@ -716,7 +712,7 @@ def _client_for_config(
         read_timeout=min(max(config.read_timeout, 30.0), 120.0),
         pool_size=network.cdx_workers,
         host_gate=host_gate,
-        rate_limit_attempts=config.rate_limit_attempts,
+        rate_limit_attempts=config.rate_limit_attempts or 3,
         rate_limit_max_wait=config.rate_limit_max_wait,
         network_backend=network.backend,
         trust_environment=network.trust_environment,
@@ -1304,7 +1300,8 @@ def index_archive(
                             persist_task_state(encode_plan(plan), False, seen, error_id)
                         # Preserve the saved checkpoint and retry autonomously. A
                         # user Stop still interrupts waits immediately.
-                        wait_seconds = min(2.0, max(0.25, network.connection_retry_seconds))
+                        wait_seconds = min(60.0, max(2.0, network.connection_retry_seconds)
+                                           * (2 ** min(5, max(0, connection_failure_streak - 1))))
                         emit(
                             callback,
                             ProgressEvent(
@@ -1340,30 +1337,16 @@ def index_archive(
                             persist_task_state(encode_plan(plan), False, seen, error_id)
                         transient_failure_streak = 0
                     if current.strategy == "paged" and current.page_count < 0:
-                        # A page-count request should be cheap. If it cannot be
-                        # obtained, do not loop on it indefinitely: switch this
-                        # window to resume-key retrieval and let ordinary window
-                        # subdivision take over if the broad request is still too
-                        # expensive for Wayback.
-                        current.strategy = "resume"
-                        current.pagination_supported = False
-                        current.page = 0
-                        current.page_count = -1
-                        current.retry_pages.clear()
-                        current.page_failures.clear()
-                        parts = split_window(current) if _can_split_cdx_window(current, exc) else []
-                        if parts:
-                            for part in parts:
-                                part.strategy = "resume"
-                                part.pagination_supported = False
-                            plan.pending[0:1] = parts
-                            added = len(parts) - 1
-                            plan.planned += added
-                            total_windows += added
-                        with database:
-                            persist_task_state(encode_plan(plan), False, seen, error_id)
-                        note = "resumable smaller windows" if parts else "the original saved range"
-                        emit(callback, ProgressEvent("index", f"Paged CDX could not count {target} {label}; continuing with {note}.", completed_windows, total_windows))
+                        # Service failures are *not* evidence that Timemap paging
+                        # is unsupported. Preserve this saved page-count setup
+                        # and retry after the shared outage backoff. Only an
+                        # explicit unsupported-pagination response (handled in
+                        # the permanent-error branch) may switch strategies.
+                        error_id = _defer_transient_window(
+                            target_config, database, plan, current, persist_task_state,
+                            seen, error_id, exc, callback, completed_windows,
+                            total_windows, stop_event,
+                        )
                         continue
                     if current.strategy == "resume" and current.pagination_supported:
                         parts = split_window(current) if _can_split_cdx_window(current, exc) else []
@@ -1395,33 +1378,20 @@ def index_archive(
                     if isinstance(exc, PermanentRequestError) and exc.category in {"wayback_excluded", "wayback_forbidden"}:
                         category = exc.category
                         message = site_issue_message(category, target, "CDX indexing", exc.status)
-                        remaining = len(plan.pending)
-                        plan.pending.clear()
-                        plan.completed += remaining
-                        completed_windows += remaining
-                        if category == "wayback_excluded":
-                            excluded_targets.add(target)
+                        # A 403 is not evidence that every capture was indexed.
+                        # Keep the exact window pending and report the blocking
+                        # condition instead of inventing an empty complete year.
                         with database:
                             error_id = record_error(
-                                database,
-                                "index",
-                                category,
-                                f"{target} {label}: {exc}",
-                                http_status=exc.status,
-                                retryable=False,
+                                database, "index", category, f"{target} {label}: {exc}",
+                                http_status=exc.status, retryable=False,
                             )
-                            record_site_issue(
-                                database,
-                                host_from_url(target),
-                                "cdx_index",
-                                category,
-                                message,
-                                target=target,
-                                http_status=exc.status,
-                            )
-                            persist_task_state(None, True, seen, error_id)
-                        emit(callback, ProgressEvent("site_issue", message, completed_windows, total_windows))
-                        continue
+                            record_site_issue(database, host_from_url(target), "cdx_index",
+                                              category, message, target=target, http_status=exc.status)
+                            persist_task_state(encode_plan(plan), False, seen, error_id)
+                        emit(callback, ProgressEvent("site_issue", message + "; indexing remains incomplete.",
+                                                     completed_windows, total_windows))
+                        raise
                     if current.strategy == "paged" and _is_pagination_unavailable(exc):
                         current.pagination_supported = False
                         current.strategy = "resume"

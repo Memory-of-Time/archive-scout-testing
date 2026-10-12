@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Callable, Iterator
+from collections import deque
 
 from ..content import decode_bytes, parse_page
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
@@ -15,6 +16,9 @@ from ..events import ProgressEvent, Stopped
 from ..utils import hash_text, normalize_search
 from .jobs import ScanJob
 from .scoring import analyze_content, prepare_analysis_fields
+
+# Bounded local working set, independent of how many archive captures exist.
+RESCAN_BYTE_BUDGET = 64 * 1024 * 1024
 
 
 def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob]) -> dict[str, object]:
@@ -81,7 +85,7 @@ def _document_rows(
     database: sqlite3.Connection,
     clauses: list[str],
     params: list[object],
-    batch_size: int = 1000,
+    batch_size: int = 16,
 ) -> Iterator[dict[str, object]]:
     last_id = 0
     while True:
@@ -107,11 +111,29 @@ def rescan_keyword_sets(
     callback: Callable[[ProgressEvent], None] | None = None,
     document_ids: list[int] | None = None,
     workers: int | None = None,
+    after_document_id: int = 0,
+    checkpoint: Callable[[int], None] | None = None,
+    missing_only: bool = False,
+    scope_pairs: list[tuple[str, str]] | None = None,
 ) -> None:
     if not jobs or any(not job.patterns for job in jobs):
         raise ValueError("at least one keyword rule is required in every selected keyword set")
-    clauses: list[str] = []
-    params: list[object] = []
+    clauses: list[str] = ["d.id>?"] if after_document_id else []
+    params: list[object] = [int(after_document_id)] if after_document_id else []
+    if missing_only:
+        # A score=0 is still a persisted coverage marker; no need to reload
+        # already-scored bodies into Python merely to rediscover no hits.
+        placeholders = ",".join("?" for _ in jobs)
+        clauses.append(f"(SELECT COUNT(DISTINCT m.scan_run_id) FROM document_matches m WHERE m.document_id=d.id AND m.scan_run_id IN ({placeholders}))<?")
+        params.extend(job.scan_run_id for job in jobs)
+        params.append(len(jobs))
+    if scope_pairs is not None:
+        if not scope_pairs:
+            return
+        clauses.append("EXISTS (SELECT 1 FROM targets t WHERE t.id=c.target_id AND (" +
+                       " OR ".join("(t.pattern=? AND c.query_signature=?)" for _ in scope_pairs) + "))")
+        for pair in scope_pairs:
+            params.extend(pair)
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_document_selection")
     if document_ids:
         database.execute(
@@ -140,21 +162,43 @@ def rescan_keyword_sets(
     max_inflight = max(worker_count, worker_count * 3)
     rows = _document_rows(database, clauses, params)
     completed = 0
+    submitted_order: deque[int] = deque()
+    finished_ids: set[int] = set()
+    in_flight_bytes = 0
+    deferred_row: dict[str, object] | None = None
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=worker_count, thread_name_prefix="archive-rescan"
     ) as pool:
-        futures: dict[concurrent.futures.Future[dict[str, object]], dict[str, object]] = {}
+        futures: dict[concurrent.futures.Future[dict[str, object]], tuple[dict[str, object], int]] = {}
 
         def submit_available() -> None:
+            nonlocal deferred_row, in_flight_bytes
             while len(futures) < max_inflight:
                 if stop_event.is_set():
                     raise Stopped
+                if deferred_row is not None:
+                    row = deferred_row
+                    deferred_row = None
+                else:
+                    try:
+                        row = next(rows)
+                    except StopIteration:
+                        return
+                # Real byte size, not stale CDX metadata; allow one oversized
+                # document at a time without silently excluding it.
                 try:
-                    row = next(rows)
-                except StopIteration:
+                    disk_bytes = Path(str(row["path"])).stat().st_size
+                except OSError:
+                    disk_bytes = max(1, int(row.get("size_bytes") or 1))
+                estimate = max(1, disk_bytes) * 3 + 2 * len(str(row.get("body_text") or ""))
+                if futures and in_flight_bytes + estimate > RESCAN_BYTE_BUDGET:
+                    deferred_row = row
                     return
-                futures[pool.submit(_analyze_saved_document, row, jobs)] = row
+                future = pool.submit(_analyze_saved_document, row, jobs)
+                futures[future] = (row, estimate)
+                in_flight_bytes += estimate
+                submitted_order.append(int(row["id"]))
 
         submit_available()
         while futures:
@@ -167,7 +211,8 @@ def rescan_keyword_sets(
             )
             results: list[dict[str, object]] = []
             for future in done:
-                futures.pop(future, None)
+                _row, estimate = futures.pop(future)
+                in_flight_bytes -= estimate
                 results.append(future.result())
 
             # SQLite remains owned by this thread. Every completed worker group is
@@ -226,6 +271,16 @@ def rescan_keyword_sets(
                             document_id=saved_document_id,
                             operations=("scan", "parse"),
                         )
+                    finished_ids.add(document_id)
+                # Only persist a contiguous prefix, never the highest ID that
+                # happened to finish first. This survives worker reordering and
+                # commits the scan results and checkpoint atomically.
+                contiguous = None
+                while submitted_order and submitted_order[0] in finished_ids:
+                    contiguous = submitted_order.popleft()
+                    finished_ids.remove(contiguous)
+                if contiguous is not None and checkpoint is not None:
+                    checkpoint(contiguous)
 
             for result in results:
                 completed += 1

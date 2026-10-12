@@ -48,6 +48,9 @@ def run(count:int=90)->dict:
                     download_archive(config,db,run_id,threading.Event(),progress,scan_jobs=[ScanJob.create(run_id,'Test',['needle'])])
                 elapsed=time.perf_counter()-started
                 assert int(db.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded'").fetchone()[0]) == count
+                scored=int(db.execute("SELECT COUNT(*) FROM document_matches WHERE scan_run_id=?", (run_id,)).fetchone()[0])
+                documented=int(db.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+                assert scored == documented == count, f"scanning coverage {scored}/{documented}/{count}"
                 files=list((root/'captures').rglob('*.txt'))
                 assert len(files)==count
                 assert all(hashlib.sha256(p.read_bytes()).digest()==hashlib.sha256(body).digest() for p in files)
@@ -57,7 +60,7 @@ def run(count:int=90)->dict:
                     b=next((t for n,t in samples if n>=high),None)
                     windows.append({'phase':label,'saves_per_second':round((high-low)/(b-a),3) if b and b>a else None})
                 acquisition_seconds=samples[-1][1] if samples else elapsed
-                return {'validated':count,'elapsed_seconds':round(elapsed,3),'saves_per_second':round(count/elapsed,3),
+                return {'validated':count,'documents_scanned':documented,'scores_persisted':scored,'elapsed_seconds':round(elapsed,3),'saves_per_second':round(count/elapsed,3),
                         'acquisition_seconds':round(acquisition_seconds,3),
                         'acquisition_saves_per_second':round(count/max(.001,acquisition_seconds),3),
                         'scan_drain_seconds':round(max(0,elapsed-acquisition_seconds),3),

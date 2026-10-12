@@ -198,7 +198,7 @@ class HttpClient:
                 status = int(response.status)
 
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
-                if status in {429, 503}:
+                if status == 429 or (status == 503 and retry_after_header):
                     retry_after = parse_retry_after(retry_after_header)
                     rate_attempt += 1
                     wait_seconds = self.host_gate.pause_for_rate_limit(retry_after, f"HTTP {status}")
@@ -543,7 +543,14 @@ class HttpClient:
         """Recognize a JSON body on a text-preferred endpoint without a re-GET."""
         if bytes(data[:2]) == b"\x1f\x8b":
             data = decode_cdx_encoded_body(data)
-        prefix = bytes(data[:128]).lstrip(b"\xef\xbb\xbf \r\n\t")
+        if bytes(data[:2]) in (b"\xff\xfe", b"\xfe\xff"):
+            # Text-preferred CDX endpoints sometimes return UTF-16 JSON.
+            # Classify before routing into the line-oriented text parser.
+            try:
+                return data.decode("utf-16").lstrip("\ufeff \r\n\t").startswith(("[", "{"))
+            except UnicodeError:
+                return False
+        prefix = bytes(data[:128]).removeprefix(b"\xef\xbb\xbf").lstrip(b" \r\n\t")
         return prefix.startswith((b"[", b"{"))
 
     def get_cdx_any(
@@ -588,10 +595,23 @@ class HttpClient:
                     ) from exc
                 except MalformedCDXResponse as exc:
                     first_error = first_error or exc
+                    description = str(exc).casefold()
+                    if any(token in description for token in
+                           ("error page", "<!doctype", "<html", "bad gateway", "temporarily unavailable")):
+                        # This is a service HTML/error response, not a choice
+                        # of JSON vs text serialization. Try the next endpoint
+                        # without issuing an identical query in the other format.
+                        break
                     if self.retry_callback:
                         other = "JSON" if format_name == "text" else "line-oriented text"
                         self.retry_callback(1, 1, f"CDX {format_name} response invalid ({str(exc)[:130]}); retrying as {other}", 0.0)
                     continue
+                except RateLimitDeferred:
+                    # 429/503 is a shared Wayback-host condition, not an
+                    # endpoint-specific response format problem. Do not retry
+                    # multiple CDX URLs on the same blocked host.
+                    self._remember_endpoint_failure(endpoint)
+                    raise
                 except TransientRequestError as exc:
                     first_error = first_error or exc
                     # Every configured CDX endpoint uses the same Wayback host.
@@ -710,10 +730,23 @@ class HttpClient:
                     ) from exc
                 except MalformedCDXResponse as exc:
                     first_error = first_error or exc
+                    description = str(exc).casefold()
+                    if any(token in description for token in
+                           ("error page", "<!doctype", "<html", "bad gateway", "temporarily unavailable")):
+                        # This is a service HTML/error response, not a choice
+                        # of JSON vs text serialization. Try the next endpoint
+                        # without issuing an identical query in the other format.
+                        break
                     if self.retry_callback:
                         other = "JSON" if format_name == "text" else "line-oriented text"
                         self.retry_callback(1, 1, f"CDX {format_name} response invalid ({str(exc)[:130]}); retrying as {other}", 0.0)
                     continue
+                except RateLimitDeferred:
+                    # 429/503 is a shared Wayback-host condition, not an
+                    # endpoint-specific response format problem. Do not retry
+                    # multiple CDX URLs on the same blocked host.
+                    self._remember_endpoint_failure(endpoint)
+                    raise
                 except TransientRequestError as exc:
                     first_error = first_error or exc
                     if (
@@ -926,7 +959,10 @@ def parse_json_response(data: bytes, endpoint: str = "") -> object:
     else:
         raw = data.decode("utf-8", "replace").lstrip("\ufeff").strip()
     if not raw:
-        return []
+        raise MalformedCDXResponse(
+            f"empty JSON body from {endpoint}; cannot prove the inventory is empty",
+            splittable=True, endpoint=endpoint,
+        )
     try:
         return json_loads(raw)
     except JSONDecodeErrors as exc:
@@ -965,10 +1001,12 @@ def parse_cdx_rows_payload(payload: object) -> CDXRows:
         return CDXRows([])
     if isinstance(payload, dict):
         message = str(payload.get("message") or payload.get("error") or payload)
-        lowered = message.casefold()
-        if "no capture" in lowered or "no result" in lowered or "not found" in lowered:
-            return CDXRows([])
-        raise RuntimeError(message)
+        # Error objects are never authoritative evidence of zero captures.
+        # Empty inventories are represented by a successful []/header-only list.
+        raise MalformedCDXResponse(
+            f"CDX returned an error object from the service: {message[:320]}",
+            splittable=False,
+        )
     if not isinstance(payload, list) or not payload:
         return CDXRows([])
     header = payload[0]

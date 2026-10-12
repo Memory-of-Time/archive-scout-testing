@@ -1,4 +1,4 @@
-# Scout 1.2.1
+# Scout 1.2.2
 
 **Scout** is a cross-platform desktop and command-line workspace for finding, preserving, downloading, searching, and reviewing public Wayback Machine captures.
 
@@ -10,7 +10,7 @@
 
 [All releases](https://github.com/Memory-of-Time/archive-scout/releases) · [Report an issue](https://github.com/Memory-of-Time/archive-scout/issues)
 
-> These download links resolve once the first GitHub release with matching assets is published. They currently target the verified development repository. If Scout is moved to a new public repository, update the three links and the adjacent links before publishing. The release workflow automatically creates these exact filenames.
+> Release download links work only after the matching assets are published on GitHub. The build workflow defines these filenames; a successful local test does not mean binaries have been published.
 
 ## What Scout does
 
@@ -60,8 +60,14 @@ The [test matrix](.github/workflows/tests.yml) covers Python 3.11/3.12 on Window
 
 Source overview: [`archive_scout/`](archive_scout/) application code; [`tests/`](tests/) regression tests; [`scripts/`](scripts/) benchmarking/build automation; [`packaging/`](packaging/) OS setup; [`docs/`](docs/) operational and developer guides. See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), [Indexing and recovery](docs/INDEXING_RECOVERY.md), [Privacy](docs/PRIVACY.md), [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md).
 
-## Release identity
+## Upgrade and resume existing projects
 
-Scout **1.2.0** is the new public product version built from the validated Archive Scout 1.2.4 development line. The reset is deliberate; it does **not** downgrade project databases or reset existing progress. Existing installations may need a reinstall because package version numbers have been reset.
+Scout **1.2.2** retains the v1.2.0 **schema-9** database and CDX query identity. Existing project folders hold their own indexed inventory, durable download states, scan matches, and CDX checkpoints. **Do not create a new project** when upgrading a large archive. Stop the old Scout process, take a consistent backup of the project (including all capture/media folders), and open the existing `project.json` in the new app. Keep original targets, date range, filters, and collapse options while verifying the upgrade. Changing network pacing does not alter CDX identity.
+
+Before/after inventory verification: `python scripts/check_project_resume.py "PATH_TO_EXISTING_PROJECT" --snapshot before.json` before opening v1.2.2, then `python scripts/check_project_resume.py "PATH_TO_EXISTING_PROJECT" --compare before.json` after upgrading. This is **read-only** and refuses a missing database instead of silently creating one. See [Upgrade v1.2.0 projects](docs/UPGRADE_1_2_0_TO_1_2_1.md) for exact instructions and limitations.
+
+See the [1.2.2 indexing and scanning audit](docs/SCOUT_1_2_2_INDEX_SCAN_AUDIT.md) for the new recovery behavior and verification limits.
+
+The historical product version reset began with Scout 1.2.0. Scout 1.2.2 continues that product line; it does **not** downgrade the database schema or discard prior captured progress.
 
 MIT-licensed. Scout is an independent research tool, not affiliated with the Internet Archive.

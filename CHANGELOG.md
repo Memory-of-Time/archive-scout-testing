@@ -1,5 +1,16 @@
 # Changelog
 
+## Scout 1.2.2 — Indexing, scanning and report integrity
+
+- Scan text inline with downloads; independently recover retained bodies before further network indexing.
+- Resume partial scans and backfill missing document outcomes without repeating completed scoring.
+- Recover downloaded bodies lacking document records; make scan results and state atomic.
+- Preserve incomplete CDX coverage on errors; reduce repeated HTTP 503 and malformed-response churn.
+- Respect target-specific CDX signatures in download/retry queues.
+- Bound local rescan work and expose genuine zero-hit scans versus unscanned documents.
+- Preserve nonempty historical discoveries separately from latest-run exports.
+- No database schema or text/media routing change. See `docs/SCOUT_1_2_2_INDEX_SCAN_AUDIT.md`.
+
 ## Scout 1.2.1 — Operations and reliability (patch)
 
 - Restored index/download-only and acquisition-only retry operations, project safety and import portability.

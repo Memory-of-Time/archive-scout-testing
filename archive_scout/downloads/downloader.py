@@ -42,6 +42,18 @@ def capture_path(root: Path, capture_id: int, timestamp: str, original: str) -> 
     return root / "captures" / timestamp[:4] / timestamp[4:6] / f"{capture_id}_{digest}.txt"
 
 
+def _populate_download_scopes(database: sqlite3.Connection, config: ProjectConfig) -> None:
+    """Keep target-specific inventory signatures in bounded SQLite temp storage."""
+    database.execute("""CREATE TEMP TABLE IF NOT EXISTS archive_scout_download_scopes(
+        pattern TEXT NOT NULL, signature TEXT NOT NULL,
+        PRIMARY KEY(pattern,signature)) WITHOUT ROWID""")
+    database.execute("DELETE FROM archive_scout_download_scopes")
+    database.executemany(
+        "INSERT OR IGNORE INTO archive_scout_download_scopes VALUES(?,?)",
+        ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
+    )
+
+
 def cumulative_download_progress(
     database: sqlite3.Connection,
     config: ProjectConfig,
@@ -51,9 +63,12 @@ def cumulative_download_progress(
     """Return completed/total progress across the whole resumable CDX queue."""
     if capture_ids:
         return 0, max(0, int(queued_total))
-    signature = cdx_query_signature(config)
+    # Callers may ask for progress without first constructing a queue.
+    _populate_download_scopes(database, config)
     total = int(database.execute(
-        "SELECT COUNT(*) FROM captures WHERE query_signature=?", (signature,)
+        """SELECT COUNT(*) FROM captures c JOIN targets t ON t.id=c.target_id
+           WHERE EXISTS (SELECT 1 FROM archive_scout_download_scopes s
+            WHERE s.pattern=t.pattern AND s.signature=c.query_signature)"""
     ).fetchone()[0])
     return max(0, total - int(queued_total)), total
 
@@ -85,6 +100,7 @@ def prepare_download_rows(
         "CREATE INDEX archive_scout_download_queue_order ON archive_scout_download_queue(priority,length,id)"
     )
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_capture_selection")
+    _populate_download_scopes(database, config)
 
     source = "captures c"
     clauses: list[str] = []
@@ -99,8 +115,11 @@ def prepare_download_rows(
         )
         source += " JOIN archive_scout_capture_selection s ON s.id=c.id"
     else:
-        clauses.extend(["c.query_signature=?", "c.download_attempts<?"])
-        params.extend([cdx_query_signature(config), config.max_attempts])
+        source += " JOIN targets t ON t.id=c.target_id"
+        clauses.extend(["""EXISTS (SELECT 1 FROM archive_scout_download_scopes s
+            WHERE s.pattern=t.pattern AND s.signature=c.query_signature)""",
+            "c.download_attempts<?"])
+        params.append(config.max_attempts)
     if states:
         clauses.append("c.state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)
@@ -346,7 +365,8 @@ def download_archive(
             ))
         if not acquire_only:
             from ..scanning.pending import scan_pending_saved
-            scan_pending_saved(database,config,jobs,stop_event,callback)
+            for target in config.targets:
+                scan_pending_saved(database,config.for_target(target),jobs,stop_event,callback)
         return
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
@@ -415,7 +435,7 @@ def download_archive(
                         ((now, int(row["id"])) for row in rows),
                     )
                 for row in rows:
-                    futures[pool.submit(fetch_parse_scan, row, config, jobs, client, False)] = row
+                    futures[pool.submit(fetch_parse_scan, row, config, jobs, client, not acquire_only)] = row
     
             submit_available()
             while futures:
@@ -573,4 +593,5 @@ def download_archive(
     # Decouple complete HTML/source scanning from network request workers.
     if not acquire_only:
         from ..scanning.pending import scan_pending_saved
-        scan_pending_saved(database,config,jobs,stop_event,callback)
+        for target in config.targets:
+            scan_pending_saved(database,config.for_target(target),jobs,stop_event,callback)

@@ -45,13 +45,21 @@ def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
 def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
     """Keyset scan over the active inventory; cursor memory is bounded."""
     signature = cdx_query_signature(config)
+    targets = list(config.targets)
+    if not targets:
+        return
     cursor_id = 0
+    target_slots = ",".join("?" for _ in targets)
     while True:
         batch = database.execute(
             """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.length,d.path
-               FROM captures c LEFT JOIN documents d ON d.capture_id=c.id
-               WHERE c.state='downloaded_unscanned' AND c.query_signature=? AND c.id>?
-               ORDER BY c.id LIMIT 500""", (signature, cursor_id),
+               FROM captures c JOIN targets t ON t.id=c.target_id
+               LEFT JOIN documents d ON d.capture_id=c.id
+               WHERE (c.state='downloaded_unscanned' OR
+                     (c.state='downloaded' AND d.id IS NULL))
+               AND c.query_signature=? AND t.pattern IN (""" + target_slots + """)
+               AND c.id>? ORDER BY c.id LIMIT 500""",
+            (signature, *targets, cursor_id),
         ).fetchall()
         if not batch:
             return
@@ -78,9 +86,16 @@ def scan_pending_saved(
     are still accepted one at a time rather than truncated or discarded.
     """
     signature = cdx_query_signature(config)
+    targets = list(config.targets)
+    if not targets:
+        return 0
+    target_slots = ",".join("?" for _ in targets)
     count = int(database.execute(
-        "SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned' AND query_signature=?",
-        (signature,),
+        """SELECT COUNT(*) FROM captures c JOIN targets t ON t.id=c.target_id
+           LEFT JOIN documents d ON d.capture_id=c.id
+           WHERE (c.state='downloaded_unscanned' OR (c.state='downloaded' AND d.id IS NULL))
+             AND c.query_signature=? AND t.pattern IN (""" + target_slots + ")",
+        (signature, *targets),
     ).fetchone()[0])
     if not count:
         return 0
@@ -102,8 +117,14 @@ def scan_pending_saved(
                     future.cancel()
                 raise Stopped
             while next_row is not None and len(futures) < max_inflight:
-                length = int(next_row.get("length") or 0)
-                estimate = length if length > 0 else 8 * 1024 * 1024
+                # File bytes are already local; archive CDX lengths can be
+                # missing, compressed, or inaccurate. Use actual disk size and
+                # reserve decoding/parsing overhead inside the memory budget.
+                try:
+                    length = Path(next_row["path"]).stat().st_size
+                except OSError:
+                    length = min(config.max_file_bytes, 8 * 1024 * 1024)
+                estimate = max(1, length) * 3
                 if futures and in_flight_bytes + estimate > estimated_budget:
                     break
                 row = next_row
@@ -122,6 +143,10 @@ def scan_pending_saved(
                 for future in done:
                     row, estimate = futures.pop(future)
                     in_flight_bytes -= estimate
+                    # A scan and every match row are one atomic unit.  A failed
+                    # save_match must never commit upsert_document's state change,
+                    # which would otherwise strand a downloaded body as scanned.
+                    database.execute("SAVEPOINT scout_capture_scan")
                     try:
                         result = future.result()
                         document_id = upsert_document(
@@ -141,11 +166,21 @@ def scan_pending_saved(
                         )
                         resolve_errors(database, capture_id=result["capture_id"], document_id=document_id)
                     except Exception as exc:
+                        database.execute("ROLLBACK TO SAVEPOINT scout_capture_scan")
+                        # Missing retained bytes need reacquisition; a transient
+                        # SQLite or parser failure does NOT need network access.
+                        missing = isinstance(exc, FileNotFoundError)
+                        if missing:
+                            database.execute(
+                                "UPDATE captures SET state='error',updated_at=? WHERE id=?",
+                                (utc_now(), row["id"]),
+                            )
                         record_error(
-                            database, "scan", "scan_failure", repr(exc),
-                            capture_id=row["id"], retryable=True,
+                            database, "scan", "missing_local_file" if missing else "scan_failure",
+                            repr(exc), capture_id=row["id"], retryable=True,
                         )
-                        # Body remains durably saved and is retried locally.
+                    finally:
+                        database.execute("RELEASE SAVEPOINT scout_capture_scan")
                     completed += 1
             if callback and (completed % 100 == 0 or completed == count):
                 callback(ProgressEvent(

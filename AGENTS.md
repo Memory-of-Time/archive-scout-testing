@@ -1,6 +1,6 @@
 # Scout contributor notes
 
-**Identity:** public Scout 1.2.1; existing `archive_scout` Python module; SQLite schema 9. Do not rename database tables or import paths to rebrand the product.
+**Identity:** public Scout 1.2.2; existing `archive_scout` Python module; SQLite schema 9. Do not rename database tables or import paths to rebrand the product.
 
 ## Structure
 - `archive_scout/cdx/`: CDX search, query signatures, pagination, checkpoints and recovery

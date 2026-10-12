@@ -9,7 +9,7 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(root))
     from archive_scout.constants import APP_NAME, VERSION
-    assert APP_NAME == "Scout" and VERSION == "1.2.1"
+    assert APP_NAME == "Scout" and VERSION == "1.2.2"
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
     assert re.search(r'(?m)^version\s*=\s*"' + re.escape(VERSION) + r'"', pyproject), "pyproject version mismatch"
     assert 'scout = "archive_scout.cli:main"' in pyproject

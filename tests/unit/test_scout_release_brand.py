@@ -6,13 +6,13 @@ from archive_scout.constants import APP_NAME, VERSION, SCHEMA_VERSION
 class ScoutReleaseBrandTests(unittest.TestCase):
     def test_new_brand_preserves_schema(self):
         self.assertEqual(APP_NAME, "Scout")
-        self.assertEqual(VERSION, "1.2.1")
+        self.assertEqual(VERSION, "1.2.2")
         self.assertEqual(SCHEMA_VERSION, 9)
 
     def test_windows_numeric_version_metadata(self):
         source = (Path(__file__).resolve().parents[2] / "packaging/windows/version_info.txt").read_text()
-        self.assertIn("filevers=(1, 2, 1, 0)", source)
-        self.assertIn("prodvers=(1, 2, 1, 0)", source)
+        self.assertIn("filevers=(1, 2, 2, 0)", source)
+        self.assertIn("prodvers=(1, 2, 2, 0)", source)
 
     def test_three_platform_download_links_match_release_assets(self):
         root = Path(__file__).resolve().parents[2]

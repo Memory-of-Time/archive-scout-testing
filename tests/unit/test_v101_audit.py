@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from archive_scout.cdx.client import HttpClient, RateLimitDeferred
+from archive_scout.cdx.client import TransientRequestError, HttpClient, RateLimitDeferred
 from archive_scout.config import KeywordSetConfig, ProjectConfig
 from archive_scout.cdx.parameters import cdx_query_signature
 from archive_scout.database.connection import open_database
@@ -84,7 +84,7 @@ class V101AuditTests(unittest.TestCase):
             pass
         self.assertGreaterEqual(time.monotonic() - started, 0.025)
 
-    def test_headerless_503_enters_coordinated_pause(self):
+    def test_headerless_503_is_bounded_transient_error(self):
         stop = threading.Event()
         client = HttpClient(
             FixedRateLimiter(0),
@@ -97,7 +97,7 @@ class V101AuditTests(unittest.TestCase):
             rate_limit_max_wait=1,
             transport=_Single503Transport(),
         )
-        with self.assertRaises(RateLimitDeferred) as ctx:
+        with self.assertRaises(TransientRequestError) as ctx:
             client.get("https://web.archive.org/test", 1024)
         self.assertEqual(ctx.exception.status, 503)
         client.close()

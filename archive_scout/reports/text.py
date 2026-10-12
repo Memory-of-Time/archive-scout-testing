@@ -122,6 +122,22 @@ def _write_over_attempt_inventory(config: ProjectConfig, database: sqlite3.Conne
     return path
 
 
+def _index_coverage_status(database: sqlite3.Connection) -> str:
+    """A saved inventory count alone never establishes complete CDX coverage."""
+    range_total, range_complete = database.execute(
+        "SELECT COUNT(*),COALESCE(SUM(complete),0) FROM index_coverage"
+    ).fetchone()
+    year_total, year_complete = database.execute(
+        "SELECT COUNT(*),COALESCE(SUM(complete),0) FROM index_state"
+    ).fetchone()
+    total = int(range_total) + int(year_total)
+    if not total:
+        return "CDX coverage: no inventory checkpoints recorded; completeness unverified"
+    incomplete = total - int(range_complete) - int(year_complete)
+    return (f"CDX coverage (whole project): {total - incomplete:,}/{total:,} "
+            f"checkpoint windows complete; {incomplete:,} incomplete")
+
+
 def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) -> dict[str, Path]:
     """Index-only reports; disabled outputs never execute their payload queries."""
     opts = _report_settings(config)
@@ -141,6 +157,7 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) 
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
+            "index_coverage": _index_coverage_status(database),
             "unresolved_errors": f"Unresolved errors: {int(database.execute('SELECT COUNT(*) FROM errors WHERE resolved=0').fetchone()[0]):,}",
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
@@ -262,6 +279,13 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
 
     if need_ranked:
         _write_selected(root, run_dir, "matches_ranked", ranked_lines(), paths)
+        # Root outputs always describe the latest scan, including legitimate
+        # zero-hit scans. Preserve a separate last-nonempty discovery export.
+        if database.execute(
+            "SELECT 1 FROM document_matches WHERE scan_run_id=? AND score>=? AND excluded=0 AND required_missing=0 LIMIT 1",
+            (scan_run_id, config.minimum_score),
+        ).fetchone():
+            _copy_latest(run_dir / "matches_ranked.txt", root / "last_nonempty_matches_ranked.txt")
     elif need_counts or need_links:
         # Only scan the minimal columns when ranked output is disabled.
         for row in database.execute("""SELECT c.original_url,m.hits_json,m.interesting_links_json
@@ -323,12 +347,22 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             "scan_run": f"Scan run: {scan_run_id}", "keyword_set": f"Keyword set: {run['keyword_set_name']}",
             "keyword_rules": f"Keyword rules: {len(keywords):,}",
             "source_operation": f"Scan source operation: {run['source_operation']}",
-            "scan_started": f"Scan started: {run['started_at']}",
+            "scan_started": f"Scan started: {run['started_at']} (status: {run['status']})",
             "scan_completed": f"Scan completed: {run['completed_at'] or '(not marked complete)'}",
             "targets": f"Targets: {', '.join(config.targets) or '(project database only)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
+            "index_coverage": _index_coverage_status(database),
             "ranked_matches": f"Ranked matches at score >= {config.minimum_score}: {int(database.execute('SELECT COUNT(*) FROM document_matches WHERE scan_run_id=? AND score>=? AND excluded=0 AND required_missing=0', (scan_run_id, config.minimum_score)).fetchone()[0]):,}",
+            "scan_diagnostic": (
+                "Scan status: " +
+                ("No bodies have recorded scan outcomes in this run. The run may be incomplete; "
+                 "inspect pending scans and unresolved errors."
+                 if int(database.execute('SELECT COUNT(*) FROM document_matches WHERE scan_run_id=?', (scan_run_id,)).fetchone()[0]) == 0
+                 else "Scan outcomes were recorded (including zero-hit documents); an empty ranked output may be a legitimate zero-match result.")
+                + " Saved documents: " + str(int(database.execute('SELECT COUNT(*) FROM documents').fetchone()[0]))
+                + "; awaiting local scan: " + str(int(database.execute("SELECT COUNT(*) FROM captures WHERE state='downloaded_unscanned'").fetchone()[0]))
+            ),
             "unresolved_errors": f"Unresolved errors: {int(database.execute('SELECT COUNT(*) FROM errors WHERE resolved=0').fetchone()[0]):,}",
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),

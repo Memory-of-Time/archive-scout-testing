@@ -66,19 +66,23 @@ def _scan_scope_identity(config: ProjectConfig) -> str:
 
 
 def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: ProjectConfig,
-                                   keyword_set_id: int, scope_id: str) -> int | None:
-    """Reuse only a stopped matching scan; never erase or mix old result sets.
+                                   keyword_set_id: int, scope_id: str,
+                                   *, include_complete: bool = False,
+                                   rescan_only: bool = False) -> int | None:
+    """Reuse compatible interrupted or completed scans, retaining earlier matches.
 
     Pre-1.2.1 jobs lacked a scope fingerprint. For them, verify that all
     previously scored documents belong to the current target/signature set.
     This check is performed at most once on an explicit Resume, never per URL.
     """
+    allowed = ("interrupted", "complete") if include_complete else ("interrupted",)
     candidate = database.execute(
-        """SELECT id,metadata_json FROM scan_runs
-           WHERE keyword_set_id=? AND minimum_score=? AND status='interrupted'
-           AND source_operation IN ('all','download','resume','external_media_after_scan')
-           ORDER BY id DESC LIMIT 1""",
-        (keyword_set_id, config.minimum_score),
+        """SELECT id,metadata_json,status FROM scan_runs
+           WHERE keyword_set_id=? AND minimum_score=? AND status IN ("""
+        + ",".join("?" for _ in allowed) + """)
+           AND source_operation IN (""" + ("'rescan'" if rescan_only else "'all','download','resume','external_media_after_scan'") + """)
+           ORDER BY CASE status WHEN 'interrupted' THEN 0 ELSE 1 END,id DESC LIMIT 1""",
+        (keyword_set_id, config.minimum_score, *allowed),
     ).fetchone()
     if candidate is None:
         return None
@@ -93,6 +97,13 @@ def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: Project
         if metadata["scope_identity"] != scope_id:
             return None
     else:
+        # Legacy scan metadata cannot establish a completed run's scope when
+        # it had no matches; only reuse interrupted legacy runs on Resume.
+        if candidate["status"] == "complete":
+            # A completed legacy run can be reused only if it demonstrably
+            # contains scored documents; empty legacy runs lack scope evidence.
+            if not database.execute("SELECT 1 FROM document_matches WHERE scan_run_id=? LIMIT 1", (run_id,)).fetchone():
+                return None
         accepted = {(target, cdx_query_signature(config.for_target(target)))
                     for target in config.targets}
         if not accepted:
@@ -136,8 +147,11 @@ def prepare_scan_jobs(
             continue
         seen_keyword_set_ids.add(keyword_set_id)
         scope_id = _scan_scope_identity(config)
-        run_id = (_reusable_interrupted_scan_run(database, config, keyword_set_id, scope_id)
-                  if mode == "resume" else None)
+        run_id = (_reusable_interrupted_scan_run(
+            database, config, keyword_set_id, scope_id,
+            include_complete=mode in {"all", "download", "resume", "external_media_after_scan"},
+            rescan_only=mode == "rescan",
+        ) if mode in {"all", "download", "resume", "external_media_after_scan", "rescan"} else None)
         if run_id is None:
             run_id = start_scan_run(
                 database,
@@ -146,16 +160,58 @@ def prepare_scan_jobs(
                 config.minimum_score,
                 mode,
                 {"keyword_set": keyword_set.name, "rules": keyword_set.rules,
-                 "scope_identity": scope_id},
+                 "scope_identity": scope_id,
+                 "historical_backfill_complete": False,
+                 "historical_backfill_cursor": 0},
             )
         jobs.append(ScanJob.create(run_id, keyword_set.name, keyword_set.rules))
     database.commit()
     return jobs
 
 
-def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str) -> None:
+def scan_prior_documents_once(database: sqlite3.Connection, jobs: list[ScanJob],
+                              config: ProjectConfig, stop_event: threading.Event,
+                              callback: Callable[[ProgressEvent], None] | None) -> None:
+    """Backfill only unscored saved bodies, with durable per-document coverage.
+
+    Scores of zero still produce a document_matches row. A crash or failed
+    read leaves that row absent, so the next run can retry it without trusting
+    a cursor that might have jumped over incomplete work.
+    """
+    scopes = sorted((target, cdx_query_signature(config.for_target(target)))
+                    for target in config.targets)
+    if not scopes:
+        return
+    rescan_keyword_sets(database, jobs, stop_event, callback,
+                        workers=config.workers, missing_only=True,
+                        scope_pairs=scopes)
+
+
+def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
+                config: ProjectConfig | None = None) -> None:
+    """Do not label a scan complete while a known saved body lacks a score."""
     for job in jobs:
-        finish_scan_run(database, job.scan_run_id, status)
+        actual = status
+        if status == "complete" and config is not None:
+            for target in config.targets:
+                signature = cdx_query_signature(config.for_target(target))
+                gap = database.execute(
+                    """SELECT 1 FROM captures c JOIN targets t ON t.id=c.target_id
+                       WHERE t.pattern=? AND c.query_signature=? AND
+                        (c.state='downloaded_unscanned' OR
+                         (c.state='downloaded' AND (NOT EXISTS (
+                             SELECT 1 FROM documents d WHERE d.capture_id=c.id) OR
+                             EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=c.id
+                             AND NOT EXISTS (SELECT 1 FROM document_matches m
+                                 WHERE m.document_id=d.id AND m.scan_run_id=?)))) OR
+                         EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
+                             AND e.operation='scan' AND e.resolved=0)) LIMIT 1""",
+                    (target, signature, job.scan_run_id),
+                ).fetchone()
+                if gap:
+                    actual = "interrupted"
+                    break
+        finish_scan_run(database, job.scan_run_id, actual)
 
 
 def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob]) -> dict[str, Path]:
@@ -171,7 +227,16 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
 def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000,
                            include_exhausted_pending: bool = False):
     """Yield each eligible capture at most once per pass, without an ID-sized list."""
-    signature = cdx_query_signature(config)
+    # Reuse a bounded, disk-backed scope table so target-specific CDX overrides
+    # are not silently filtered out by the global signature on retry.
+    database.execute("""CREATE TEMP TABLE IF NOT EXISTS archive_scout_retry_scopes(
+        pattern TEXT NOT NULL, signature TEXT NOT NULL,
+        PRIMARY KEY(pattern,signature)) WITHOUT ROWID""")
+    database.execute("DELETE FROM archive_scout_retry_scopes")
+    database.executemany(
+        "INSERT OR IGNORE INTO archive_scout_retry_scopes VALUES(?,?)",
+        ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
+    )
     last_id = 0
     while True:
         # Explicit retry includes pending captures which a lifetime attempt
@@ -179,13 +244,15 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         # still considers only recorded retryable errors, once per sweep.
         exhausted = " OR (c.state='pending' AND c.download_attempts>=?)" if include_exhausted_pending else ""
         rows = database.execute(
-            """SELECT c.id FROM captures c WHERE c.id>? AND c.query_signature=?
+            """SELECT c.id FROM captures c JOIN targets t ON t.id=c.target_id
+               WHERE c.id>? AND EXISTS (SELECT 1 FROM archive_scout_retry_scopes s
+                   WHERE s.pattern=t.pattern AND s.signature=c.query_signature)
                AND ((c.state='error' AND EXISTS (
                    SELECT 1 FROM errors e WHERE e.capture_id=c.id
                    AND e.resolved=0 AND e.ignored=0 AND e.retryable=1))"""
             + exhausted + ") ORDER BY c.id LIMIT ?",
-            (last_id, signature, config.max_attempts, batch_size)
-            if include_exhausted_pending else (last_id, signature, batch_size),
+            (last_id, config.max_attempts, batch_size)
+            if include_exhausted_pending else (last_id, batch_size),
         ).fetchall()
         if not rows:
             return
@@ -382,7 +449,11 @@ def run_project(
             database.commit()
             return paths
         if mode == "report":
-            existing = latest_scan_run(database)
+            # Explicit report regeneration must not hide a partially completed
+            # scan behind an older successful scan. Keep status visible in the
+            # report summary and preserve the scan-specific run directory.
+            latest = database.execute("SELECT id FROM scan_runs ORDER BY id DESC LIMIT 1").fetchone()
+            existing = int(latest[0]) if latest else None
             if existing is None:
                 if database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]:
                     paths = generate_index_reports(config, database)
@@ -420,6 +491,19 @@ def run_project(
             database.commit()
             return paths
 
+        # Scanning retained bodies is local work and must not wait for CDX.
+        # On a Resume with an unreachable indexing endpoint, every previously
+        # saved capture can still be recovered and scored before the outage.
+        if mode in {"all", "external_media_after_scan", "resume"} and database.execute(
+            "SELECT 1 FROM captures WHERE state IN ('downloaded','downloaded_unscanned') LIMIT 1"
+        ).fetchone():
+            jobs = prepare_scan_jobs(database, config, mode)
+            scan_prior_documents_once(database, jobs, config, stop_event, callback)
+            from .scanning.pending import scan_pending_saved
+            for target in config.targets:
+                scan_pending_saved(database, config.for_target(target), jobs,
+                                   stop_event, callback, workers=config.workers)
+
         if mode in {"all", "external_media_after_scan", "resume", "download_only"}:
             index_archive(config, database, stop_event, callback)
 
@@ -441,14 +525,29 @@ def run_project(
             database.commit()
             return paths
 
-        jobs = prepare_scan_jobs(database, config, mode)
+        if not jobs:
+            jobs = prepare_scan_jobs(database, config, mode)
+            if mode in {"all", "download", "resume", "external_media_after_scan"}:
+                scan_prior_documents_once(database, jobs, config, stop_event, callback)
         primary_run_id = jobs[0].scan_run_id
         if mode in {"all", "external_media_after_scan"}:
             download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
         elif mode in {"download", "resume"}:
             download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
         elif mode == "rescan":
-            rescan_keyword_sets(database, jobs, stop_event, callback, workers=config.workers)
+            # Existing document rows and saved-but-unscanned bodies are both
+            # part of the searchable inventory.  Scanning documents first
+            # avoids reprocessing any newly recovered pending body twice.
+            rescan_keyword_sets(database, jobs, stop_event, callback, workers=config.workers,
+                                missing_only=all(database.execute(
+                                    "SELECT source_operation,status FROM scan_runs WHERE id=?", (job.scan_run_id,)
+                                ).fetchone()["source_operation"] == "rescan" and
+                                database.execute("SELECT 1 FROM document_matches WHERE scan_run_id=? LIMIT 1", (job.scan_run_id,)).fetchone()
+                                for job in jobs))
+            from .scanning.pending import scan_pending_saved
+            for target in config.targets:
+                scan_pending_saved(database, config.for_target(target), jobs,
+                                   stop_event, callback, workers=config.workers)
         elif mode == "retry_errors":
             retry_error_urls(config, database, primary_run_id, stop_event, callback, jobs)
             media_error_count = database.execute(
@@ -464,7 +563,7 @@ def run_project(
                 )
         if mode in {"all", "external_media_after_scan", "download", "resume"}:
             recover_transient_text_errors(config, database, primary_run_id, jobs, stop_event, callback)
-        finish_jobs(database, jobs, "complete")
+        finish_jobs(database, jobs, "complete", config)
         database.commit()
         paths = generate_job_reports(config, database, jobs)
         if mode == "retry_errors" and database.execute("SELECT COUNT(*) FROM media_captures").fetchone()[0]:

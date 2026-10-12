@@ -113,10 +113,8 @@ def parse_cdx(payload: object) -> tuple[list[dict[str, str]], str | None]:
         return [], None
     if isinstance(payload, dict):
         message = str(payload.get("message") or payload.get("error") or payload)
-        lowered = message.lower()
-        if "no capture" in lowered or "no result" in lowered or "not found" in lowered:
-            return [], None
-        raise RuntimeError(message)
+        # A service error is not a valid proof of empty Wayback inventory.
+        raise RuntimeError(f"CDX returned an error object: {message}")
     if not isinstance(payload, list) or not payload:
         return [], None
     header = payload[0]

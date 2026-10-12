@@ -1,27 +1,38 @@
-# Scout 1.2.1 — Operations, Safety and Acquisition Visibility
+# Scout 1.2.2 — Indexing and scanning recovery
 
-This **patch-only** update builds on the public Scout 1.2.0 repository, including the Dashboard refresh hotfix and intended 1.5-second CDX default. It does not change the fixed replay request-start spacing (0.125s), normal worker count (10), CDX query pacing or the existing text/media classifier.
+This release repairs incomplete scan coverage, empty reports, and repeat CDX failures. Scans run alongside text downloads and recover prior saved bodies before the next indexing request in an existing project. Per-target query overrides stay in the download/retry queue. CDX errors no longer masquerade as empty inventories, and reports distinguish incomplete indexing, missing scan outcomes and legitimate zero matches. Text/media differentiation and schema 9 are unchanged.
 
-## Included changes
+**Validation:** local Linux pytest, fault injection, and a 120-capture loopback test with persisted score verification. Live Wayback throughput, overnight stability, and GitHub cross-platform CI remain unverified. See `docs/SCOUT_1_2_2_INDEX_SCAN_AUDIT.md`.
 
-- Index and download only (no keyword scans or scan jobs); separate retry failed downloads without scanning; correct index-only scope routing.
-- One bounded, fair pass over transient text errors, preventing repeated selection of the same failing batch within a run.
-- Cross-process project operation lease, and SQLite WAL-aware safety backup before manual database restoration.
-- Import files copied into project-owned capture storage, and one-time rebasing of project-owned document/media paths when a project is moved.
-- Consistent media embedded-link filtering: a recognized extension not in Include is rejected, while extensionless tagged candidates remain eligible.
-- Manual, on-demand integrity checks include media files and streamed SHA-256 verification; never add these checks to the acquisition hot path.
-- Balanced Media page rows and editor headings; additional GUI operation help and validation coverage.
-- Passive stall diagnostics report outstanding tasks, waiting Wayback gate workers, probe state and elapsed time since completion/save (only after 30 seconds of no completion).
-- **Experimental coordinated host connection recovery is OFF by default**. When explicitly enabled, independent failed connections can trigger a short shared recovery probe using the existing host gate; healthy traffic is not delayed by startup ramp-ups.
-- CDX error classification prevents temporary 5xx/429 and host connection outages from generating one-second indexing queries. Broad read timeouts and oversized responses retain bounded/responsible subdivision, but HTTP service failures no longer shrink the saved page size or rotate through one-second checkpoint windows.
-- Endpoint fallback logs now include the failure category, elapsed time and next service. No extra network requests or automatic checkpoint reset are introduced.
-- Windows/macOS/Linux-facing version metadata and README release links updated for Scout 1.2.1.
+---
 
-## Important limitations and decisions
+# Scout 1.2.1 — Complete repository
 
-- **Schema 13 from v1.1.1 is NOT migrated in this patch.** An unverified schema downgrade can destroy historic data; use a tested importer against a real legacy project before claiming support.
-- Historical scan-and-discard, scan overlap, manual scan memory/workers and storage compaction controls remain under review. Reintroducing them blindly could alter acquisition correctness or performance.
-- No automatic retry gate is enabled by default; the optional host gate has synthetic tests only, not a live long-run proof.
-- Existing fragmented CDX plans are not automatically recombined because the historical split cause may be unknown. Incomplete windows remain saved and retryable.
-- Project relocation/rebase changes only identifiable internal paths and never synthesizes missing files. Back up and verify very large/legacy projects before moving them.
-- A local 90-capture benchmark is not evidence of sustained Internet Archive performance. Hosted cross-platform CI and sustained real Wayback trials are required before public release.
+Full source release for `Memory-of-Time/archive-scout`, assembled from the v1.2.0 repository and cumulative v1.2.1 operation/CI/completeness patches. The v1.2.0 project schema remains **9**; installed source version is **1.2.1**.
+
+## Resumability and integrity
+
+- Durable CDX cursor/SQLite write consistency in text and media indexing; committed Timemap page coverage remains verifiable.
+- Encoded CDX response handling (including bounded gzip/UTF-16); malformed or truncated responses cannot silently count as complete inventory.
+- Gateway 504 retry recovery keeps the saved checkpoint intact, with service-oriented subdivision rather than blindly multiplying requests.
+- Interrupted streamed-media Range continuation validates range offsets, totals and identity before publishing bytes; unverified partial bodies are never treated as complete.
+- Media basenames cannot overwrite or wrongly reuse other archived captures without digest/identity validation.
+- One-pass recovery of temporary text failures; explicit retry of captures that have exhausted the ordinary attempt ceiling.
+- Resume can reuse matching **interrupted scan runs** and preserve their existing match history; unrelated scopes create new scan runs.
+- Safeguarded project backups, relocation of verifiably project-owned paths, crash recovery for in-flight states and per-operation diagnostics.
+- A read-only project upgrade checker and a v1.2.0 schema-9 compatibility regression suite.
+
+## Performance and compatibility
+
+- No change to the standard 0.125-second replay start spacing, established worker concurrency or user-saved CDX pacing settings.
+- No additional HTTP requests in the healthy download or CDX indexing path. Safety checks in this release run only when recovery, compatibility or an existing media file warrants them.
+- Python source targets >=3.11. The GitHub Actions suite covers Python 3.11 and 3.12 across Ubuntu, Windows and Intel/Apple Silicon macOS. Local Linux CI-script test results accompany this artifact; hosted cross-platform results must be checked after uploading.
+
+## Safety limitations
+
+- Legacy schema-13 databases are **not** supported by Scout 1.2.1.
+- Failed partial HTTP responses with no validator cannot always resume safely; affected captures remain retryable.
+- Index completeness still depends on actual responses from the Wayback Machine. A successful local fixture test cannot guarantee remote archival availability or sustained 8/s throughput.
+- Do not overwrite a running 650,000-URL project, change its indexing constraints during upgrade, or copy a live SQLite WAL database by copying only `.sqlite3`.
+
+See `docs/UPGRADE_1_2_0_TO_1_2_1.md` for a safe upgrade procedure and preflight commands.
