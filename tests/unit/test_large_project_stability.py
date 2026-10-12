@@ -430,44 +430,50 @@ class LargeProjectStabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             database = open_database(root)
-            with database:
-                upsert_media_captures(
-                    database,
-                    (
+            try:
+                with database:
+                    upsert_media_captures(
+                        database,
                         (
                             (
-                                "20010101000000",
-                                f"http://example.com/media/{index}.jpg",
-                                "image/jpeg",
-                                "200",
-                                f"M{index}",
-                                "123",
-                            ),
-                            "image",
-                            ".jpg",
-                        )
-                        for index in range(1200)
-                    ),
-                    None,
-                    "media-retry-selection",
-                )
-                media_ids = [int(row[0]) for row in database.execute("SELECT id FROM media_captures ORDER BY id")]
-                database.execute("UPDATE media_captures SET state='error'")
-                now = utc_now()
-                database.executemany(
-                    """
-                    INSERT INTO errors(media_capture_id,operation,category,message,retryable,first_seen,last_seen)
-                    VALUES(?, 'media_download', 'timeout', 'timeout', 1, ?, ?)
-                    """,
-                    ((media_id, now, now) for media_id in media_ids),
-                )
-            config = ProjectConfig(text_collapse_scope="year", output_dir=root, targets=["example.com/*"], keywords=[]).normalized()
-            with patch("archive_scout.media.downloader.download_media") as mocked:
-                retry_media_errors(
-                    config, database, threading.Event(), media_capture_ids=media_ids
-                )
-            self.assertEqual(len(mocked.call_args.kwargs["media_capture_ids"]), 1200)
-            database.close()
+                                (
+                                    "20010101000000",
+                                    f"http://example.com/media/{index}.jpg",
+                                    "image/jpeg",
+                                    "200",
+                                    f"M{index}",
+                                    "123",
+                                ),
+                                "image",
+                                ".jpg",
+                            )
+                            for index in range(1200)
+                        ),
+                        None,
+                        "media-retry-selection",
+                    )
+                    media_ids = [int(row[0]) for row in database.execute("SELECT id FROM media_captures ORDER BY id")]
+                    database.execute("UPDATE media_captures SET state='error'")
+                    now = utc_now()
+                    database.executemany(
+                        """
+                        INSERT INTO errors(media_capture_id,operation,category,message,retryable,first_seen,last_seen)
+                        VALUES(?, 'media_download', 'timeout', 'timeout', 1, ?, ?)
+                        """,
+                        ((media_id, now, now) for media_id in media_ids),
+                    )
+                config = ProjectConfig(text_collapse_scope="year", output_dir=root, targets=["example.com/*"], keywords=[]).normalized()
+                with patch("archive_scout.media.downloader.download_media") as mocked:
+                    retry_media_errors(
+                        config, database, threading.Event(), media_capture_ids=media_ids
+                    )
+                batches = [call.kwargs["media_capture_ids"] for call in mocked.call_args_list]
+                selected_ids = [media_id for batch in batches for media_id in batch]
+                self.assertEqual(selected_ids, media_ids, "Every eligible media ID must be retried exactly once, in order")
+                self.assertTrue(all(0 < len(batch) <= 1000 for batch in batches), "Retry batches must remain bounded")
+
+            finally:
+                database.close()
 
     def test_unexpected_local_index_error_is_not_retried_forever(self):
         with tempfile.TemporaryDirectory() as temp:
