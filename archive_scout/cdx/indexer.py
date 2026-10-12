@@ -35,6 +35,12 @@ from .parameters import (
 PAGED_PIPELINE_PAGES = 1000
 PAGED_REQUEST_ATTEMPTS = 5
 PAGED_PAGE_FAILURE_LIMIT = 5
+# Only persistent HTTP 504 on a *broad, not-yet-paginated* range qualifies.
+# Cap exploratory splits across the whole saved task until a CDX response
+# succeeds. A host-wide outage must not explode one range into thousands.
+GATEWAY_504_SPLIT_AFTER = 2
+GATEWAY_504_MAX_SPLITS_WITHOUT_RESPONSE = 5
+GATEWAY_504_MIN_WINDOW_DAYS = 28
 
 
 @dataclass(slots=True)
@@ -51,6 +57,7 @@ class PendingWindow:
     pagination_supported: bool = True
     retry_pages: list[int] = field(default_factory=list)
     page_failures: dict[int, int] = field(default_factory=dict)
+    gateway_504_failures: int = 0
 
 
 @dataclass(slots=True)
@@ -58,6 +65,7 @@ class IndexPlan:
     pending: list[PendingWindow]
     completed: int
     planned: int
+    gateway_splits_without_response: int = 0
 
 
 @dataclass(slots=True)
@@ -132,12 +140,14 @@ def encode_plan(plan: IndexPlan) -> str | None:
         "version": 5,
         "completed": int(plan.completed),
         "planned": int(plan.planned),
+        "gateway_splits_without_response": int(plan.gateway_splits_without_response),
         "pending": [
             {
                 "start": item.start,
                 "end": item.end,
                 "resume_key": item.resume_key,
                 "failures": int(item.failures),
+                "gateway_504_failures": int(item.gateway_504_failures),
                 "page_size": int(item.page_size),
                 "strategy": item.strategy,
                 "page": int(item.page),
@@ -183,6 +193,7 @@ def decode_plan(value: str | None, default_windows: list[tuple[str, str]]) -> In
                             end=end,
                             resume_key=str(resume) if resume else None,
                             failures=max(0, int(raw.get("failures", 0))),
+                            gateway_504_failures=max(0, int(raw.get("gateway_504_failures", 0))),
                             page_size=max(0, int(raw.get("page_size", 0))),
                             strategy=str(raw.get("strategy") or "auto"),
                             page=max(0, int(raw.get("page", 0))),
@@ -196,7 +207,8 @@ def decode_plan(value: str | None, default_windows: list[tuple[str, str]]) -> In
                 completed = max(0, int(payload.get("completed", 0)))
                 planned = max(completed + len(pending), int(payload.get("planned", 0)))
                 if pending:
-                    return IndexPlan(pending, completed, planned)
+                    return IndexPlan(pending, completed, planned,
+                                     max(0, int(payload.get("gateway_splits_without_response", 0))))
         except Exception:
             pass
 
@@ -259,6 +271,98 @@ def split_window(window: PendingWindow) -> list[PendingWindow]:
         )
         cursor = part_end + timedelta(seconds=1)
     return parts if len(parts) > 1 else []
+
+
+
+def _bisect_persistent_gateway_504(window: PendingWindow) -> list[PendingWindow]:
+    """Conservatively split a not-yet-started CDX range after repeated 504s.
+
+    In contrast to the response-size splitter, use exactly two inclusive,
+    contiguous halves. Never discard a live resume key or numbered-page ledger.
+    This helper is only reached from the failure path.
+    """
+    if window.resume_key or window.page or window.page_count >= 0:
+        return []
+    try:
+        start = datetime.strptime(window.start, "%Y%m%d%H%M%S")
+        end = datetime.strptime(window.end, "%Y%m%d%H%M%S")
+    except ValueError:
+        return []
+    if end - start < timedelta(days=GATEWAY_504_MIN_WINDOW_DAYS):
+        return []
+    midpoint = start + timedelta(seconds=int((end - start).total_seconds() // 2))
+    left_end = midpoint.strftime("%Y%m%d%H%M%S")
+    right_start = (midpoint + timedelta(seconds=1)).strftime("%Y%m%d%H%M%S")
+    return [
+        PendingWindow(window.start, left_end,
+                      page_size=window.page_size, strategy=window.strategy,
+                      page_blocks=window.page_blocks,
+                      pagination_supported=window.pagination_supported),
+        PendingWindow(right_start, window.end,
+                      page_size=window.page_size, strategy=window.strategy,
+                      page_blocks=window.page_blocks,
+                      pagination_supported=window.pagination_supported),
+    ]
+
+
+def _maybe_subdivide_persistent_gateway_504(
+    database: sqlite3.Connection,
+    plan: IndexPlan,
+    current: PendingWindow,
+    exc: TransientRequestError,
+    persist_task_state: Callable[[str | None, bool, int, int | None], None],
+    seen: int,
+    error_id: int | None,
+    callback: Callable[[ProgressEvent], None] | None,
+    completed_windows: int,
+    total_windows: int,
+) -> bool:
+    """Durably replace a stuck broad range with two halves, never drop work.
+
+    This is deliberately distinct from the ordinary split predicate: a single
+    HTTP 504 is insufficient, and 429/503/connection failures never trigger it.
+    A task-wide persisted budget stops an outage from generating limitless work.
+    """
+    details = str(exc).casefold()
+    mixed_endpoint_outage = ("all cdx endpoints failed" in details and any(
+        f"http {status}" in details for status in (408, 425, 429, 500, 502, 503)
+    ))
+    if (exc.status != 504 or exc.connection_failed or isinstance(exc, RateLimitDeferred)
+            or mixed_endpoint_outage):
+        current.gateway_504_failures = 0
+        return False
+    current.gateway_504_failures += 1
+    if (current.gateway_504_failures < GATEWAY_504_SPLIT_AFTER
+            or plan.gateway_splits_without_response >= GATEWAY_504_MAX_SPLITS_WITHOUT_RESPONSE):
+        return False
+    children = _bisect_persistent_gateway_504(current)
+    if not children or not plan.pending or plan.pending[0] is not current:
+        return False
+
+    original_planned = plan.planned
+    original_budget = plan.gateway_splits_without_response
+    try:
+        with database:
+            plan.pending[0:1] = children
+            plan.planned += 1
+            plan.gateway_splits_without_response += 1
+            persist_task_state(encode_plan(plan), False, seen, error_id)
+    except BaseException:
+        # The SQLite transaction rolled back: also restore the live cursor,
+        # so the caller cannot accidentally persist work that wasn't committed.
+        plan.pending[0:2] = [current]
+        plan.planned = original_planned
+        plan.gateway_splits_without_response = original_budget
+        raise
+    emit(callback, ProgressEvent(
+        "index",
+        f"Repeated HTTP 504 on {window_label(current.start, current.end)}. "
+        f"Saved both nonoverlapping halves for retry; no captures marked complete "
+        f"({plan.gateway_splits_without_response}/"
+        f"{GATEWAY_504_MAX_SPLITS_WITHOUT_RESPONSE} exploratory splits since last response).",
+        completed_windows, total_windows + 1,
+    ))
+    return True
 
 
 def window_label(start: str, end: str) -> str:
@@ -1123,12 +1227,16 @@ def index_archive(
                     # cursor that skips an uncommitted CDX response.
                     old_seen, old_cursor = seen, current.resume_key
                     old_failures, old_completed = current.failures, plan.completed
+                    old_gateway_count = current.gateway_504_failures
+                    old_gateway_budget = plan.gateway_splits_without_response
                     old_completed_windows, old_error_id = completed_windows, error_id
                     try:
                         with database:
                             changed = upsert_captures(database, rows, target_id, signature)
                             seen += received
                             current.failures = 0
+                            current.gateway_504_failures = 0
+                            plan.gateway_splits_without_response = 0
                             if next_cursor is not None:
                                 current.resume_key = next_cursor
                             if finished:
@@ -1143,6 +1251,8 @@ def index_archive(
                     except BaseException:
                         seen, current.resume_key = old_seen, old_cursor
                         current.failures, plan.completed = old_failures, old_completed
+                        current.gateway_504_failures = old_gateway_count
+                        plan.gateway_splits_without_response = old_gateway_budget
                         completed_windows, error_id = old_completed_windows, old_error_id
                         if finished and (not plan.pending or plan.pending[0] is not current):
                             plan.pending.insert(0, current)
@@ -1173,6 +1283,7 @@ def index_archive(
                     )
                 except TransientRequestError as exc:
                     if exc.connection_failed:
+                        current.gateway_504_failures = 0
                         connection_failure_streak += 1
                         current.failures += 1
                         network = target_config.network.normalized()
@@ -1207,6 +1318,13 @@ def index_archive(
                         stop_event.wait(wait_seconds)
                         if stop_event.is_set():
                             raise Stopped
+                        continue
+                    if _maybe_subdivide_persistent_gateway_504(
+                        database, plan, current, exc, persist_task_state, seen, error_id,
+                        callback, completed_windows, total_windows,
+                    ):
+                        total_windows += 1
+                        transient_failure_streak = 0
                         continue
                     transient_failure_streak += 1
                     network = target_config.network.normalized()
