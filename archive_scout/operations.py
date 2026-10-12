@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import hashlib
 import threading
 import time
 from dataclasses import replace
@@ -55,6 +57,69 @@ def emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent)
         callback(event)
 
 
+def _scan_scope_identity(config: ProjectConfig) -> str:
+    """Stable inventory scope; excludes request pacing and project location."""
+    targets = sorted((target, cdx_query_signature(config.for_target(target)))
+                     for target in config.targets)
+    data = {"targets": targets, "from": config.from_date, "to": config.to_date}
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _reusable_interrupted_scan_run(database: sqlite3.Connection, config: ProjectConfig,
+                                   keyword_set_id: int, scope_id: str) -> int | None:
+    """Reuse only a stopped matching scan; never erase or mix old result sets.
+
+    Pre-1.2.1 jobs lacked a scope fingerprint. For them, verify that all
+    previously scored documents belong to the current target/signature set.
+    This check is performed at most once on an explicit Resume, never per URL.
+    """
+    candidate = database.execute(
+        """SELECT id,metadata_json FROM scan_runs
+           WHERE keyword_set_id=? AND minimum_score=? AND status='interrupted'
+           AND source_operation IN ('all','download','resume','external_media_after_scan')
+           ORDER BY id DESC LIMIT 1""",
+        (keyword_set_id, config.minimum_score),
+    ).fetchone()
+    if candidate is None:
+        return None
+    run_id = int(candidate["id"])
+    try:
+        metadata = json.loads(candidate["metadata_json"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("scope_identity"):
+        if metadata["scope_identity"] != scope_id:
+            return None
+    else:
+        accepted = {(target, cdx_query_signature(config.for_target(target)))
+                    for target in config.targets}
+        if not accepted:
+            return None
+        # v1.2.0 had no scope marker. Only reuse if its existing matched
+        # document references are all in the present scope. Unmatched saved
+        # captures keep their independent durable states regardless.
+        conditions = " OR ".join("(t.pattern=? AND c.query_signature=?)" for _ in accepted)
+        params = [item for pair in sorted(accepted) for item in pair]
+        mismatch = database.execute(
+            f"""SELECT 1 FROM document_matches dm
+                JOIN documents d ON d.id=dm.document_id
+                JOIN captures c ON c.id=d.capture_id
+                LEFT JOIN targets t ON t.id=c.target_id
+                WHERE dm.scan_run_id=? AND NOT ({conditions}) LIMIT 1""",
+            (run_id, *params),
+        ).fetchone()
+        if mismatch is not None:
+            return None
+    metadata["scope_identity"] = scope_id
+    database.execute(
+        "UPDATE scan_runs SET status='running',completed_at=NULL,metadata_json=? WHERE id=?",
+        (json.dumps(metadata, ensure_ascii=False, sort_keys=True), run_id),
+    )
+    return run_id
+
+
 def prepare_scan_jobs(
     database: sqlite3.Connection,
     config: ProjectConfig,
@@ -70,14 +135,19 @@ def prepare_scan_jobs(
         if keyword_set_id in seen_keyword_set_ids:
             continue
         seen_keyword_set_ids.add(keyword_set_id)
-        run_id = start_scan_run(
-            database,
-            keyword_set_id,
-            f"{keyword_set.name} ({mode})",
-            config.minimum_score,
-            mode,
-            {"keyword_set": keyword_set.name, "rules": keyword_set.rules},
-        )
+        scope_id = _scan_scope_identity(config)
+        run_id = (_reusable_interrupted_scan_run(database, config, keyword_set_id, scope_id)
+                  if mode == "resume" else None)
+        if run_id is None:
+            run_id = start_scan_run(
+                database,
+                keyword_set_id,
+                f"{keyword_set.name} ({mode})",
+                config.minimum_score,
+                mode,
+                {"keyword_set": keyword_set.name, "rules": keyword_set.rules,
+                 "scope_identity": scope_id},
+            )
         jobs.append(ScanJob.create(run_id, keyword_set.name, keyword_set.rules))
     database.commit()
     return jobs

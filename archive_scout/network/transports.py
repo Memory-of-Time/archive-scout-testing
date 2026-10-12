@@ -306,7 +306,31 @@ def _resume_partial_httpx(backend, url: str, headers: dict, destination: Path,
             if status in {429, 503}:
                 raise RuntimeError(f"Range recovery returned HTTP {status}; prefix preserved")
             _discard_partial(destination)
-            return None
+            if status != 200 or str(response.url) != url:
+                return None
+            # Some Wayback replay endpoints ignore Range and send the entire
+            # representation. Consume that same 200 response as a clean full
+            # download rather than immediately issuing another GET.
+            full_headers = _copy_headers(response.headers.items())
+            announced = full_headers.get("content-length", "")
+            if announced.isdigit() and int(announced) > max_bytes:
+                raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
+            try:
+                written, sha256, preview = _write_limited(
+                    response.iter_bytes(64 * 1024), destination, max_bytes, stop_event,
+                    preserve_on_stream_error=True,
+                )
+            except (Stopped, httpx.HTTPError, TimeoutError, OSError):
+                if announced.isdigit() and int(announced) <= max_bytes:
+                    _save_partial_metadata(destination, url, url, full_headers, int(announced))
+                else:
+                    _discard_partial(destination)
+                raise
+            return TransportFileResponse(
+                status=200, headers=full_headers, final_url=url, path=destination,
+                bytes_written=written, content_hash=sha256, preview=preview,
+                backend="httpx-full-range-ignored", elapsed=time.monotonic() - started,
+            )
         fields = _copy_headers(response.headers.items())
         match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", fields.get("content-range", "").strip())
         if (not match or fields.get("content-encoding", "identity").casefold() not in {"", "identity"}
@@ -447,7 +471,7 @@ class HttpxBackend:
         expected_digest: str = "",
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
-        if retain_partial and _partial_metadata_path(destination).exists():
+        if retain_partial and destination.exists() and _partial_metadata_path(destination).exists():
             resumed = _resume_partial_httpx(
                 self, url, headers, destination, max_bytes, stop_event, expected_digest
             )
@@ -954,7 +978,7 @@ class ResilientTransport:
         expected_digest: str = "",
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
-        names = (["httpx"] if retain_partial and _partial_metadata_path(destination).is_file()
+        names = (["httpx"] if retain_partial and destination.exists() and _partial_metadata_path(destination).is_file()
                  and "httpx" in self.backends else self._ordered_names())
         for name in names:
             if stop_event.is_set():
