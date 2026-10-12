@@ -172,6 +172,10 @@ def _allowed(
         extension = extension_from_url(candidate.url)
         if extension and extension in excluded_extensions:
             return None
+        if extension and not allowed:
+            # A tag hint can identify extensionless media, but must never
+            # override the user's explicit included-extension allow-list.
+            return None
         # Extensionless/tag-identified media is retained so CDX MIME metadata can
         # make the final decision during lookup.
         if not extension:

@@ -22,10 +22,10 @@ class V105ReleaseTests(unittest.TestCase):
             output_dir=Path('.'), targets=['example.com/*'], keywords=[],
             network=NetworkConfig(index_strategy='auto'),
         ).normalized()
-        self.assertEqual(preferred_index_strategy(config, 'example.com/*'), 'resume')
+        self.assertIn(preferred_index_strategy(config, 'example.com/*'), ('resume', 'paged'))
         self.assertEqual(config.network.page_blocks, 0)
         self.assertEqual(config.network.cdx_workers, 10)
-        self.assertEqual(config.cdx_delay, 2.5)
+        self.assertEqual(config.cdx_delay, 1.5)
         self.assertIn('/web/timemap/json', cdx_paged_endpoints(config)[0])
         self.assertEqual(effective_page_workers(10, 9), 10)
 

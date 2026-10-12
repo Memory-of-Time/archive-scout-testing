@@ -363,6 +363,7 @@ class NetworkConfig:
     failure_pause_threshold: int = 8
     connection_failure_pause_threshold: int = 3
     connection_retry_seconds: float = 3.0
+    coordinated_connection_recovery: bool = False
     diagnostics: bool = True
 
     def normalized(self) -> "NetworkConfig":
@@ -388,6 +389,7 @@ class NetworkConfig:
             failure_pause_threshold=min(100, max(2, int(self.failure_pause_threshold))),
             connection_failure_pause_threshold=min(10, max(2, int(self.connection_failure_pause_threshold))),
             connection_retry_seconds=min(30.0, max(1.0, float(self.connection_retry_seconds))),
+            coordinated_connection_recovery=bool(self.coordinated_connection_recovery),
             diagnostics=bool(self.diagnostics),
         )
 
@@ -415,7 +417,7 @@ class ProjectConfig:
     minimum_score: int = 1
     max_file_mb: float = 25.0
     page_size: int = 100000
-    cdx_delay: float = 2.5
+    cdx_delay: float = 1.5
     download_delay: float = 0.125
     retries: int = 4
     rate_limit_base_pause: float = 5.0
@@ -425,7 +427,7 @@ class ProjectConfig:
     connect_timeout: float = 30.0
     read_timeout: float = 180.0
     max_attempts: int = 4
-    user_agent: str = "ArchiveScout/1.0 public web archive research client"
+    user_agent: str = "Scout/1.2.0 public web archive research client"
     retry_error_categories: list[str] = field(default_factory=list)
     retry_capture_ids: list[int] = field(default_factory=list)
     retry_media_capture_ids: list[int] = field(default_factory=list)
@@ -543,7 +545,7 @@ class ProjectConfig:
             connect_timeout=max(1.0, float(self.connect_timeout)),
             read_timeout=max(1.0, float(self.read_timeout)),
             max_attempts=min(20, max(1, int(self.max_attempts))),
-            user_agent=self.user_agent.strip() or "ArchiveScout/1.0 public web archive research client",
+            user_agent=self.user_agent.strip() or "Scout/1.2.0 public web archive research client",
             retry_error_categories=list(dict.fromkeys(value.strip() for value in self.retry_error_categories if value.strip())),
             retry_capture_ids=sorted({int(value) for value in self.retry_capture_ids if int(value) > 0}),
             retry_media_capture_ids=sorted({int(value) for value in self.retry_media_capture_ids if int(value) > 0}),
@@ -606,7 +608,14 @@ def save_project_config(config: ProjectConfig) -> Path:
 
 
 def load_project_config(path: Path) -> ProjectConfig:
+    path = Path(path).expanduser()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    saved_root = Path(payload.get("output_dir") or path.parent).expanduser()
+    # The standard project.json belongs inside the project directory. When a
+    # complete project is moved or copied, use the colocated database instead
+    # of silently returning to a different folder.
+    if saved_root != path.parent and (path.parent / "archive_scout.sqlite3").is_file():
+        saved_root = path.parent
     keyword_sets = list(payload.get("keyword_sets") or [])
     media_payload = payload.get("media") or {}
     analysis_payload = payload.get("analysis") or {}
@@ -615,7 +624,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     network_payload = payload.get("network") or {}
     report_payload = payload.get("report") or {}
     loaded_page_size = int(payload.get("page_size", 100000))
-    loaded_cdx_delay = float(payload.get("cdx_delay", 2.5))
+    loaded_cdx_delay = float(payload.get("cdx_delay", 1.5))
     loaded_page_blocks = int(network_payload.get("page_blocks", 0))
     loaded_cdx_workers = int(network_payload.get("cdx_workers", 10))
     loaded_workers = int(payload.get("workers", 10))
@@ -676,7 +685,7 @@ def load_project_config(path: Path) -> ProjectConfig:
     # Migrate only historical untouched 0.75-second defaults; an explicit
     # custom interval other than that historical default is preserved.
     if loaded_cdx_delay == 0.75 and str(payload.get("version", "")) != VERSION:
-        loaded_cdx_delay = 2.5
+        loaded_cdx_delay = 1.5
     # v1.0.3 shipped conservative replay defaults (4 workers, 0.5 s
     # between request starts). Upgrade only that untouched pair to the v1.0.4
     # high-throughput replay profile: ten persistent connections and eight
@@ -685,7 +694,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         loaded_workers = 10
         loaded_download_delay = 0.125
     return ProjectConfig(
-        output_dir=Path(payload.get("output_dir") or path.parent),
+        output_dir=saved_root,
         targets=list(payload.get("targets") or []),
         keywords=list(payload.get("keywords") or []),
         keyword_set_name=str(payload.get("keyword_set_name") or "Current keywords"),
@@ -713,7 +722,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         connect_timeout=float(payload.get("connect_timeout", 30.0)),
         read_timeout=float(payload.get("read_timeout", 180.0)),
         max_attempts=int(payload.get("max_attempts", 4)),
-        user_agent=str(payload.get("user_agent", "ArchiveScout/1.0 public web archive research client")),
+        user_agent=str(payload.get("user_agent", "Scout/1.2.0 public web archive research client")),
         retry_error_categories=list(payload.get("retry_error_categories") or []),
         retry_capture_ids=[int(value) for value in payload.get("retry_capture_ids") or []],
         retry_media_capture_ids=[int(value) for value in payload.get("retry_media_capture_ids") or []],
@@ -788,6 +797,7 @@ def load_project_config(path: Path) -> ProjectConfig:
             failure_pause_threshold=int(network_payload.get("failure_pause_threshold", 8)),
             connection_failure_pause_threshold=int(network_payload.get("connection_failure_pause_threshold", 3)),
             connection_retry_seconds=float(network_payload.get("connection_retry_seconds", 3.0)),
+            coordinated_connection_recovery=bool(network_payload.get("coordinated_connection_recovery", False)),
             diagnostics=bool(network_payload.get("diagnostics", True)),
         ),
         target_settings=dict(payload.get("target_settings") or {}),

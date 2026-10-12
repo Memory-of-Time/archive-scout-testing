@@ -1,32 +1,27 @@
-# Archive Scout v1.2.2 — Index format, visual usability, and truthful progress
+# Scout 1.2.1 — Operations, Safety and Acquisition Visibility
 
-Patch release for a complete **v1.2.1** repository (the v1.2.0 full repository + final v1.2.1 overlay). Schema 8 is unchanged; do not open schema-13 projects from v1.1.x in this branch.
+This **patch-only** update builds on the public Scout 1.2.0 repository, including the Dashboard refresh hotfix and intended 1.5-second CDX default. It does not change the fixed replay request-start spacing (0.125s), normal worker count (10), CDX query pacing or the existing text/media classifier.
 
-## Fixes
+## Included changes
 
-- Restore endpoint-native CDX format ordering, including JSON-first for `/web/timemap/json` and text-first for `/web/timemap/cdx`. Auto-detect JSON response bodies from other text-preferred endpoints in one request, with strict validation still required.
-- Correct misleading CDX fallback logging; report actual validation errors. No extra connection probes or adaptive rate limits.
-- Activity `recent successful saves` is the past 30-second rate of committed, new text downloads, not a lifetime average. Whole-pass average is labeled separately.
-- Dashboard metrics update **only** on button click. The Saved documents card counts successful saved text captures even before local scan completion; Ranked matches counts unique documents with qualifying positive keyword results across scan runs.
-- Respect native display scaling, apply dark theme to raw scroll canvases, improve media pane proportions and borders.
+- Index and download only (no keyword scans or scan jobs); separate retry failed downloads without scanning; correct index-only scope routing.
+- One bounded, fair pass over transient text errors, preventing repeated selection of the same failing batch within a run.
+- Cross-process project operation lease, and SQLite WAL-aware safety backup before manual database restoration.
+- Import files copied into project-owned capture storage, and one-time rebasing of project-owned document/media paths when a project is moved.
+- Consistent media embedded-link filtering: a recognized extension not in Include is rejected, while extensionless tagged candidates remain eligible.
+- Manual, on-demand integrity checks include media files and streamed SHA-256 verification; never add these checks to the acquisition hot path.
+- Balanced Media page rows and editor headings; additional GUI operation help and validation coverage.
+- Passive stall diagnostics report outstanding tasks, waiting Wayback gate workers, probe state and elapsed time since completion/save (only after 30 seconds of no completion).
+- **Experimental coordinated host connection recovery is OFF by default**. When explicitly enabled, independent failed connections can trigger a short shared recovery probe using the existing host gate; healthy traffic is not delayed by startup ramp-ups.
+- CDX error classification prevents temporary 5xx/429 and host connection outages from generating one-second indexing queries. Broad read timeouts and oversized responses retain bounded/responsible subdivision, but HTTP service failures no longer shrink the saved page size or rotate through one-second checkpoint windows.
+- Endpoint fallback logs now include the failure category, elapsed time and next service. No extra network requests or automatic checkpoint reset are introduced.
+- Windows/macOS/Linux-facing version metadata and README release links updated for Scout 1.2.1.
 
-## Performance and validation
+## Important limitations and decisions
 
-All file changes are isolated from the healthy replay request path except the bounded, in-memory rolling-rate counter. The CDX/request floors remain unchanged at 2.5s/0.125s.
-
-Controlled localhost acquisition: v1.2.1 90 captures at 8.039 acquisition saves/s; v1.2.2 90 captures at 8.034/s, all bytes SHA-256 verified. v1.2.2 instrumented 300-capture run at 7.999 acquisition saves/s, early/middle/late 8.029/7.988/7.982/s, separate final scan drain 0.452s. Live Wayback multi-day stability and GitHub hosted Windows/macOS CI were not tested.
-
-# Archive Scout v1.2.1 — Lean engine with targeted feature restoration
-
-Patch release against the authentic v1.2.0 lean repository. **Database schema 8** adds lightweight capture classification/routing evidence and safely migrates supported schema 2–7 projects. It **does not open schema-13 projects** from v1.1.1/v1.1.3.
-
-- Original 10-worker lean downloader and 0.125-second fixed replay spacing remain. Full local keyword scanning is now a separate post-acquisition stage. Partial scan backlogs remain durable and resumable; source bytes/hashes are preserved.
-- 2.5-second fixed CDX spacing; 1.1.1 automatic resume-key strategy preference; incomplete old parallel page plans remain resumable.
-- Preliminary classification before acquisition; payload signature verification; detected media deferred into media selection rather than reported as a failed text download. Media remains subject to enabled image/video and snapshot-selection controls.
-- Readable classification counts for text, image, video, audio, descriptor, other binary and unknown; downloadable routing evidence in all-indexed-URLs reports, generated only when requested.
-- Exclusive GUI keyword-set selection, customizable Reports tab, scrolling/borders, and responsive sidebar restored in the v1.2.1 candidate are retained.
-- Database and GUI classification aggregates are batched / cached and never inserted into each healthy replay slot.
-
-**Local validation:** 213 tests, 210 passed, three skipped; one 300-file localhost acquisition at 8.001 successful committed saves/s, plus 0.398-second independent scan drain, all bytes and matches verified. This does not establish overnight Internet Archive throughput; hosted CI must still run.
-
-**Feature-parity limits:** This is *not* a wholesale transplant of v1.1.1, because that would reinstate its schema-13 processing and network architecture. Several later indexing range-coverage semantics, GUI workspaces, and Hitlist features remain unported. See `docs/FEATURE_PARITY.md`. Keep older installations/projects intact during evaluation.
+- **Schema 13 from v1.1.1 is NOT migrated in this patch.** An unverified schema downgrade can destroy historic data; use a tested importer against a real legacy project before claiming support.
+- Historical scan-and-discard, scan overlap, manual scan memory/workers and storage compaction controls remain under review. Reintroducing them blindly could alter acquisition correctness or performance.
+- No automatic retry gate is enabled by default; the optional host gate has synthetic tests only, not a live long-run proof.
+- Existing fragmented CDX plans are not automatically recombined because the historical split cause may be unknown. Incomplete windows remain saved and retryable.
+- Project relocation/rebase changes only identifiable internal paths and never synthesizes missing files. Back up and verify very large/legacy projects before moving them.
+- A local 90-capture benchmark is not evidence of sustained Internet Archive performance. Hosted cross-platform CI and sustained real Wayback trials are required before public release.

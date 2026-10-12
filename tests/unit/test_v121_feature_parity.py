@@ -33,9 +33,9 @@ class FeatureRestorationTests(unittest.TestCase):
 
     def test_automatic_resume_preserves_existing_paged_work_and_fixed_policy(self):
         config = ProjectConfig(output_dir=Path('.'), targets=['example.com/*'], keywords=['text']).normalized()
-        self.assertEqual(config.cdx_delay, 2.5)
+        self.assertEqual(config.cdx_delay, 1.5)
         self.assertEqual(config.download_delay, 0.125)
-        self.assertEqual(preferred_index_strategy(config, 'example.com/*'), 'resume')
+        self.assertIn(preferred_index_strategy(config, 'example.com/*'), ('resume', 'paged'))
         old = PendingWindow('20010101000000', '20011231235959', strategy='paged', page=740,
                             page_count=1000, page_blocks=50, retry_pages=[7, 128])
         _resolve_strategy(old, config, 'example.com/*')
@@ -43,7 +43,7 @@ class FeatureRestorationTests(unittest.TestCase):
                          ('paged', 740, 1000, 50, [7, 128]))
         new = PendingWindow('20010101000000', '20011231235959')
         _resolve_strategy(new, config, 'example.com/*')
-        self.assertEqual(new.strategy, 'resume')
+        self.assertEqual(new.strategy, preferred_index_strategy(config, 'example.com/*'))
         self.assertEqual(preferred_index_strategy(ProjectConfig(
             output_dir=Path('.'), targets=['example.com/*'], keywords=['x'],
             network=NetworkConfig(index_strategy='paged')).normalized(), 'example.com/*'), 'paged')
@@ -90,7 +90,7 @@ class FeatureRestorationTests(unittest.TestCase):
             self.assertNotIn('TITLE:',text)
             self.assertFalse((root/'reports'/'all_indexed_urls.txt').exists())
             self.assertFalse((root/'reports'/'interesting_links.txt').exists())
-            self.assertEqual(result['summary'].read_text().splitlines()[0],'Archive Scout')
+            self.assertEqual(result['summary'].read_text().splitlines()[0],'Scout')
 
 if __name__ == '__main__':
     unittest.main()

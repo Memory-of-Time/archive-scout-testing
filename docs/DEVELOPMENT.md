@@ -1,29 +1,16 @@
 # Development
 
-Archive Scout supports Python 3.11 and newer. The official package version is 1.0.5.
+Scout 1.2.1 supports Python 3.11/3.12 for published source/CI builds. Some newer Python versions may work but are not part of the official matrix. Tkinter is needed to run the desktop UI.
 
-## Principles
+```bash
+python -m pip install .
+scout --help
+scout-gui
+python scripts/verify_release.py
+python scripts/run_tests.py --output validation/test-results
+python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
+```
 
-- Preserve project compatibility unless a schema migration is deliberate and tested.
-- Keep network concurrency bounded and request starts rate-limited.
-- Keep SQLite access on the owning thread/connection.
-- Avoid project-sized Python lists when a persistent queue or keyset iterator can be used.
-- Prefer atomic writes for user-visible reports and configuration.
-- Never persist API keys in project data or ordinary application settings.
-- Treat archived HTML as untrusted input.
-- Keep AI analysis separate from deterministic scoring and human review.
-- Do not bypass Wayback exclusions or robots restrictions.
+Use `scripts/build_windows.ps1`, `scripts/build_macos.sh`, and `scripts/build_linux.sh` only on their respective operating systems. Releases from GitHub Actions include platform-specific executable bundles, and tagged releases upload asset names matched by the top README links.
 
-## Validation
-
-Before release:
-
-- compile source/tests;
-- run the complete unittest suite;
-- run offline benchmark smoke tests;
-- validate both GitHub workflow YAML files;
-- verify packaging scripts;
-- ensure no generated build, bytecode, egg-info, cache, credential, or local-project files are present;
-- build and smoke-test native packages on each platform.
-
-The Tests workflow covers Linux, Windows, Intel macOS, and Apple Silicon macOS on Python 3.11 and 3.12.
+The internal `archive_scout` package and schema-9 database names intentionally remain stable. Make behavioral changes in the appropriate engine module rather than adding networking or scanning side effects in the GUI. Preserve restartability and avoid extra per-capture database queries.

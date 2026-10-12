@@ -14,6 +14,7 @@ from .database.classification import classify_indexed_captures
 from .analysis.workflow import run_analysis
 from .config import KeywordSetConfig, ProjectConfig, save_project_config
 from .database.connection import open_database
+from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
 from .downloads.downloader import download_archive
 from .downloads.retry import retry_error_urls
@@ -37,7 +38,7 @@ from .scanning.hitlist import load_hitlist, search_with_hitlist
 
 SUPPORTED_MODES = {
     "hitlist",
-    "all", "external_media_after_scan", "index", "download", "resume", "rescan", "retry_errors", "report", "integrity",
+    "all", "external_media_after_scan", "index", "download", "download_only", "retry_download_errors", "resume", "rescan", "retry_errors", "report", "integrity",
     "repair", "backup", "diagnostics", "import_folder",
     "media_all", "media_index", "media_download", "media_retry",
     "analysis", "research_index", "forum_rebuild", "merge_project",
@@ -97,6 +98,25 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
     return paths
 
 
+def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000):
+    """Yield each eligible capture at most once per pass, without an ID-sized list."""
+    signature = cdx_query_signature(config)
+    last_id = 0
+    while True:
+        rows = database.execute(
+            """SELECT c.id FROM captures c WHERE c.id>? AND c.query_signature=?
+               AND c.state='error' AND EXISTS (
+                   SELECT 1 FROM errors e WHERE e.capture_id=c.id
+                   AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
+               ORDER BY c.id LIMIT ?""", (last_id, signature, batch_size)
+        ).fetchall()
+        if not rows:
+            return
+        ids = [int(row[0]) for row in rows]
+        last_id = ids[-1]
+        yield ids
+
+
 def recover_transient_text_errors(
     config: ProjectConfig,
     database: sqlite3.Connection,
@@ -105,42 +125,31 @@ def recover_transient_text_errors(
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None,
 ) -> None:
-    """Keep transient replay errors eligible without resetting successful captures.
+    """One fair recovery sweep per operation; failures remain retryable later.
 
-    Only failed captures from the current query are reconsidered. Work is
-    selected in small database batches, and old successful bodies are never
-    redownloaded. Permanent 404/policy/content errors stay recorded rather
-    than entering an infinite request loop.
+    A permanently unavailable host must not trap a days-long operation retrying
+    the same low-numbered captures indefinitely. No new timers or per-capture
+    database probes are added to the healthy acquisition path.
     """
-    from .cdx.parameters import cdx_query_signature
-    from .events import Stopped
-    signature = cdx_query_signature(config)
-    while not stop_event.is_set():
-        rows = database.execute(
-            """SELECT DISTINCT c.id FROM captures c
-               WHERE c.query_signature=? AND c.state='error'
-                 AND EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                             AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
-               ORDER BY c.id LIMIT 1000""", (signature,),
-        ).fetchall()
-        if not rows:
-            return
-        ids = [int(row[0]) for row in rows]
-        pending_before = len(ids)
-        emit(callback, ProgressEvent("download_retry", f"Automatically retrying {pending_before:,} temporary replay failures"))
+    for ids in _retryable_text_batches(config, database):
+        if stop_event.is_set():
+            raise Stopped
+        emit(callback, ProgressEvent("download_retry", f"Retrying {len(ids):,} recoverable text failures in this sweep"))
         download_archive(config, database, scan_run_id, stop_event, callback,
                          states=("error",), capture_ids=ids, scan_jobs=jobs)
-        remaining = int(database.execute(
-            """SELECT COUNT(*) FROM captures c WHERE c.id IN (
-                SELECT e.capture_id FROM errors e WHERE e.resolved=0
-                  AND e.ignored=0 AND e.retryable=1 AND e.capture_id IS NOT NULL)
-               AND c.query_signature=? AND c.state='error'""", (signature,),
-        ).fetchone()[0])
-        if remaining and stop_event.wait(1.0):
+
+
+def retry_capture_downloads(config, database, stop_event, callback) -> None:
+    """Explicit acquisition-only retry, with no scan jobs or keyword matching."""
+    for ids in _retryable_text_batches(config, database):
+        if stop_event.is_set():
             raise Stopped
-    raise Stopped
+        emit(callback, ProgressEvent("download_retry", f"Retrying {len(ids):,} failed downloads without scanning"))
+        download_archive(config, database, 0, stop_event, callback,
+                         states=("error",), capture_ids=ids, acquire_only=True)
 
 
+@guard_project
 def run_project(
     config: ProjectConfig,
     mode: str = "all",
@@ -148,6 +157,8 @@ def run_project(
     callback: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Path]:
     config = config.normalized()
+    if config.download_scope == "index_only" and mode in {"all", "download_only", "external_media_after_scan"}:
+        mode = "index"
     if mode == "external_media_after_scan":
         config.media = replace(
             config.media.normalized(),
@@ -159,7 +170,7 @@ def run_project(
         raise ValueError(f"unsupported mode: {mode}")
     if config.from_date > config.to_date:
         raise ValueError("start date must not be later than end date")
-    if mode in {"all", "external_media_after_scan", "index"} and not config.targets:
+    if mode in {"all", "external_media_after_scan", "index", "download_only"} and not config.targets:
         raise ValueError("at least one target is required")
     if mode.startswith("media_") and not (config.media.targets or config.targets):
         raise ValueError("at least one media target or site target is required")
@@ -245,7 +256,7 @@ def run_project(
                 create_project_backup(config.output_dir, reason="before_import", keep=config.backup_keep)
             imported = import_text_folder(config.output_dir, source, database, stop_event, callback)
             report = config.output_dir / "reports" / "import_summary.txt"
-            report.write_text(f"Archive Scout import\n\nSource: {source}\nImported: {imported}\n", encoding="utf-8")
+            report.write_text(f"Scout import\n\nSource: {source}\nImported: {imported}\n", encoding="utf-8")
             finish_operation_run(database, operation_run_id, "complete", f"Imported {imported}")
             database.commit()
             return {"import_summary": report}
@@ -276,12 +287,12 @@ def run_project(
         if mode == "merge_project":
             source = Path(config.analysis.normalized().merge_source).expanduser()
             if not str(source).strip() or not source.exists():
-                raise ValueError("choose an existing Archive Scout project folder to merge")
+                raise ValueError("choose an existing Scout project folder to merge")
             if config.auto_backup and (config.output_dir / "archive_scout.sqlite3").exists():
                 create_project_backup(config.output_dir, reason="before_merge", keep=config.backup_keep)
             summary = merge_projects(config.output_dir, source, database, stop_event, callback)
             merge_report = config.output_dir / "reports" / "merge_summary.txt"
-            merge_report.write_text("Archive Scout project merge\n\n" + "\n".join(f"{key}: {value}" for key, value in summary.items()) + "\n", encoding="utf-8")
+            merge_report.write_text("Scout project merge\n\n" + "\n".join(f"{key}: {value}" for key, value in summary.items()) + "\n", encoding="utf-8")
             finish_operation_run(database, operation_run_id, "complete", str(merge_report))
             database.commit()
             return {"merge_summary": merge_report}
@@ -332,8 +343,26 @@ def run_project(
             database.commit()
             return paths
 
-        if mode in {"all", "external_media_after_scan", "resume"}:
+        if mode in {"all", "external_media_after_scan", "resume", "download_only"}:
             index_archive(config, database, stop_event, callback)
+
+        # Acquisition-only runs never create scan jobs, even without a keyword set.
+        if mode in {"download_only", "retry_download_errors"}:
+            if mode == "download_only":
+                download_archive(config, database, 0, stop_event, callback,
+                                 states=("pending",), acquire_only=True)
+            else:
+                retry_capture_downloads(config, database, stop_event, callback)
+            if mode == "download_only" and config.media.enabled:
+                index_media(config, database, stop_event, callback)
+                download_media(config, database, stop_event, callback)
+            paths = generate_index_reports(config, database)
+            paths["project"] = config.output_dir / "project.json"
+            if config.media.enabled and mode == "download_only":
+                paths.update(generate_media_reports(config, database))
+            finish_operation_run(database, operation_run_id, "complete", "Acquisition-only operation complete")
+            database.commit()
+            return paths
 
         jobs = prepare_scan_jobs(database, config, mode)
         primary_run_id = jobs[0].scan_run_id

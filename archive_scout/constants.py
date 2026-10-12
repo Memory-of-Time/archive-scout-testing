@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-VERSION = "1.2.3"
+VERSION = "1.2.1"
 SCHEMA_VERSION = 9
-APP_NAME = "Archive Scout"
+APP_NAME = "Scout"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"
 CDX_TIMEMAP_URL = "https://web.archive.org/web/timemap/cdx"
 CDX_TIMEMAP_JSON_URL = "https://web.archive.org/web/timemap/json"
@@ -43,6 +43,8 @@ OPERATION_MODES = {
     "Index, download, scan, and report": "all",
     "Index, download, scan, then download external embedded media": "external_media_after_scan",
     "Index URLs only": "index",
+    "Index and download only (no scanning)": "download_only",
+    "Retry failed downloads only (no scanning)": "retry_download_errors",
     "Download and scan pending URLs": "download",
     "Resume interrupted work": "resume",
     "Rescan existing downloads with selected keyword sets": "rescan",
@@ -60,6 +62,7 @@ OPERATION_MODES = {
     "Run archive recovery and analysis": "analysis",
     "Build or refresh Research Intelligence": "research_index",
     "Rebuild forum threads only": "forum_rebuild",
+    "Merge another Scout project": "merge_project",
     "Merge another Archive Scout project": "merge_project",
 }
 SCOPE_LABELS = {

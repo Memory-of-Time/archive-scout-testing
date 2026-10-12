@@ -65,6 +65,8 @@ MODE_HELP = {
     "all": "Queries CDX, downloads pending text captures, scans only the keyword set marked Use in next scan, and writes reports.",
     "external_media_after_scan": "Indexes the site, downloads and scans all selected text pages, then indexes only external media URLs found in those saved pages and downloads them after discovery finishes.",
     "index": "Queries CDX and stores capture metadata without downloading pages.",
+    "download_only": "Indexes and saves text captures without scanning, keyword requirements or scan reports; optionally downloads supplemental media.",
+    "retry_download_errors": "Retries unresolved text acquisition failures without creating scan jobs or scanning.",
     "download": "Downloads pending text captures and scans them with the keyword set marked Use in next scan.",
     "resume": "Continues interrupted pending work without automatically retrying earlier errors.",
     "rescan": "Reads saved files locally and creates new scan runs without making Wayback requests.",
@@ -83,7 +85,7 @@ MODE_HELP = {
     "analysis": "Reconstructs forum threads, extracts identifiers and legacy embeds, clusters duplicates, compares snapshots, and builds provenance reports.",
     "research_index": "Builds or refreshes the local Research Intelligence vector, entity, duplicate, and evidence-relationship index without making Wayback requests.",
     "forum_rebuild": "Rebuilds forum threads and posts from saved pages without rerunning the rest of the archive analysis.",
-    "merge_project": "Merges captures, downloads, scans, reviews, notes, tags, media, and extraction results from another Archive Scout project.",
+    "merge_project": "Merges captures, downloads, scans, reviews, notes, tags, media, and extraction results from another Scout project.",
 }
 REVIEW_LABELS = {
     "Unreviewed": "unreviewed",
@@ -187,19 +189,19 @@ class ArchiveScoutApp(tk.Tk):
 
     def apply_application_icon(self) -> None:
         try:
-            png_path = bundled_resource("assets", "archivescout.png")
+            png_path = bundled_resource("assets", "scout.png")
             if png_path.exists():
                 self._app_icon = tk.PhotoImage(file=str(png_path))
                 self.iconphoto(True, self._app_icon)
             if os.name == "nt":
-                ico_path = bundled_resource("assets", "archivescout.ico")
+                ico_path = bundled_resource("assets", "scout.ico")
                 if ico_path.exists():
                     self.iconbitmap(default=str(ico_path))
         except (OSError, tk.TclError):
             self._app_icon = None
 
     def create_variables(self) -> None:
-        default_output = Path.home() / "Downloads" / "ArchiveScout"
+        default_output = Path.home() / "Downloads" / "Scout"
         self.output_var = tk.StringVar(value=str(default_output))
         self.preset_var = tk.StringVar(value="Ogrish 9/11 research")
         self.mode_var = tk.StringVar(value="Index, download, scan, and report")
@@ -214,7 +216,7 @@ class ArchiveScoutApp(tk.Tk):
         self.workers_var = tk.StringVar(value="10")
         self.max_file_var = tk.StringVar(value="25")
         self.minimum_score_var = tk.StringVar(value="1")
-        self.cdx_delay_var = tk.StringVar(value="2.5")
+        self.cdx_delay_var = tk.StringVar(value="1.5")
         self.download_delay_var = tk.StringVar(value="0.125")
         self.rate_limit_base_var = tk.StringVar(value="5")
         self.rate_limit_max_var = tk.StringVar(value="5")
@@ -231,6 +233,7 @@ class ArchiveScoutApp(tk.Tk):
         self.network_cdx_workers_var = tk.StringVar(value="10")
         self.network_trust_env_var = tk.BooleanVar(value=True)
         self.network_persistent_var = tk.BooleanVar(value=True)
+        self.network_connection_gate_var = tk.BooleanVar(value=False)
         self.network_retry_base_var = tk.StringVar(value="5")
         self.network_retry_max_var = tk.StringVar(value="120")
         self.network_failure_limit_var = tk.StringVar(value="8")
@@ -591,15 +594,15 @@ class ArchiveScoutApp(tk.Tk):
 
     def show_welcome(self) -> None:
         dialog = tk.Toplevel(self)
-        dialog.title("Welcome to Archive Scout")
+        dialog.title("Welcome to Scout")
         dialog.transient(self)
         dialog.grab_set()
         dialog.geometry("620x420")
         frame = ttk.Frame(dialog, padding=24)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Welcome to Archive Scout", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="Welcome to Scout", style="Title.TLabel").pack(anchor="w")
         ttk.Label(frame, text="Built for long-running public web-archive research", style="Muted.TLabel").pack(anchor="w", pady=(0, 18))
-        ttk.Label(frame, text="The Simple workspace keeps the common workflow visible. Advanced mode exposes CDX, media, analysis, network, review, repair, and migration controls. Archive Scout saves its indexing queue continuously and can switch between multiple HTTP connection methods when one stack cannot reach the Internet Archive.", wraplength=550, justify="left").pack(anchor="w")
+        ttk.Label(frame, text="The Simple workspace keeps the common workflow visible. Advanced mode exposes CDX, media, analysis, network, review, repair, and migration controls. Scout saves its indexing queue continuously and can switch between multiple HTTP connection methods when one stack cannot reach the Internet Archive.", wraplength=550, justify="left").pack(anchor="w")
         ttk.Button(frame, text="Open the dashboard", style="Accent.TButton", command=dialog.destroy).pack(anchor="e", pady=(24, 0))
 
     def invalidate_dashboard(self) -> None:
@@ -615,19 +618,19 @@ class ArchiveScoutApp(tk.Tk):
         self._refresh_dashboard_media_policy_summary()
 
     def refresh_dashboard(self, manual: bool = True) -> None:
-        if self.__dict__.get("project_restore_identity") == self.project_identity():
-            return
         root = Path(self.output_var.get()).expanduser()
         self.dashboard_project_var.set(str(root))
         token = self.dashboard_refresh.begin(time.monotonic(), manual=manual)
         if token is None:
+            self.dashboard_last_refresh_var.set("Dashboard refresh already running; please wait.")
             return
+        self.dashboard_last_refresh_var.set("Refreshing persisted totals (database snapshot)…")
         database_path = root / "archive_scout.sqlite3"
         events = self.events
 
         def worker() -> None:
             try:
-                counts = read_dashboard_counts(database_path, max_query_seconds=2.0)
+                counts = read_dashboard_counts(database_path, max_query_seconds=20.0 if manual else 2.0)
                 events.put(("dashboard", (token, str(root), counts, "")))
             except Exception as exc:
                 events.put(("dashboard", (token, str(root), None, str(exc))))
@@ -635,10 +638,13 @@ class ArchiveScoutApp(tk.Tk):
         threading.Thread(target=worker, name="archive-dashboard-read", daemon=True).start()
 
     def restore_backup_ui(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showerror(APP_NAME, "Stop the active Scout operation before restoring a backup.")
+            return
         root = Path(self.output_var.get()).expanduser()
         backups = list_project_backups(root)
         selected = filedialog.askopenfilename(
-            title="Restore Archive Scout database backup",
+            title="Restore Scout database backup",
             initialdir=str(root / "backups"),
             filetypes=[("SQLite database", "*.sqlite3"), ("All files", "*")],
         )
@@ -800,19 +806,30 @@ class ArchiveScoutApp(tk.Tk):
         self.notebook.add(page, text="Media")
         options = ttk.Frame(tab)
         options.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Checkbutton(options, text="Also download media during a full text run", variable=self.media_enabled_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(options, text="Images", variable=self.media_images_var).grid(row=0, column=1, padx=(12, 0), sticky="w")
-        ttk.Checkbutton(options, text="Videos", variable=self.media_videos_var).grid(row=0, column=2, padx=(8, 0), sticky="w")
-        ttk.Checkbutton(options, text="Discover media linked inside saved pages", variable=self.media_embedded_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
-        ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(row=1, column=2, sticky="w", pady=(7, 0))
+        # Each control gets a balanced cell; never pack all options into one
+        # narrow column when the Media page is resized.
+        for column in range(4):
+            options.columnconfigure(column, weight=1, uniform="media_options")
+        ttk.Checkbutton(options, text="Also download media during a full text run", variable=self.media_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(options, text="Images", variable=self.media_images_var).grid(
+            row=0, column=2, sticky="w", padx=(12, 0), pady=(0, 8))
+        ttk.Checkbutton(options, text="Videos", variable=self.media_videos_var).grid(
+            row=0, column=3, sticky="w", padx=(12, 0), pady=(0, 8))
+        ttk.Checkbutton(options, text="Discover media linked inside saved pages", variable=self.media_embedded_var).grid(
+            row=1, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(options, text="Allow external hosts", variable=self.media_external_var).grid(
+            row=1, column=2, columnspan=2, sticky="w", padx=(12, 0))
         ttk.Label(
             tab,
-            text="The ‘Index, download, scan, then download external embedded media’ operation waits until every saved text page has been scanned before it looks up and downloads external image/video links found in those pages.",
-            wraplength=520,
+            text=("The external embedded-media operation first scans saved text pages, "
+                  "then looks up and downloads image/video links discovered within them."),
+            wraplength=580,
+            justify="left",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         editors = ttk.Frame(tab)
-        editors.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        editors.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(12, 0))
         editors.rowconfigure(1, weight=1)
         for column in range(3):
             editors.columnconfigure(column, weight=1, uniform="media_editors")
@@ -822,14 +839,14 @@ class ArchiveScoutApp(tk.Tk):
             "Exclude extensions",
         )
         for column, description in enumerate(descriptions):
-            ttk.Label(editors, text=description, wraplength=160).grid(
-                row=0, column=column, sticky="w", padx=(0 if column == 0 else 8, 0), pady=(0, 4)
+            ttk.Label(editors, text=description, anchor="w", wraplength=210, justify="left").grid(
+                row=0, column=column, sticky="ew", padx=(0 if column == 0 else 10, 0), pady=(0, 6)
             )
         self.media_targets_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
         self.media_include_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
         self.media_exclude_text = tk.Text(editors, wrap="none", font="TkFixedFont", width=12, height=10)
         for column, widget in enumerate((self.media_targets_text, self.media_include_text, self.media_exclude_text)):
-            widget.grid(row=1, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 0))
+            widget.grid(row=1, column=column, sticky="nsew", padx=(0 if column == 0 else 10, 0))
         settings = ttk.Frame(tab)
         settings.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Label(settings, text="Snapshot:").grid(row=0, column=0)
@@ -1083,12 +1100,12 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Button(merge, text="Browse…", command=self.choose_merge_source).grid(row=0, column=2)
         ttk.Label(
             merge,
-            text="Choose the ‘Merge another Archive Scout project’ operation to copy captures, documents, media, scan history, reviews, notes, tags, and extraction results into this project.",
+            text="Choose the ‘Merge another Scout project’ operation to copy captures, documents, media, scan history, reviews, notes, tags, and extraction results into this project.",
             wraplength=920,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def choose_merge_source(self) -> None:
-        selected = filedialog.askdirectory(title="Choose Archive Scout project to merge")
+        selected = filedialog.askdirectory(title="Choose Scout project to merge")
         if selected:
             self.analysis_merge_source_var.set(selected)
 
@@ -1153,6 +1170,7 @@ class ArchiveScoutApp(tk.Tk):
             ttk.Label(recovery, text=label + ":", wraplength=340).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(recovery, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
         ttk.Checkbutton(recovery, text="Automatically continue after recoverable Internet Archive outages", variable=self.network_persistent_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 2))
+        ttk.Checkbutton(recovery, text="Experimental: coordinate recovery after confirmed host connection failures", variable=self.network_connection_gate_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 2))
         ttk.Label(recovery, text="Recommended and enabled by default. A recovery-cycle threshold pauses archive admissions and schedules another shared probe; it does not end the operation. Server Retry-After is never shortened.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         redirects = ttk.LabelFrame(tab, text="Redirect handling", padding=10)
@@ -1293,9 +1311,9 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(
             tab,
             text=(
-                "After a normal scan, describe what you are actually searching for. Archive Scout selects a bounded set of "
+                "After a normal scan, describe what you are actually searching for. Scout selects a bounded set of "
                 "existing report matches, sends compact excerpts to the configured OpenAI or OpenRouter provider, and stores a separate explainable relevance ranking. "
-                "Deterministic Archive Scout scores and reviews are never replaced."
+                "Deterministic Scout scores and reviews are never replaced."
             ),
             style="Muted.TLabel", wraplength=1080,
         ).grid(row=1, column=0, sticky="ew", pady=(2, 8))
@@ -1392,7 +1410,7 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Label(
             tab,
             text=(
-                "Search the entire saved project as one evidence corpus. Archive Scout combines a local vector index, full-text search, "
+                "Search the entire saved project as one evidence corpus. Scout combines a local vector index, full-text search, "
                 "entities, duplicate clusters, archive scores, and page-to-page relationships. Deep review is optional and sends only a "
                 "bounded evidence set to your selected AI provider; archived text is always treated as untrusted source material."
             ),
@@ -1762,6 +1780,7 @@ class ArchiveScoutApp(tk.Tk):
                 failure_pause_threshold=int(self.network_failure_limit_var.get()),
                 connection_failure_pause_threshold=(self.loaded_project_config.network.connection_failure_pause_threshold if self.loaded_project_config else NetworkConfig().connection_failure_pause_threshold),
                 connection_retry_seconds=(self.loaded_project_config.network.connection_retry_seconds if self.loaded_project_config else NetworkConfig().connection_retry_seconds),
+                coordinated_connection_recovery=self.network_connection_gate_var.get(),
                 diagnostics=(self.loaded_project_config.network.diagnostics if self.loaded_project_config else NetworkConfig().diagnostics),
             )
             from_date = normalize_cdx_date(self.from_date_var.get(), end=False)
@@ -1820,9 +1839,10 @@ class ArchiveScoutApp(tk.Tk):
         except (ValueError, KeyError) as exc:
             raise ValueError(f"Check the numeric settings, keyword rules, and target lines: {exc}") from exc
         mode = selected_mode
-        if mode in {"all", "external_media_after_scan", "index"} and not config.targets:
+        if mode in {"all", "external_media_after_scan", "index", "download_only"} and not config.targets:
             raise ValueError("Add at least one site or path.")
-        if require_keywords and mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
+        effective_index_only = config.download_scope == "index_only" and mode in {"all", "external_media_after_scan", "download_only"}
+        if require_keywords and not effective_index_only and mode in {"all", "external_media_after_scan", "download", "resume", "rescan", "retry_errors"} and not config.selected_keyword_sets():
             raise ValueError("Select at least one non-empty keyword set.")
         if mode == "merge_project" and not config.analysis.merge_source:
             raise ValueError("Choose a source project folder in Archive analysis.")
@@ -1872,7 +1892,11 @@ class ArchiveScoutApp(tk.Tk):
             self.worker_thread = None
         try:
             ensure_frozen_bundle_available()
-            config = override_config or self.build_config(require_keywords=(MODE_LABELS[self.mode_var.get()] != "hitlist"))
+            selected_operation = override_mode or MODE_LABELS[self.mode_var.get()]
+            config = override_config or self.build_config(require_keywords=selected_operation not in {
+                "hitlist", "index", "download_only", "retry_download_errors", "media_all", "media_index", "media_download", "media_retry",
+                "backup", "integrity", "diagnostics", "repair", "report", "import_folder", "merge_project", "analysis", "research_index", "forum_rebuild",
+            })
         except (ValueError, FrozenBundleError) as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -1980,7 +2004,7 @@ class ArchiveScoutApp(tk.Tk):
                     self.finish_run()
                     messagebox.showinfo(
                         APP_NAME,
-                        "Archive Scout could not obtain a stable Wayback connection after trying the available connection methods. "
+                        "Scout could not obtain a stable Wayback connection after trying the available connection methods. "
                         "The exact queue was saved instead of marking the project failed. Use Resume after connectivity recovers.\n\n" + str(payload),
                     )
                 elif kind == "error":
@@ -2380,7 +2404,7 @@ class ArchiveScoutApp(tk.Tk):
             f"Vector similarity: {float(row.get('vector_score') or 0) * 100:.1f}/100\n"
             f"Full-text component: {float(row.get('text_score') or 0) * 100:.1f}/100\n"
             f"Entity component: {float(row.get('entity_score') or 0) * 100:.1f}/100\n"
-            f"Archive Scout evidence component: {float(row.get('archive_score') or 0) * 100:.1f}/100\n"
+            f"Scout evidence component: {float(row.get('archive_score') or 0) * 100:.1f}/100\n"
             f"Document ID: {row.get('document_id')}\n"
             f"Duplicate group: {row.get('duplicate_group_id') or '—'}\n"
             f"Related documents: {related or '—'}\n"
@@ -2552,7 +2576,7 @@ class ArchiveScoutApp(tk.Tk):
         detail = (
             f"Relevance: {int(row.get('relevance_score') or 0)}/100\n"
             f"Confidence: {float(row.get('confidence') or 0):.2f}\n"
-            f"Archive Scout score: {int(row.get('archive_score') or 0)}\n"
+            f"Scout score: {int(row.get('archive_score') or 0)}\n"
             f"Category: {row.get('category') or '—'}\n\n"
             f"Reason\n{row.get('reason') or ''}\n\n"
             f"Evidence summary\n{row.get('evidence') or ''}"
@@ -2779,7 +2803,7 @@ class ArchiveScoutApp(tk.Tk):
             messagebox.showerror(APP_NAME, str(exc))
 
     def load_project(self) -> None:
-        selected = filedialog.askopenfilename(title="Load Archive Scout project", filetypes=[("Archive Scout project", "project.json"), ("JSON files", "*.json"), ("All files", "*")])
+        selected = filedialog.askopenfilename(title="Load Scout project", filetypes=[("Scout project", "project.json"), ("JSON files", "*.json"), ("All files", "*")])
         if not selected:
             return
         try:
@@ -2827,6 +2851,7 @@ class ArchiveScoutApp(tk.Tk):
         self.network_cdx_workers_var.set(str(network.cdx_workers))
         self.network_trust_env_var.set(network.trust_environment)
         self.network_persistent_var.set(network.persistent_retries)
+        self.network_connection_gate_var.set(network.coordinated_connection_recovery)
         self.network_retry_base_var.set(str(network.retry_base_seconds))
         self.network_retry_max_var.set(str(network.retry_max_seconds))
         self.network_failure_limit_var.set(str(network.failure_pause_threshold))
@@ -3165,6 +3190,11 @@ class ArchiveScoutApp(tk.Tk):
             return
         if error:
             self.dashboard_last_refresh_var.set(f"Refresh unavailable: {error}")
+            return
+        if not counts.get("_exact", True):
+            self.dashboard_last_refresh_var.set(
+                "Refresh exceeded the query deadline; existing totals retained. Try again after heavy disk activity."
+            )
             return
         def display_count(key: str) -> str:
             value = counts.get(key)

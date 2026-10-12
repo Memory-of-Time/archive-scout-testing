@@ -33,6 +33,11 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True)
     path = root / DATABASE_NAME
     version = database_version(path) if path.exists() else None
+    if version is not None and version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Scout schema {version} is newer than this release supports (schema {SCHEMA_VERSION}). "
+            "The historical project has not been modified; use a verified migration rather than editing schema_info."
+        )
     if migrate and path.exists() and not is_modern_database(path):
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
@@ -55,6 +60,8 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         database.execute("PRAGMA wal_autocheckpoint=10000")
         database.execute("PRAGMA busy_timeout=60000")
         initialize_schema(database)
+        from ..projects.paths import rebase_project_files
+        rebase_project_files(root, database)
         # Recover states left behind by a terminated process. A second connection
         # opened by the active UI must not mark the current worker as crashed.
         current_pid = os.getpid()

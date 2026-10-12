@@ -1,51 +1,67 @@
-# Archive Scout 1.2.3
+# Scout 1.2.1
 
-This release builds on the supplied `archive-scout-testing-main.zip` (v1.2.2). It restores the compatible v1.1.1 interface, indexing behavior, and missing local tools while retaining the supplied repository's text/media classification, acquisition and local scanning engines.
+**Scout** is a cross-platform desktop and command-line workspace for finding, preserving, downloading, searching, and reviewing public Wayback Machine captures.
 
-## Changes
+### Download Scout
 
-- v1.1.1 layout and aesthetic, visible editor borders, controlled wheel scrolling, responsive panels, per-file report controls, read-only evidence details, and paginated History/Errors views with copy/export details.
-- Resume-first automatic indexing, full selected-range queries for new projects, native JSON numbered pages when needed, bounded parallel requests, independently committed completed-page checkpoints, and range coverage. Existing projects retain their saved year-collapse behavior and in-progress page sizes.
-- Search with Hitlist searches indexed URLs and complete saved text, including downloaded files awaiting scanning. Its separate durable coverage resumes interrupted searches, freezes the inventory boundary, and checks saved-file hashes before reusing coverage. It does not download, create score runs, or change classification.
-- Recorded redirect destination in results and optional ranked report fields. Settings can enable archived redirect destinations outside selected sites; this is off by default. Every replay redirect hop is checked before contact, and live-web destinations remain blocked.
-- Manual dashboard refresh remains the default. Optional automatic refresh is bounded and coalesced; optional ETA is a display estimate.
+| Windows | macOS | Linux |
+|---|---|---|
+| [**Download for Windows (x64)**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/Scout-Windows-x64.zip) | [**Download for macOS (Universal)**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/Scout-macOS-Universal.zip) | [**Download for Linux (x64)**](https://github.com/Memory-of-Time/archive-scout/releases/latest/download/Scout-Linux-x64.tar.gz) |
 
-The fixed user-selected request spacing, existing automatic connection recovery, service Retry-After handling, text/media rules, original byte validation, existing scored scanner, Media, AI and Research Intelligence remain in place. No adaptive rate limiter is added.
+[All releases](https://github.com/Memory-of-Time/archive-scout/releases) · [Report an issue](https://github.com/Memory-of-Time/archive-scout/issues)
 
-## Apply the patch
+> These download links resolve once the first GitHub release with matching assets is published. They currently target the verified development repository. If Scout is moved to a new public repository, update the three links and the adjacent links before publishing. The release workflow automatically creates these exact filenames.
 
-Use the extracted repository from the supplied `archive-scout-testing-main.zip` as the base. Keep a backup of that source folder and of existing project folders. Extract the patch ZIP into the repository root (beside `pyproject.toml`) and replace matching files. No repository files need deletion. Do not apply this patch directly to an older v1.1.1/schema-13 source tree.
+## What Scout does
 
-## Install and launch
+- Index Wayback CDX inventories with restartable resume-key and paged traversal, query compatibility, and durable checkpoints.
+- Download eligible captures with fixed request pacing, resilient network transports, and separate local keyword scanning.
+- **Index and download only (no scanning)** or retry failed acquisition independently of keyword sets.
+- Explain blocked acquisition using passive stall diagnostics, with optional (default-off) coordinated host connection recovery.
+- Classify text and media, optionally retrieve images and video, follow approved archived redirects, and discover embedded media.
+- Search stored files and indexed URLs using keyword sets and an optional resumable Hitlist; review results and export reports.
+- Maintain project databases, diagnostics, backups, integrity tools, analysis, and optional AI research tools.
 
-Python 3.11 or 3.12 and Tk are required. Wayback operations require Internet access.
+**Performance:** Scout's healthy replay start clock defaults to 0.125 seconds (nominal eight requests/s), but successful saves depend on network and archive availability. No adaptive request-rate escalation is used. A local benchmark cannot guarantee live Wayback throughput.
+
+## Requirements and installation
+
+Use the linked platform builds once the release is published. On Windows, run `Scout.exe` inside the extracted `Scout` folder (or the included `Install Scout.cmd`). On macOS, extract the ZIP and launch `Scout.app`. On Linux, extract the archive and use its `install.sh` script or launch the contained binary directly. Consult `packaging/` for installation details and checksum verification. Unsigned Windows builds may show SmartScreen prompts; do not disable antivirus protection.
+
+For source installations, Python 3.11 or 3.12 and Tk are recommended:
 
 ```bash
 python -m pip install .
-archive-scout-gui
-archive-scout --help
+scout-gui
+scout --help
 ```
 
-Hitlist is available in Results and search, the Operation menu, and the CLI:
+The legacy `archive-scout` and `archive-scout-gui` entry points remain available to existing automations. Internally, Python imports remain `archive_scout` to preserve project and integration compatibility; that does not change the public **Scout** name.
+
+## First project
+
+1. Choose a project folder, target URL patterns, date range and operation.
+2. Choose **Index and download only** to preserve text without scanning, or use the full index/download/scan workflow with a keyword set.
+3. Review results and generate reports. Use **Refresh dashboard** to update the summary counters manually.
+4. If a service outage interrupts work, pause and resume in the **same project folder** to preserve checkpoints. Acquisition stalls over 30 seconds now surface worker/host-gate diagnostics in Activity without extra network requests.
+
+The existing schema-9 project database format is retained. Schema-13 projects created by historical releases cannot be opened in this codebase; preserve their backups. Imported files are copied into project-owned storage, and moved schema-9 projects can rebase previously saved internal file paths on opening. See [Migration](docs/MIGRATION.md).
+
+## Development
 
 ```bash
-archive-scout run /path/to/project.json --mode hitlist --format jsonl
-```
-
-Set `hitlist_keywords` or `hitlist_file` in the project configuration, or enter them in the GUI. A hitlist file contains one literal search phrase per line; the normal scoring keyword sets remain separate. Outputs are `reports/hitlist_<run-id>/matches.csv` and `summary.txt`.
-
-## Projects and validation
-
-Schema 9 adds Hitlist and indexing checkpoint tables to schema 8. Supported schema 2–8 projects migrate with a safety database backup; payloads and classification tables are retained. Schema-13 v1.1.1 projects are not a supported migration source. New projects use selected-range text collapse; older configurations without that setting retain year collapse. Stored custom settings and current text/media routing remain authoritative.
-
-```bash
-python -m pip check
-python -m compileall -q archive_scout tests scripts
+python -m pip install .
 python scripts/verify_release.py
 python scripts/run_tests.py --output validation/test-results
 python scripts/benchmark_offline.py --cdx-rows 1000 --result-rows 100 --body-bytes 1024
 ```
 
-The existing Tests workflow checks Python 3.11/3.12 on Linux, Windows and both macOS architectures and uploads its results. Build All Platforms retains its signing and packaging rules. Run Tests successfully before Build All Platforms; publishing/signing settings are separate from source validation.
+The [test matrix](.github/workflows/tests.yml) covers Python 3.11/3.12 on Windows, Linux, Intel macOS and Apple Silicon macOS. [Build and release](.github/workflows/build-and-release.yml) packages platform executables and uploads matching assets to tagged GitHub releases. Published binaries require those hosted jobs to complete successfully; local tests alone are not proof of cross-platform builds.
 
-Local tests use fixtures, injected faults and localhost HTTP. They do not establish sustained live Wayback throughput near eight validated saves per second, million-capture completeness, overnight consistency, or hosted platform build success. See `docs/V1.2.3_RESTORATION.md` and the separate validation evidence supplied with this patch.
+Source overview: [`archive_scout/`](archive_scout/) application code; [`tests/`](tests/) regression tests; [`scripts/`](scripts/) benchmarking/build automation; [`packaging/`](packaging/) OS setup; [`docs/`](docs/) operational and developer guides. See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), [Indexing and recovery](docs/INDEXING_RECOVERY.md), [Privacy](docs/PRIVACY.md), [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md).
+
+## Release identity
+
+Scout **1.2.0** is the new public product version built from the validated Archive Scout 1.2.4 development line. The reset is deliberate; it does **not** downgrade project databases or reset existing progress. Existing installations may need a reinstall because package version numbers have been reset.
+
+MIT-licensed. Scout is an independent research tool, not affiliated with the Internet Archive.

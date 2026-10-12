@@ -136,6 +136,9 @@ class HttpClient:
         trust_environment: bool = True,
         network_callback: Callable[[str], None] | None = None,
         transport: ResilientTransport | None = None,
+        coordinated_connection_recovery: bool = False,
+        connection_failure_threshold: int = 3,
+        connection_retry_seconds: float = 3.0,
     ) -> None:
         self.limiter = limiter
         self.retries = max(1, int(retries))
@@ -146,6 +149,9 @@ class HttpClient:
         self.stop_event = stop_event
         self.retry_callback = retry_callback
         self.host_gate = host_gate or SharedHostGate()
+        self.coordinated_connection_recovery = bool(coordinated_connection_recovery)
+        self.connection_failure_threshold = max(2, int(connection_failure_threshold))
+        self.connection_retry_seconds = max(1.0, float(connection_retry_seconds))
         self.rate_limit_attempts = max(0, int(rate_limit_attempts))
         self.rate_limit_max_wait = max(0.0, float(rate_limit_max_wait))
         self.endpoint_lock = threading.Lock()
@@ -212,6 +218,8 @@ class HttpClient:
                     continue
 
                 self.host_gate.finish_request(permit, recovered=True)
+                if self.coordinated_connection_recovery:
+                    self.host_gate.connection_success()
 
                 if status >= 400:
                     if status not in RETRYABLE_STATUS:
@@ -278,6 +286,10 @@ class HttpClient:
                 # TransportExhaustedError subclasses RuntimeError so it must be
                 # handled before deterministic local RuntimeError failures.
                 if isinstance(exc, TransportExhaustedError):
+                    if self.coordinated_connection_recovery and exc.connection_failed:
+                        self.host_gate.connection_failed(
+                            url, self.connection_failure_threshold, self.connection_retry_seconds
+                        )
                     timed_out = is_timeout_error(exc)
                     read_timed_out = bool(getattr(exc, "read_timed_out", False))
                     generic_attempt += 1
@@ -417,6 +429,10 @@ class HttpClient:
                 if is_missing_frozen_bundle_error(exc):
                     raise frozen_bundle_error_from_exception(exc) from exc
                 if isinstance(exc, TransportExhaustedError):
+                    if self.coordinated_connection_recovery and exc.connection_failed:
+                        self.host_gate.connection_failed(
+                            url, self.connection_failure_threshold, self.connection_retry_seconds
+                        )
                     timed_out = is_timeout_error(exc)
                     read_timed_out = bool(getattr(exc, "read_timed_out", False))
                     generic_attempt += 1
@@ -476,6 +492,20 @@ class HttpClient:
         with self.endpoint_lock:
             self.endpoint_cooldown_until[endpoint] = time.monotonic() + 20.0
 
+    def _report_cdx_endpoint_failure(
+        self, endpoint: str, failure: BaseException, next_endpoint: str | None, elapsed: float
+    ) -> None:
+        if not self.retry_callback:
+            return
+        status = getattr(failure, "status", None)
+        reason = f"HTTP {status}" if status else type(failure).__name__
+        detail = str(failure).replace("\n", " ")[:130]
+        next_step = f"trying {next_endpoint}" if next_endpoint else "all configured services exhausted"
+        self.retry_callback(1, 1, (
+            f"Endpoint unavailable: {endpoint}; {reason}: {detail}; "
+            f"elapsed {elapsed:.1f}s; {next_step} (indexing checkpoint retained)"
+        ), 0.0)
+
     @staticmethod
     def _cdx_format_attempts(endpoint: str, prefer_text: bool) -> tuple[str, str]:
         """Choose the native Timemap representation before trying an alternative.
@@ -510,7 +540,8 @@ class HttpClient:
         failures: list[tuple[str, TransientRequestError]] = []
         text_params = cdx_text_fallback_params(params)
 
-        for endpoint in endpoints:
+        for endpoint_index, endpoint in enumerate(endpoints):
+            endpoint_started = time.monotonic()
             attempts = self._cdx_format_attempts(endpoint, prefer_text)
             first_error: BaseException | None = None
             for format_name in attempts:
@@ -580,14 +611,17 @@ class HttpClient:
                 )
             failure.endpoint = endpoint
             failures.append((endpoint, failure))
-            if self.retry_callback and len(endpoints) > 1:
-                self.retry_callback(1, len(endpoints), f"Endpoint unavailable: {endpoint}; trying alternate CDX service", 0.0)
+            self._report_cdx_endpoint_failure(
+                endpoint, failure, endpoints[endpoint_index + 1] if endpoint_index + 1 < len(endpoints) else None,
+                time.monotonic() - endpoint_started,
+            )
 
         timed_out = any(exc.timed_out for _, exc in failures)
         splittable = any(exc.splittable for _, exc in failures)
         summary = "; ".join(f"{endpoint}: {exc}" for endpoint, exc in failures)
         raise TransientRequestError(
             f"all CDX endpoints failed: {summary}",
+            status=next((error.status for _, error in failures if error.status is not None), None),
             timed_out=timed_out,
             read_timed_out=any(exc.read_timed_out for _, exc in failures),
             connection_failed=bool(failures) and all(exc.connection_failed for _, exc in failures),
@@ -628,7 +662,8 @@ class HttpClient:
         failures: list[tuple[str, TransientRequestError]] = []
         text_params = cdx_text_fallback_params(params)
 
-        for endpoint in endpoints:
+        for endpoint_index, endpoint in enumerate(endpoints):
+            endpoint_started = time.monotonic()
             attempts = self._cdx_format_attempts(endpoint, prefer_text)
             first_error: BaseException | None = None
             for format_name in attempts:
@@ -685,13 +720,16 @@ class HttpClient:
             )
             failure.endpoint = endpoint
             failures.append((endpoint, failure))
-            if self.retry_callback and len(endpoints) > 1:
-                self.retry_callback(1, len(endpoints), f"Endpoint unavailable: {endpoint}; trying alternate CDX service", 0.0)
+            self._report_cdx_endpoint_failure(
+                endpoint, failure, endpoints[endpoint_index + 1] if endpoint_index + 1 < len(endpoints) else None,
+                time.monotonic() - endpoint_started,
+            )
 
         timed_out = any(exc.timed_out for _, exc in failures)
         summary = "; ".join(f"{endpoint}: {exc}" for endpoint, exc in failures)
         raise TransientRequestError(
             f"all CDX endpoints failed: {summary}",
+            status=next((error.status for _, error in failures if error.status is not None), None),
             timed_out=timed_out,
             read_timed_out=any(exc.read_timed_out for _, exc in failures),
             connection_failed=bool(failures) and all(exc.connection_failed for _, exc in failures),
@@ -752,7 +790,8 @@ class HttpClient:
         if not endpoints:
             raise ValueError("at least one endpoint is required")
         failures: list[tuple[str, TransientRequestError]] = []
-        for endpoint in endpoints:
+        for endpoint_index, endpoint in enumerate(endpoints):
+            endpoint_started = time.monotonic()
             full_url = endpoint + "?" + urllib.parse.urlencode(params, doseq=True)
             try:
                 response = self.get(full_url, max_bytes, "application/json,*/*")
@@ -792,17 +831,15 @@ class HttpClient:
                 )
             self._remember_endpoint_failure(endpoint)
             failures.append((endpoint, failure))
-            if self.retry_callback and len(endpoints) > 1:
-                self.retry_callback(
-                    1,
-                    len(endpoints),
-                    f"Endpoint unavailable: {endpoint}; trying alternate CDX service",
-                    0.0,
-                )
+            self._report_cdx_endpoint_failure(
+                endpoint, failure, endpoints[endpoint_index + 1] if endpoint_index + 1 < len(endpoints) else None,
+                time.monotonic() - endpoint_started,
+            )
 
         summary = "; ".join(f"{endpoint}: {exc}" for endpoint, exc in failures)
         raise TransientRequestError(
             f"all native JSON CDX endpoints failed: {summary}",
+            status=next((error.status for _, error in failures if error.status is not None), None),
             timed_out=any(exc.timed_out for _, exc in failures),
             read_timed_out=any(exc.read_timed_out for _, exc in failures),
             connection_failed=bool(failures) and all(exc.connection_failed for _, exc in failures),
