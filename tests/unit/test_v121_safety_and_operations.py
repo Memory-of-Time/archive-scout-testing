@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -131,29 +132,63 @@ class V121RestorationTests(unittest.TestCase):
             save_project_config(self._cfg(original))
             shutil.move(str(original),str(moved))
             restored_config = load_project_config(moved/'project.json')
-            self.assertEqual(restored_config.output_dir, moved)
+            self.assertTrue(os.path.samefile(restored_config.output_dir, moved))
             db = open_database(moved)
             try:
                 path = Path(db.execute('SELECT path FROM documents').fetchone()[0])
                 self.assertTrue(path.is_file())
-                self.assertEqual(path, moved/'captures'/'2001'/'01'/'page.txt')
+                self.assertTrue(os.path.samefile(path, moved/'captures'/'2001'/'01'/'page.txt'))
             finally:db.close()
 
     def test_restore_safety_backup_contains_committed_wal_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
-            db=open_database(root)
-            db.execute("INSERT INTO project_meta(key,value) VALUES('before','one')");db.commit();db.close()
-            baseline=create_project_backup(root,keep=99)
-            writer=sqlite3.connect(root/'archive_scout.sqlite3')
-            writer.execute("INSERT INTO project_meta(key,value) VALUES('after','two')");writer.commit()
-            # A SQLite WAL backup sees latest committed data; raw file copies may not.
-            safety=restore_project_backup(root,baseline)
-            with sqlite3.connect(safety) as copy:
-                self.assertEqual(copy.execute("SELECT value FROM project_meta WHERE key='after'").fetchone()[0], 'two')
-            with sqlite3.connect(root/'archive_scout.sqlite3') as restored:
-                self.assertIsNone(restored.execute("SELECT value FROM project_meta WHERE key='after'").fetchone())
-            writer.close()
+            root = Path(tmp)
+            db = open_database(root)
+            db.execute("INSERT INTO project_meta(key,value) VALUES('before','one')")
+            db.commit()
+            db.close()
+            baseline = create_project_backup(root, keep=99)
+            writer = sqlite3.connect(root / 'archive_scout.sqlite3')
+            try:
+                writer.execute("INSERT INTO project_meta(key,value) VALUES('after','two')")
+                writer.commit()
+                # Deliberately keep this WAL connection open across restoration.
+                # Old restore code failed on Windows by unlinking the live -wal.
+                safety = restore_project_backup(root, baseline)
+                with sqlite3.connect(safety) as copy:
+                    self.assertEqual(copy.execute(
+                        "SELECT value FROM project_meta WHERE key='after'"
+                    ).fetchone()[0], 'two')
+                with sqlite3.connect(root / 'archive_scout.sqlite3') as restored:
+                    self.assertIsNone(restored.execute(
+                        "SELECT value FROM project_meta WHERE key='after'"
+                    ).fetchone())
+                # The previously-open connection must still refer to the live
+                # database after restoration, not an unlinked, stale file.
+                writer.execute("INSERT INTO project_meta(key,value) VALUES('continued','yes')")
+                writer.commit()
+                with sqlite3.connect(root / 'archive_scout.sqlite3') as other:
+                    self.assertEqual(other.execute(
+                        "SELECT value FROM project_meta WHERE key='continued'"
+                    ).fetchone()[0], 'yes')
+            finally:
+                writer.close()
+
+    def test_restore_rejects_corrupt_backup_without_mutating_live_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = open_database(root)
+            db.execute("INSERT INTO project_meta(key,value) VALUES('keep','intact')")
+            db.commit()
+            db.close()
+            bad = root / 'bad backup #1?.sqlite3'
+            bad.write_bytes(b'not a sqlite database')
+            with self.assertRaises(sqlite3.DatabaseError):
+                restore_project_backup(root, bad)
+            with sqlite3.connect(root / 'archive_scout.sqlite3') as live:
+                self.assertEqual(live.execute(
+                    "SELECT value FROM project_meta WHERE key='keep'"
+                ).fetchone()[0], 'intact')
 
     def test_media_include_extensions_are_respected_by_embed_parser(self):
         media=MediaConfig(include_images=True, include_videos=False,

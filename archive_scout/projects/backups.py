@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import shutil
-import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,47 +68,40 @@ def prune_backups(root: Path, keep: int = 5) -> None:
 
 
 def restore_project_backup(root: Path, backup_path: Path) -> Path:
-    """Restore a SQLite snapshot without racing an active Scout operation.
+    """Restore a verified SQLite snapshot through SQLite's online backup API.
 
-    Project lease is acquired once; full SQLite backup avoids losing committed
-    WAL pages. No backup/restore work runs during ordinary acquisition.
+    Replacing database files and deleting -wal/-shm sidecars while connections
+    are open is unsafe, and Windows explicitly prevents it.  SQLite's backup
+    API coordinates locks and restores a complete snapshot transactionally.
+    The project lease excludes simultaneous Scout operations. This maintenance
+    path is never entered by normal acquisition or indexing.
     """
     root = Path(root).expanduser().resolve()
     backup_path = Path(backup_path).expanduser().resolve()
     if not backup_path.is_file():
         raise FileNotFoundError(backup_path)
     target = root / DATABASE_NAME
+
     with project_lease(root):
-        # A second process holding a database connection may be a reader, but
-        # active WAL writers must not be allowed to modify a replaced file.
-        safety = None
-        if target.exists():
-            safety = create_project_backup(root, reason="before_restore", keep=999999)
-            live = sqlite3.connect(target, timeout=2)
-            try:
-                checkpoint = live.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-                if checkpoint and int(checkpoint[0]):
-                    raise RuntimeError("database is busy; close other Scout processes before restoring")
-            finally:
-                live.close()
-        temp = target.with_name(target.name + ".restore.tmp")
-        temp.unlink(missing_ok=True)
-        # Produce a canonical standalone database even when the provided
-        # backup itself has WAL sidecars.
-        source = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
-        destination = sqlite3.connect(temp)
+        # Reject damaged snapshots before changing the live database. Use an
+        # escaped URI so spaces, '#' and '?' in backup filenames remain valid.
+        source = sqlite3.connect(f"{backup_path.as_uri()}?mode=ro", uri=True)
         try:
-            source.backup(destination)
-            check = destination.execute("PRAGMA integrity_check").fetchone()
+            check = source.execute("PRAGMA integrity_check").fetchone()
             if not check or str(check[0]).lower() != "ok":
                 raise RuntimeError(f"backup failed SQLite integrity check: {check}")
+
+            # A consistent online safety snapshot includes committed WAL pages.
+            # This is intentionally done only for explicit restore operations.
+            safety = create_project_backup(root, reason="before_restore", keep=999999) if target.exists() else None
+
+            destination = sqlite3.connect(target, timeout=10)
+            try:
+                # Never unlink WAL/SHM sidecars or replace the database inode:
+                # an existing connection may still have those files open.
+                source.backup(destination)
+            finally:
+                destination.close()
+            return safety or target
         finally:
-            destination.close()
             source.close()
-        try:
-            for suffix in ("-wal", "-shm"):
-                Path(str(target) + suffix).unlink(missing_ok=True)
-            os.replace(temp, target)
-        finally:
-            temp.unlink(missing_ok=True)
-        return safety or target
