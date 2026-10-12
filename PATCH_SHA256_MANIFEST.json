@@ -1,8 +1,4 @@
 {
-  "patch": "Scout v1.2.1 cross-platform CI hotfix",
-  "target_commit": "fe2bcfd246da9031b8cd1e27af2d2369949d1beb",
-  "files": {
-    "archive_scout/projects/backups.py": "948a24ce62956747077c44e01e07b0b68cbf1fe35c06e019a689a4f4ea763783",
-    "tests/unit/test_v121_safety_and_operations.py": "878c799a973cfd3ed2e4fe149e09c182fcfc08073d03b7e495a949b38385fbe4"
-  }
+  "archive_scout/projects/paths.py": "ba5b3043fe13298c00d75d32ec9735179697bf574c9eda3abc922d94aff64fb7",
+  "tests/unit/test_v121_safety_and_operations.py": "081425d85b02c63a882a60d3258b993804d49f6706a4a0cccc9c03676b21c218"
 }

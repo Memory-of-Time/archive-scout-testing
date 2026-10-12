@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import closing
 import os
 import shutil
 import sqlite3
@@ -24,6 +25,7 @@ from archive_scout.events import ProgressEvent
 from archive_scout.media.discovery import discover_media
 from archive_scout.operations import recover_transient_text_errors, run_project
 from archive_scout.projects.backups import create_project_backup, restore_project_backup
+from archive_scout.projects.paths import _owned_project_suffix
 from archive_scout.utils import hash_text
 
 
@@ -140,6 +142,52 @@ class V121RestorationTests(unittest.TestCase):
                 self.assertTrue(os.path.samefile(path, moved/'captures'/'2001'/'01'/'page.txt'))
             finally:db.close()
 
+    def test_windows_short_and_long_root_spelling_is_project_owned(self):
+        previous = r'C:\Users\runneradmin\AppData\Local\Temp\tmp123\original'
+        short = r'C:\Users\RUNNER~1\AppData\Local\Temp\tmp123\original\captures\2001\page.txt'
+        external = r'C:\Users\RUNNER~1\AppData\Local\Temp\other\original\captures\2001\page.txt'
+        self.assertEqual(_owned_project_suffix(short, previous), 'captures/2001/page.txt')
+        self.assertIsNone(_owned_project_suffix(external, previous))
+
+    def test_rebase_handles_old_path_alias_after_relocation(self):
+        # Mac temporary paths can be spelled /var or /private/var. On Windows
+        # the same old root may use an 8.3 path or a long spelling. Rebase must
+        # resolve aliases rather than comparing stored path strings.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            alias = base.parent / (base.name + '_alias')
+            try:
+                alias.symlink_to(base, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest('Directory symlink unavailable on this runner')
+            try:
+                original = base / 'original'
+                moved = base / 'moved'
+                db = open_database(original)
+                canonical_file = original / 'captures' / '2001' / 'page.txt'
+                canonical_file.parent.mkdir(parents=True)
+                canonical_file.write_bytes(b'from alias')
+                t = get_or_create_target(db, 'example.net/*')
+                upsert_capture(db, {'original': 'http://example.net/alias',
+                    'timestamp': '20010101000000', 'mimetype': 'text/plain',
+                    'statuscode': '200', 'digest': 'X', 'length': '10'}, t, 'fixture')
+                capture_id = db.execute('SELECT id FROM captures').fetchone()[0]
+                aliased_file = alias / 'original' / 'captures' / '2001' / 'page.txt'
+                upsert_document(db, capture_id, aliased_file, 'title', 'from alias', [],
+                    hashlib.sha256(b'from alias').hexdigest(), hash_text('from alias'), 10)
+                db.commit()
+                db.close()
+                shutil.move(str(original), str(moved))
+                db = open_database(moved)
+                try:
+                    path = Path(db.execute('SELECT path FROM documents').fetchone()[0])
+                    self.assertTrue(path.is_file())
+                    self.assertTrue(os.path.samefile(path, moved / 'captures' / '2001' / 'page.txt'))
+                finally:
+                    db.close()
+            finally:
+                alias.unlink(missing_ok=True)
+
     def test_restore_safety_backup_contains_committed_wal_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -155,11 +203,11 @@ class V121RestorationTests(unittest.TestCase):
                 # Deliberately keep this WAL connection open across restoration.
                 # Old restore code failed on Windows by unlinking the live -wal.
                 safety = restore_project_backup(root, baseline)
-                with sqlite3.connect(safety) as copy:
+                with closing(sqlite3.connect(safety)) as copy:
                     self.assertEqual(copy.execute(
                         "SELECT value FROM project_meta WHERE key='after'"
                     ).fetchone()[0], 'two')
-                with sqlite3.connect(root / 'archive_scout.sqlite3') as restored:
+                with closing(sqlite3.connect(root / 'archive_scout.sqlite3')) as restored:
                     self.assertIsNone(restored.execute(
                         "SELECT value FROM project_meta WHERE key='after'"
                     ).fetchone())
@@ -167,7 +215,7 @@ class V121RestorationTests(unittest.TestCase):
                 # database after restoration, not an unlinked, stale file.
                 writer.execute("INSERT INTO project_meta(key,value) VALUES('continued','yes')")
                 writer.commit()
-                with sqlite3.connect(root / 'archive_scout.sqlite3') as other:
+                with closing(sqlite3.connect(root / 'archive_scout.sqlite3')) as other:
                     self.assertEqual(other.execute(
                         "SELECT value FROM project_meta WHERE key='continued'"
                     ).fetchone()[0], 'yes')
@@ -181,11 +229,11 @@ class V121RestorationTests(unittest.TestCase):
             db.execute("INSERT INTO project_meta(key,value) VALUES('keep','intact')")
             db.commit()
             db.close()
-            bad = root / 'bad backup #1?.sqlite3'
+            bad = root / 'bad backup #1.sqlite3'
             bad.write_bytes(b'not a sqlite database')
             with self.assertRaises(sqlite3.DatabaseError):
                 restore_project_backup(root, bad)
-            with sqlite3.connect(root / 'archive_scout.sqlite3') as live:
+            with closing(sqlite3.connect(root / 'archive_scout.sqlite3')) as live:
                 self.assertEqual(live.execute(
                     "SELECT value FROM project_meta WHERE key='keep'"
                 ).fetchone()[0], 'intact')

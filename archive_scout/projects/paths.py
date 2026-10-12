@@ -22,6 +22,37 @@ def _old_project_suffix(value: str) -> str | None:
     return None
 
 
+def _owned_project_suffix(value: str, previous_root: str) -> str | None:
+    """Find a stored project file despite aliases in the old absolute root.
+
+    pathlib can resolve /var vs /private/var on macOS and 8.3 vs long-path
+    spellings on Windows, even after the final project directory was moved.
+    Only project-owned captures/ and media/ paths are eligible for rebasing.
+    """
+    suffix = _old_project_suffix(value)
+    if not suffix:
+        return None
+    try:
+        source = Path(value).expanduser().resolve(strict=False)
+        origin = Path(previous_root).expanduser().resolve(strict=False)
+        relative = source.relative_to(origin).as_posix()
+        if relative.startswith(("captures/", "media/")):
+            return relative
+    except (OSError, ValueError, RuntimeError):
+        pass
+
+    # Alias resolution can fail after a move if the *project* path no longer
+    # exists. Require several identical trailing directory components before
+    # the storage folder; this must never rewrite an unrelated external file.
+    normalized = value.replace("\\", "/")
+    prefix = normalized[: -(len(suffix) + 1)]
+    stored_parts = [part.casefold() for part in prefix.split("/") if part]
+    old_parts = [part.casefold() for part in previous_root.replace("\\", "/").split("/") if part]
+    if len(stored_parts) >= 3 and len(old_parts) >= 3 and stored_parts[-3:] == old_parts[-3:]:
+        return suffix
+    return None
+
+
 def rebase_project_files(root: Path, database: sqlite3.Connection) -> int:
     """One-time DB maintenance when a project is relocated, never per capture."""
     root = root.expanduser().resolve()
@@ -58,12 +89,10 @@ def rebase_project_files(root: Path, database: sqlite3.Connection) -> int:
             updates = []
             for row in rows:
                 raw = str(row["path"])
-                if previous_root:
-                    old = previous_root.replace("\\", "/").rstrip("/") + "/"
-                    value = raw.replace("\\", "/")
-                    suffix = value[len(old):] if value.startswith(old) else None
-                else:
-                    suffix = _old_project_suffix(raw)
+                suffix = (
+                    _owned_project_suffix(raw, previous_root)
+                    if previous_root else _old_project_suffix(raw)
+                )
                 if not suffix or not suffix.startswith(("captures/", "media/")):
                     continue
                 destination = root / suffix
