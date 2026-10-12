@@ -757,7 +757,9 @@ class ResilientTransport:
                     self.callback(f"Network backend {name} reached Wayback but the response timed out; requeueing without repeating the full timeout on every backend…")
                 break
             if self.callback:
-                self.callback(f"Network backend {name} failed during connection setup; trying another connection method…")
+                stage = ("connection setup" if is_transport_connection_failure(last_error)
+                         else "response transfer or TLS handling")
+                self.callback(f"Network backend {name} failed during {stage}; checking another connection method…")
         raise TransportExhaustedError(url, failures)
 
 
@@ -803,7 +805,7 @@ class ResilientTransport:
                     )
                 break
             if self.callback:
-                self.callback(
-                    f"Network backend {name} failed during connection setup; trying another connection method…"
-                )
+                stage = ("connection setup" if is_transport_connection_failure(last_error)
+                         else "response transfer or TLS handling")
+                self.callback(f"Network backend {name} failed during {stage}; checking another connection method…")
         raise TransportExhaustedError(url, failures)

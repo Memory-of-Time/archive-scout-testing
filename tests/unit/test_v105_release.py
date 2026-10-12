@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -132,6 +134,7 @@ class V105ReleaseTests(unittest.TestCase):
                 'original_url': 'http://example.com/path/photo.jpg',
                 'media_kind': 'image',
                 'extension': '.jpg',
+                'digest': base64.b32encode(hashlib.sha1(b'abc').digest()).decode('ascii').rstrip('='),
             }
             # ProjectConfig.normalized() canonicalizes output_dir. On macOS,
             # /var resolves to /private/var; on Windows, an 8.3 temp path such as

@@ -736,7 +736,8 @@ def _request_resume(
     config: ProjectConfig,
     target: str,
     current: PendingWindow,
-) -> tuple[list[tuple[str, str, str, str, str, str]], bool]:
+) -> tuple[list[tuple[str, str, str, str, str, str]], bool, str | None]:
+    # Read the next cursor, but do not advance it before the rows are durable.
     page_size = current.page_size or config.page_size
     result = request_cdx_rows(
         client,
@@ -749,9 +750,8 @@ def _request_resume(
     if next_resume:
         if next_resume == current.resume_key:
             raise TransientRequestError("CDX returned the same resume key twice", splittable=True)
-        current.resume_key = next_resume
-        return rows, False
-    return rows, True
+        return rows, False, next_resume
+    return rows, True, None
 
 
 def _paged_failure_error(failures: list[PageFetchResult]) -> BaseException:
@@ -1090,25 +1090,41 @@ def index_archive(
                         )
                         continue
 
-                    rows, finished = _request_resume(client, target_config, target, current)
+                    rows, finished, next_cursor = _request_resume(client, target_config, target, current)
                     connection_failure_streak = 0
                     transient_failure_streak = 0
                     request_seconds = time.monotonic() - request_started
                     received = len(rows)
                     write_started = time.monotonic()
-                    with database:
-                        changed = upsert_captures(database, rows, target_id, signature)
-                        seen += received
-                        current.failures = 0
-                        if finished:
-                            plan.pending.pop(0)
-                            plan.completed += 1
-                            completed_windows += 1
-                        complete = not plan.pending
-                        persist_task_state(encode_plan(plan), complete, seen, None if complete else error_id)
-                        if error_id:
-                            database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
-                            error_id = None
+                    # Roll back in-memory checkpoint changes if the SQLite write
+                    # or commit fails. Otherwise an error handler might persist a
+                    # cursor that skips an uncommitted CDX response.
+                    old_seen, old_cursor = seen, current.resume_key
+                    old_failures, old_completed = current.failures, plan.completed
+                    old_completed_windows, old_error_id = completed_windows, error_id
+                    try:
+                        with database:
+                            changed = upsert_captures(database, rows, target_id, signature)
+                            seen += received
+                            current.failures = 0
+                            if next_cursor is not None:
+                                current.resume_key = next_cursor
+                            if finished:
+                                plan.pending.pop(0)
+                                plan.completed += 1
+                                completed_windows += 1
+                            complete = not plan.pending
+                            persist_task_state(encode_plan(plan), complete, seen, None if complete else error_id)
+                            if error_id:
+                                database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
+                                error_id = None
+                    except BaseException:
+                        seen, current.resume_key = old_seen, old_cursor
+                        current.failures, plan.completed = old_failures, old_completed
+                        completed_windows, error_id = old_completed_windows, old_error_id
+                        if finished and (not plan.pending or plan.pending[0] is not current):
+                            plan.pending.insert(0, current)
+                        raise
                     write_seconds = time.monotonic() - write_started
                     emit(
                         callback,

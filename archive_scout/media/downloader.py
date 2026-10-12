@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import base64
 import hashlib
 import os
 import re
@@ -68,31 +69,70 @@ def media_replay_url(row: sqlite3.Row) -> str:
     return replay_url(str(row["timestamp"]), str(row["original_url"]), modifier=modifier)
 
 
-def _hash_existing(path: Path) -> tuple[int, str]:
-    digest = hashlib.sha256()
+def _hash_existing(path: Path) -> tuple[int, str, str]:
+    """Verify an existing file in one pass; used only when it already exists."""
+    sha256 = hashlib.sha256()
+    sha1 = hashlib.sha1()
     size = 0
     with path.open("rb") as handle:
         while chunk := handle.read(1024 * 1024):
             size += len(chunk)
-            digest.update(chunk)
-    return size, digest.hexdigest()
+            sha256.update(chunk)
+            sha1.update(chunk)
+    return size, sha256.hexdigest(), base64.b32encode(sha1.digest()).decode("ascii").rstrip("=")
 
 
-def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient) -> dict:
-    path = media_path(config.output_dir, row)
+def _media_row_value(row: sqlite3.Row | dict, name: str, default=None):
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
+def _matching_existing_media(path: Path, row: sqlite3.Row | dict) -> tuple[int, str] | None:
+    """Never claim a different capture as saved merely because its filename matches."""
+    if not path.is_file():
+        return None
+    size, sha256, sha1_b32 = _hash_existing(path)
+    verified_sha256 = str(_media_row_value(row, "content_hash", "")).lower()
+    saved_size = int(_media_row_value(row, "bytes_saved", 0) or 0)
+    if len(verified_sha256) == 64 and saved_size == size and sha256 == verified_sha256:
+        return size, sha256
+    cdx_digest = str(_media_row_value(row, "digest", "")).upper().rstrip("=")
+    if len(cdx_digest) == 32 and cdx_digest == sha1_b32:
+        return size, sha256
+    return None
+
+
+def _disambiguate_media_path(path: Path, row: sqlite3.Row | dict) -> Path:
+    """Only rare basename collisions get a stable suffix; keep media folders flat."""
+    identity = f'{row["original_url"]}\0{row["timestamp"]}'.encode("utf-8", "surrogatepass")
+    token = hashlib.sha256(identity).hexdigest()[:16]
+    return path.with_name(f"{path.stem}__{token}{path.suffix}")
+
+
+def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
+                destination: Path | None = None) -> dict:
+    path = Path(destination) if destination is not None else media_path(config.output_dir, row)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Match the fast downloader's preflight: an exact destination that already
-    # exists is treated as downloaded and is not fetched again.
+    # Existing files may belong to a different URL or archived timestamp.
+    # The CDX SHA-1 digest (or a previously committed per-capture SHA-256) is
+    # required for a zero-request reuse; never use a basename alone as proof.
     if path.is_file():
-        size, digest = _hash_existing(path)
-        return {
-            "id": int(row["id"]),
-            "path": path,
-            "bytes": size,
-            "hash": digest,
-            "status": 200,
-            "final_url": media_replay_url(row),
-        }
+        verified = _matching_existing_media(path, row)
+        if verified is None:
+            path = _disambiguate_media_path(path, row)
+            if path.is_file():
+                verified = _matching_existing_media(path, row)
+                if verified is None:
+                    raise FileExistsError(f"media filename collision: {path}; existing contents unverified")
+        if verified is not None:
+            size, digest = verified
+            return {
+                "id": int(row["id"]), "path": path, "bytes": size,
+                "hash": digest, "status": 200, "final_url": media_replay_url(row),
+            }
     temp = path.with_name(path.name + ".part")
     response = client.download_to_path(
         media_replay_url(row),
@@ -251,8 +291,11 @@ def download_media(
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-media") as pool:
-            futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
-    
+            futures: dict[concurrent.futures.Future, tuple[sqlite3.Row, Path]] = {}
+            # Only currently in-flight paths need reserving. Never hold a set
+            # proportional to the entire media inventory in memory.
+            in_flight_paths: set[Path] = set()
+
             def submit_available() -> None:
                 nonlocal complete, errors
                 slots = max_inflight - len(futures)
@@ -296,7 +339,13 @@ def download_media(
                         ((now, int(row["id"])) for row in rows),
                     )
                 for row in rows:
-                    futures[pool.submit(fetch_media, row, config, client)] = row
+                    destination = media_path(config.output_dir, row)
+                    if destination in in_flight_paths:
+                        destination = _disambiguate_media_path(destination, row)
+                    if destination in in_flight_paths:
+                        raise RuntimeError(f"media path reservation conflict: {destination}")
+                    in_flight_paths.add(destination)
+                    futures[pool.submit(fetch_media, row, config, client, destination)] = (row, destination)
     
             submit_available()
     
@@ -307,7 +356,8 @@ def download_media(
                     raise Stopped
                 done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
-                    row = futures.pop(future)
+                    row, destination = futures.pop(future)
+                    in_flight_paths.discard(destination)
                     try:
                         result = future.result()
                         with database:

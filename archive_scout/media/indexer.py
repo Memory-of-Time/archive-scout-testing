@@ -498,7 +498,8 @@ def _request_media_resume(
     target: str,
     current: PendingWindow,
     extensions: list[str],
-) -> tuple[list[dict[str, str]], bool]:
+) -> tuple[list[dict[str, str]], bool, str | None]:
+    # Cursor advancement must be atomic with inserted media inventory rows.
     page_size = current.page_size or config.page_size
     result = request_cdx_rows(
         client,
@@ -519,9 +520,8 @@ def _request_media_resume(
     if next_resume:
         if next_resume == current.resume_key:
             raise TransientRequestError("CDX returned the same media resume key twice", splittable=True)
-        current.resume_key = next_resume
-        return rows, False
-    return rows, True
+        return rows, False, next_resume
+    return rows, True, None
 
 
 def _media_failure_error(failures: list[PageFetchResult]) -> BaseException:
@@ -790,7 +790,7 @@ def index_direct_media(
                     )
                     continue
 
-                rows, finished = _request_media_resume(
+                rows, finished, next_cursor = _request_media_resume(
                     target_config, client, target, current, extensions
                 )
                 connection_failure_streak = 0
@@ -800,19 +800,32 @@ def index_direct_media(
                 accepted = _accept_media_rows(rows, media)
                 accepted_count = len(accepted)
                 write_started = time.monotonic()
-                with database:
-                    changed = upsert_media_captures(database, accepted, target_id, signature)
-                    seen += received
-                    current.failures = 0
-                    if finished:
-                        plan.pending.pop(0)
-                        plan.completed += 1
-                        completed += 1
-                    complete = not plan.pending
-                    _save_media_state(database, target_id, year, state_signature, encode_plan(plan), complete, seen, None if complete else error_id)
-                    if error_id:
-                        database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
-                        error_id = None
+                old_seen, old_cursor = seen, current.resume_key
+                old_failures, old_completed = current.failures, plan.completed
+                old_completed_windows, old_error_id = completed, error_id
+                try:
+                    with database:
+                        changed = upsert_media_captures(database, accepted, target_id, signature)
+                        seen += received
+                        current.failures = 0
+                        if next_cursor is not None:
+                            current.resume_key = next_cursor
+                        if finished:
+                            plan.pending.pop(0)
+                            plan.completed += 1
+                            completed += 1
+                        complete = not plan.pending
+                        _save_media_state(database, target_id, year, state_signature, encode_plan(plan), complete, seen, None if complete else error_id)
+                        if error_id:
+                            database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
+                            error_id = None
+                except BaseException:
+                    seen, current.resume_key = old_seen, old_cursor
+                    current.failures, plan.completed = old_failures, old_completed
+                    completed, error_id = old_completed_windows, old_error_id
+                    if finished and (not plan.pending or plan.pending[0] is not current):
+                        plan.pending.insert(0, current)
+                    raise
                 write_seconds = time.monotonic() - write_started
                 if callback:
                     callback(

@@ -59,11 +59,12 @@ class NetworkTuningTests(unittest.TestCase):
             to_date="2001",
         ).normalized()
         client = RecordingClient()
-        rows, finished = _request_resume(
+        rows, finished, next_cursor = _request_resume(
             client, config, "example.com/*", PendingWindow("20010101000000", "20011231235959")
         )
         self.assertEqual(rows, [])
         self.assertTrue(finished)
+        self.assertIsNone(next_cursor)
         self.assertTrue(client.assert_prefer_text)
         self.assertGreaterEqual(client.max_bytes, 100000 * 1536)
 
