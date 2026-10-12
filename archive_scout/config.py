@@ -427,7 +427,7 @@ class ProjectConfig:
     connect_timeout: float = 30.0
     read_timeout: float = 180.0
     max_attempts: int = 4
-    user_agent: str = "Scout/1.2.0 public web archive research client"
+    user_agent: str = "Scout/1.2.1 public web archive research client"
     retry_error_categories: list[str] = field(default_factory=list)
     retry_capture_ids: list[int] = field(default_factory=list)
     retry_media_capture_ids: list[int] = field(default_factory=list)
@@ -545,7 +545,7 @@ class ProjectConfig:
             connect_timeout=max(1.0, float(self.connect_timeout)),
             read_timeout=max(1.0, float(self.read_timeout)),
             max_attempts=min(20, max(1, int(self.max_attempts))),
-            user_agent=self.user_agent.strip() or "Scout/1.2.0 public web archive research client",
+            user_agent=self.user_agent.strip() or "Scout/1.2.1 public web archive research client",
             retry_error_categories=list(dict.fromkeys(value.strip() for value in self.retry_error_categories if value.strip())),
             retry_capture_ids=sorted({int(value) for value in self.retry_capture_ids if int(value) > 0}),
             retry_media_capture_ids=sorted({int(value) for value in self.retry_media_capture_ids if int(value) > 0}),
@@ -722,7 +722,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         connect_timeout=float(payload.get("connect_timeout", 30.0)),
         read_timeout=float(payload.get("read_timeout", 180.0)),
         max_attempts=int(payload.get("max_attempts", 4)),
-        user_agent=str(payload.get("user_agent", "Scout/1.2.0 public web archive research client")),
+        user_agent=str(payload.get("user_agent", "Scout/1.2.1 public web archive research client")),
         retry_error_categories=list(payload.get("retry_error_categories") or []),
         retry_capture_ids=[int(value) for value in payload.get("retry_capture_ids") or []],
         retry_media_capture_ids=[int(value) for value in payload.get("retry_media_capture_ids") or []],

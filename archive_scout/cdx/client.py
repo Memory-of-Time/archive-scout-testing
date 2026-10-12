@@ -343,7 +343,7 @@ class HttpClient:
     @staticmethod
     def _discard_untracked_partial(destination: Path) -> None:
         from ..network.transports import _partial_metadata_path
-        if not _partial_metadata_path(destination).is_file():
+        if destination.exists() and not _partial_metadata_path(destination).is_file():
             destination.unlink(missing_ok=True)
 
     def download_to_path(
@@ -371,7 +371,7 @@ class HttpClient:
         while True:
             ensure_frozen_bundle_available()
             from ..network.transports import _partial_metadata_path
-            if not _partial_metadata_path(destination).is_file():
+            if destination.exists() and not _partial_metadata_path(destination).is_file():
                 destination.unlink(missing_ok=True)
             permit = self.host_gate.acquire_request(self.stop_event)
             try:
