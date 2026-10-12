@@ -319,13 +319,14 @@ def download_archive(
     states: tuple[str, ...] = ("pending",),
     capture_ids: list[int] | None = None,
     scan_jobs: list[ScanJob] | None = None,
+    acquire_only: bool = False,
 ) -> None:
     if config.download_scope == "index_only":
         if callback:
             callback(ProgressEvent("download", "Index-only mode selected; downloads skipped."))
         return
-    jobs = scan_jobs or [ScanJob.create(scan_run_id, config.keyword_set_name, config.keywords)]
-    if not jobs or any(not job.patterns for job in jobs):
+    jobs = [] if acquire_only else (scan_jobs or [ScanJob.create(scan_run_id, config.keyword_set_name, config.keywords)])
+    if not acquire_only and (not jobs or any(not job.patterns for job in jobs)):
         raise ValueError("at least one keyword rule is required")
     combined_patterns = [item for job in jobs for item in job.patterns]
     with database:
@@ -343,8 +344,9 @@ def download_archive(
                 f"No matching captures remain to download; project progress {completed_before:,}/{cumulative_total:,}.",
                 completed_before, cumulative_total,
             ))
-        from ..scanning.pending import scan_pending_saved
-        scan_pending_saved(database,config,jobs,stop_event,callback)
+        if not acquire_only:
+            from ..scanning.pending import scan_pending_saved
+            scan_pending_saved(database,config,jobs,stop_event,callback)
         return
     limiter = SharedFixedRateLimiter(config.download_delay)
     host_gate = shared_host_gate(config.rate_limit_base_pause, config.rate_limit_max_pause)
@@ -375,12 +377,18 @@ def download_archive(
         rate_limit_max_wait=config.rate_limit_max_wait,
         network_backend=config.network.normalized().backend,
         trust_environment=config.network.normalized().trust_environment,
+        coordinated_connection_recovery=config.network.coordinated_connection_recovery,
+        connection_failure_threshold=config.network.connection_failure_pause_threshold,
+        connection_retry_seconds=config.network.connection_retry_seconds,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
     )
     completed = matched = failures = saved_this_pass = 0
     recent_commits: deque[float] = deque()
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
+    last_completion = time.monotonic()
+    last_save = time.monotonic()
+    last_stall_message = time.monotonic()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="archive-scout") as pool:
             futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
@@ -415,14 +423,32 @@ def download_archive(
                     for pending in futures:
                         pending.cancel()
                     raise Stopped
-                done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                done, _ = concurrent.futures.wait(futures, timeout=5.0, return_when=concurrent.futures.FIRST_COMPLETED)
+                if not done:
+                    now = time.monotonic()
+                    if callback and now-last_completion >= 30.0 and now-last_stall_message >= 30.0:
+                        status = client.host_gate.snapshot()
+                        callback(ProgressEvent(
+                            "acquisition_stall",
+                            f"No completed text requests for {now-last_completion:.0f}s; "
+                            f"queued/running tasks {len(futures)}; "
+                            f"workers waiting at Wayback gate {status['waiting_workers']}; "
+                            f"probe active {status['recovery_probe']}; "
+                            f"host pause {status['remaining_pause']:.1f}s; "
+                            f"last successful save {now-last_save:.0f}s ago. "
+                            "Other workers may be awaiting network responses or pacing."
+                        ))
+                        last_stall_message = now
+                    continue
+                last_completion = time.monotonic()
                 for future in done:
                     row = futures.pop(future)
                     try:
                         result = future.result()
                         save_success(database, result)
                         saved_this_pass += 1
-                        recent_commits.append(time.monotonic())
+                        last_save = time.monotonic()
+                        recent_commits.append(last_save)
                         if "analyses" in result:
                             matched += int(any(
                                 int(analysis.get("score") or 0) >= config.minimum_score
@@ -545,5 +571,6 @@ def download_archive(
     finally:
         client.close()
     # Decouple complete HTML/source scanning from network request workers.
-    from ..scanning.pending import scan_pending_saved
-    scan_pending_saved(database,config,jobs,stop_event,callback)
+    if not acquire_only:
+        from ..scanning.pending import scan_pending_saved
+        scan_pending_saved(database,config,jobs,stop_event,callback)

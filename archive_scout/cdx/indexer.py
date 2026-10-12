@@ -15,7 +15,7 @@ from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
 from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
-from .client import HttpClient, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload
+from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload
 from .parallel import PageFetchResult, effective_page_workers, iter_cdx_pages
 from .parameters import (
     build_cdx_params,
@@ -279,6 +279,52 @@ def window_label(start: str, end: str) -> str:
     return f"{start_date:%Y-%m-%d}–{end_date:%Y-%m-%d}"
 
 
+
+def _query_is_oversized(exc: BaseException) -> bool:
+    """Only explicit response-size / memory pressure justifies aggressive reduction.
+
+    Transport errors and HTTP 5xx may be flagged `splittable` by the client for
+    callers that can retry smaller work, but don't establish query-size pressure.
+    """
+    description = str(exc).casefold()
+    return any(token in description for token in (
+        "safe in-memory budget", "response exceeds", "response was larger",
+        "parsing exceeded available memory", "json parsing exceeded available memory",
+    ))
+
+
+def _can_split_cdx_window(current: PendingWindow, exc: TransientRequestError) -> bool:
+    """Split query-specific failures, never a transient Wayback outage.
+
+    Read timeouts and malformed responses can be query-related, but are also
+    caused by temporary service unavailability. A 30-minute minimum parent
+    window prevents a stalled service from producing thousands of second-sized
+    CDX requests. Explicit response-size pressure can still split more finely.
+    """
+    if not exc.splittable or exc.connection_failed:
+        return False
+    if getattr(exc, "status", None) in {408, 425, 429, 500, 502, 503, 504}:
+        return False
+    # Some client aggregators wrap multiple endpoint errors in a single error.
+    # Do not mistake an HTML/gateway outage for a malformed oversized query.
+    description = str(exc).casefold()
+    if "all cdx endpoints failed" in description and any(
+        f"http {status}" in description for status in (408, 425, 429, 500, 502, 503, 504)
+    ):
+        return False
+    if _query_is_oversized(exc):
+        return True
+    if not (exc.timed_out or isinstance(exc, MalformedCDXResponse)
+            or "same resume key twice" in description):
+        return False
+    try:
+        duration = (datetime.strptime(current.end, "%Y%m%d%H%M%S")
+                    - datetime.strptime(current.start, "%Y%m%d%H%M%S"))
+    except ValueError:
+        return False
+    return duration >= timedelta(minutes=30)
+
+
 def transient_backoff(config: ProjectConfig, failures: int) -> float:
     """Fixed failure-only retry wait; no escalating application cooldown.
 
@@ -444,9 +490,13 @@ def _defer_transient_window(
     stop_event: threading.Event,
 ) -> int:
     current.failures += 1
-    current.page_size = max(100, (current.page_size or config.page_size) // 2)
-    if current.strategy != "paged":
-        current.page_blocks = max(1, current.page_blocks // 2)
+    # A busy/unreachable service does not imply a query is oversized. Preserve
+    # the user's page size and ZipNum grouping during outages, so retrying does
+    # not progressively multiply the requests needed for the same inventory.
+    if _query_is_oversized(exc):
+        current.page_size = max(100, (current.page_size or config.page_size) // 2)
+        if current.strategy != "paged" and current.page_blocks > 0:
+            current.page_blocks = max(1, current.page_blocks // 2)
     message = f"{type(exc).__name__}: {exc}"
     network = config.network.normalized()
     with database:
@@ -471,7 +521,11 @@ def _defer_transient_window(
                 "retry_pages": current.retry_pages[:100],
             },
         )
-        if len(plan.pending) > 1:
+        # A host outage affects every saved window. Walking to the next
+        # one-second window after each 503 creates the false appearance of
+        # progress and burns requests without gaining any CDX records.
+        # Only rotate for failures plausibly isolated to the query itself.
+        if len(plan.pending) > 1 and _can_split_cdx_window(current, exc):
             plan.pending.append(plan.pending.pop(0))
         persist_task_state(encode_plan(plan), False, seen, error_id)
 
@@ -486,12 +540,12 @@ def _defer_transient_window(
     # Transient outages are not a terminal operation state. Every window remains
     # in the checkpoint and will be revisited automatically until stopped.
 
-    if len(plan.pending) > 1:
+    if len(plan.pending) > 1 and _can_split_cdx_window(current, exc):
         emit(
             callback,
             ProgressEvent(
                 "index",
-                f"Wayback did not answer {window_label(current.start, current.end)}. Progress was saved and this work moved behind the remaining queue.",
+                f"Wayback did not answer {window_label(current.start, current.end)}. Progress was saved and this query-specific failure moved behind remaining work.",
                 completed_windows,
                 total_windows,
             ),
@@ -501,6 +555,12 @@ def _defer_transient_window(
     # Do not require a manual Resume after an intermittent outage.
 
     wait_seconds = transient_backoff(config, current.failures)
+    if not _can_split_cdx_window(current, exc):
+        emit(callback, ProgressEvent(
+            "index", f"CDX service failure for {window_label(current.start, current.end)}: "
+            f"keeping original saved date range and page size; {type(exc).__name__}: {str(exc)[:180]}",
+            completed_windows, total_windows,
+        ))
     emit(
         callback,
         ProgressEvent(
@@ -1135,7 +1195,7 @@ def index_archive(
                         current.page_count = -1
                         current.retry_pages.clear()
                         current.page_failures.clear()
-                        parts = split_window(current) if exc.splittable else []
+                        parts = split_window(current) if _can_split_cdx_window(current, exc) else []
                         if parts:
                             for part in parts:
                                 part.strategy = "resume"
@@ -1146,10 +1206,11 @@ def index_archive(
                             total_windows += added
                         with database:
                             persist_task_state(encode_plan(plan), False, seen, error_id)
-                        emit(callback, ProgressEvent("index", f"Paged CDX could not count {target} {label}; continuing with resumable smaller windows.", completed_windows, total_windows))
+                        note = "resumable smaller windows" if parts else "the original saved range"
+                        emit(callback, ProgressEvent("index", f"Paged CDX could not count {target} {label}; continuing with {note}.", completed_windows, total_windows))
                         continue
                     if current.strategy == "resume" and current.pagination_supported:
-                        parts = split_window(current) if exc.splittable else []
+                        parts = split_window(current) if _can_split_cdx_window(current, exc) else []
                         if parts:
                             plan.pending[0:1] = parts
                             added = len(parts) - 1
@@ -1157,9 +1218,9 @@ def index_archive(
                             total_windows += added
                             with database:
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            emit(callback, ProgressEvent("index", f"CDX did not answer {target} {label}; split into {len(parts)} smaller windows.", completed_windows, total_windows))
+                            emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split {target} {label} into {len(parts)} smaller windows (unfinished ranges retained).", completed_windows, total_windows))
                             continue
-                        if preferred_index_strategy(target_config, target) == "paged":
+                        if _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
                             current.strategy = "paged"
                             current.page = 0
                             current.page_count = -1

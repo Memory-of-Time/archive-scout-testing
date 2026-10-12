@@ -1,4 +1,4 @@
-# Scout 1.2.0
+# Scout 1.2.1
 
 **Scout** is a cross-platform desktop and command-line workspace for finding, preserving, downloading, searching, and reviewing public Wayback Machine captures.
 
@@ -10,10 +10,14 @@
 
 [All releases](https://github.com/Memory-of-Time/archive-scout/releases) · [Report an issue](https://github.com/Memory-of-Time/archive-scout/issues)
 
+> These download links resolve once the first GitHub release with matching assets is published. They currently target the verified development repository. If Scout is moved to a new public repository, update the three links and the adjacent links before publishing. The release workflow automatically creates these exact filenames.
+
 ## What Scout does
 
 - Index Wayback CDX inventories with restartable resume-key and paged traversal, query compatibility, and durable checkpoints.
 - Download eligible captures with fixed request pacing, resilient network transports, and separate local keyword scanning.
+- **Index and download only (no scanning)** or retry failed acquisition independently of keyword sets.
+- Explain blocked acquisition using passive stall diagnostics, with optional (default-off) coordinated host connection recovery.
 - Classify text and media, optionally retrieve images and video, follow approved archived redirects, and discover embedded media.
 - Search stored files and indexed URLs using keyword sets and an optional resumable Hitlist; review results and export reports.
 - Maintain project databases, diagnostics, backups, integrity tools, analysis, and optional AI research tools.
@@ -37,11 +41,11 @@ The legacy `archive-scout` and `archive-scout-gui` entry points remain available
 ## First project
 
 1. Choose a project folder, target URL patterns, date range and operation.
-2. Index captures, then download and search them with a selected keyword set.
+2. Choose **Index and download only** to preserve text without scanning, or use the full index/download/scan workflow with a keyword set.
 3. Review results and generate reports. Use **Refresh dashboard** to update the summary counters manually.
-4. If a service outage interrupts work, pause and resume in the **same project folder** to preserve checkpoints.
+4. If a service outage interrupts work, pause and resume in the **same project folder** to preserve checkpoints. Acquisition stalls over 30 seconds now surface worker/host-gate diagnostics in Activity without extra network requests.
 
-The existing schema-9 project database format is retained. Schema-13 projects created by historical releases cannot be opened in this codebase; preserve their backups. See [Migration](docs/MIGRATION.md).
+The existing schema-9 project database format is retained. Schema-13 projects created by historical releases cannot be opened in this codebase; preserve their backups. Imported files are copied into project-owned storage, and moved schema-9 projects can rebase previously saved internal file paths on opening. See [Migration](docs/MIGRATION.md).
 
 ## Development
 

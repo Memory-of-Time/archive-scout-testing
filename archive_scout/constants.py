@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 SCHEMA_VERSION = 9
 APP_NAME = "Scout"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"
@@ -43,6 +43,8 @@ OPERATION_MODES = {
     "Index, download, scan, and report": "all",
     "Index, download, scan, then download external embedded media": "external_media_after_scan",
     "Index URLs only": "index",
+    "Index and download only (no scanning)": "download_only",
+    "Retry failed downloads only (no scanning)": "retry_download_errors",
     "Download and scan pending URLs": "download",
     "Resume interrupted work": "resume",
     "Rescan existing downloads with selected keyword sets": "rescan",

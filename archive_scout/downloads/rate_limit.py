@@ -104,6 +104,40 @@ class SharedHostGate:
         self.generation = 0
         self.probe_required = False
         self.probe_inflight = False
+        self.waiting_workers = 0
+        self.connection_failures: dict[str, float] = {}
+        self.last_reachable = time.monotonic()
+
+    def connection_success(self) -> None:
+        with self.condition:
+            self.last_reachable = time.monotonic()
+            self.connection_failures.clear()
+
+    def connection_failed(self, url: str, threshold: int = 3, pause_seconds: float = 3.0) -> bool:
+        """Only distinct requests failing host setup can close the gate.
+
+        This optional hook is inert when networking is healthy and the caller
+        does not enable it. Never classifies HTTP 404/403 or body timeouts as
+        a host-level outage.
+        """
+        now = time.monotonic()
+        with self.condition:
+            self.connection_failures = {k: v for k, v in self.connection_failures.items() if now-v <= 15.0}
+            self.connection_failures.setdefault(url, now)
+            if now-self.last_reachable < 5.0 or len(self.connection_failures) < threshold:
+                return False
+            self.connection_failures.clear()
+        self.pause_for_rate_limit(retry_after=pause_seconds, reason="host connection failure")
+        return True
+
+    def snapshot(self) -> dict[str, object]:
+        """Cheap in-memory stall diagnostics; called only during a stall."""
+        with self.condition:
+            return {"waiting_workers": self.waiting_workers,
+                    "recovery_probe": self.probe_inflight,
+                    "probe_required": self.probe_required,
+                    "remaining_pause": max(0.0, self.blocked_until-time.monotonic()),
+                    "reason": self.reason}
 
     def acquire_request(self, stop_event: threading.Event) -> HostPermit:
         while True:
@@ -113,13 +147,21 @@ class SharedHostGate:
                 now = time.monotonic()
                 remaining = self.blocked_until - now
                 if remaining > 0:
-                    self.condition.wait(timeout=min(max(remaining, 0.05), 0.5))
+                    self.waiting_workers += 1
+                    try:
+                        self.condition.wait(timeout=min(max(remaining, 0.05), 0.5))
+                    finally:
+                        self.waiting_workers -= 1
                     continue
                 if self.probe_required:
                     if not self.probe_inflight:
                         self.probe_inflight = True
                         return HostPermit(self.generation, True)
-                    self.condition.wait(timeout=0.5)
+                    self.waiting_workers += 1
+                    try:
+                        self.condition.wait(timeout=0.5)
+                    finally:
+                        self.waiting_workers -= 1
                     continue
                 return HostPermit(self.generation, False)
 

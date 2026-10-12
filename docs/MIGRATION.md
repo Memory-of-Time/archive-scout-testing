@@ -1,6 +1,6 @@
 # Project migration and compatibility
 
-Scout 1.2.0 uses **database schema 9**, inherited unchanged from the validated Archive Scout 1.2.4 development release. The public version reset does not reset the database schema.
+Scout 1.2.1 uses **database schema 9**, inherited unchanged from the validated Archive Scout 1.2.4 development release. The public version reset does not reset the database schema.
 
 Scout retains the existing migration code for supported older schemas and creates a safety copy before migrations where supported. Always make an independent backup of valuable projects.
 

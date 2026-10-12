@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from ..content import parse_page
 from ..database.repositories import get_or_create_target, upsert_document
 from ..events import ProgressEvent, Stopped
-from ..utils import hash_text, normalize_search, utc_now
+from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 
 
 def import_text_folder(
@@ -23,9 +25,16 @@ def import_text_folder(
     for index, path in enumerate(files, 1):
         if stop_event.is_set():
             raise Stopped
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        original = f"file://{path.resolve()}"
-        timestamp = path.stat().st_mtime_ns.__str__()[:14].ljust(14, "0")
+        data = path.read_bytes()
+        raw = data.decode("utf-8", errors="replace")
+        original = path.resolve().as_uri()
+        timestamp = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y%m%d%H%M%S")
+        stable_id = hashlib.sha256((original + "|" + timestamp + "|" + hashlib.sha256(data).hexdigest()).encode("utf-8", "replace")).hexdigest()[:24]
+        destination = root / "captures" / "imported" / f"{stable_id}.txt"
+        # Local-import file I/O occurs only during explicit import, never in
+        # the Wayback download hot path. Avoid rewriting already identical files.
+        if not destination.exists() or destination.read_bytes() != data:
+            atomic_write_bytes(destination, data)
         now = utc_now()
         cursor = database.execute(
             """
@@ -44,13 +53,13 @@ def import_text_folder(
         upsert_document(
             database,
             capture_id,
-            path,
+            destination,
             title,
             visible,
             links,
-            hash_text(raw),
+            hashlib.sha256(data).hexdigest(),
             hash_text(normalize_search(visible)),
-            path.stat().st_size,
+            len(data),
         )
         imported += int(cursor.rowcount > 0)
         if callback:

@@ -45,7 +45,7 @@ def capture(database, root, target, number, body=None, kind='text'):
 
 
 class HitlistRestorationTests(unittest.TestCase):
-    def test_existing_imported_source_outside_project_remains_searchable_in_place(self):
+    def test_imported_source_is_copied_to_portable_project_storage(self):
         from archive_scout.projects.importers import import_text_folder
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)/'project'; source=Path(temp)/'source'
@@ -60,10 +60,11 @@ class HitlistRestorationTests(unittest.TestCase):
                 self.assertEqual(result['local_checked'],1)
                 self.assertEqual(path.read_bytes(),body)
                 stored_path = database.execute('SELECT path FROM documents').fetchone()[0]
-                # Windows 8.3 aliases and macOS /var -> /private/var are the same file.
-                # Verify physical identity rather than imposing one path spelling.
-                self.assertTrue(os.path.samefile(stored_path, path),
-                                f'Imported document is not the original source: {stored_path!r}')
+                self.assertTrue(Path(stored_path).is_relative_to(root))
+                self.assertFalse(os.path.samefile(stored_path, path))
+                path.unlink()  # Archive remains usable after source folder is removed.
+                self.assertEqual(Path(stored_path).read_bytes(), body)
+                self.assertEqual(search_with_hitlist(root,database,['imported needle'],threading.Event())['matches'],1)
             finally:
                 database.close()
 
@@ -173,7 +174,7 @@ class IndexRestorationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp); database=open_database(root)
             try:
-                config=ProjectConfig(root,keywords=[],targets=['example.org/*'],from_date='2001',to_date='2010',cdx_delay=0).normalized()
+                config=ProjectConfig(root,keywords=[],targets=['example.org/*'],from_date='2001',to_date='2010',cdx_delay=0, network=NetworkConfig(index_strategy='resume')).normalized()
                 with patch.object(HttpClient,'get_cdx_any',return_value=[]) as getter:
                     index_archive(config,database,threading.Event())
                     index_archive(config,database,threading.Event())

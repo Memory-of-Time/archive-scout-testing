@@ -1,6 +1,6 @@
 # Development
 
-Scout 1.2.0 supports Python 3.11/3.12 for published source/CI builds. Some newer Python versions may work but are not part of the official matrix. Tkinter is needed to run the desktop UI.
+Scout 1.2.1 supports Python 3.11/3.12 for published source/CI builds. Some newer Python versions may work but are not part of the official matrix. Tkinter is needed to run the desktop UI.
 
 ```bash
 python -m pip install .

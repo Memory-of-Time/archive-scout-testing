@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import shutil
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..database.connection import DATABASE_NAME
+from ..database.lease import project_lease
 from ..utils import utc_now
 
 
@@ -68,26 +70,47 @@ def prune_backups(root: Path, keep: int = 5) -> None:
 
 
 def restore_project_backup(root: Path, backup_path: Path) -> Path:
-    root = Path(root)
-    backup_path = Path(backup_path)
-    if not backup_path.exists():
+    """Restore a SQLite snapshot without racing an active Scout operation.
+
+    Project lease is acquired once; full SQLite backup avoids losing committed
+    WAL pages. No backup/restore work runs during ordinary acquisition.
+    """
+    root = Path(root).expanduser().resolve()
+    backup_path = Path(backup_path).expanduser().resolve()
+    if not backup_path.is_file():
         raise FileNotFoundError(backup_path)
     target = root / DATABASE_NAME
-    safety = None
-    if target.exists():
-        safety = root / "backups" / f"archive_scout_{_timestamp()}_before_restore.sqlite3"
-        safety.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(target, safety)
-    temp = target.with_suffix(".restore.tmp")
-    shutil.copy2(backup_path, temp)
-    check = sqlite3.connect(temp)
-    try:
-        result = check.execute("PRAGMA integrity_check").fetchone()
-        if not result or str(result[0]).lower() != "ok":
-            raise RuntimeError(f"backup failed SQLite integrity check: {result}")
-    finally:
-        check.close()
-    temp.replace(target)
-    for suffix in ("-wal", "-shm"):
-        Path(str(target) + suffix).unlink(missing_ok=True)
-    return safety or target
+    with project_lease(root):
+        # A second process holding a database connection may be a reader, but
+        # active WAL writers must not be allowed to modify a replaced file.
+        safety = None
+        if target.exists():
+            safety = create_project_backup(root, reason="before_restore", keep=999999)
+            live = sqlite3.connect(target, timeout=2)
+            try:
+                checkpoint = live.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint and int(checkpoint[0]):
+                    raise RuntimeError("database is busy; close other Scout processes before restoring")
+            finally:
+                live.close()
+        temp = target.with_name(target.name + ".restore.tmp")
+        temp.unlink(missing_ok=True)
+        # Produce a canonical standalone database even when the provided
+        # backup itself has WAL sidecars.
+        source = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+        destination = sqlite3.connect(temp)
+        try:
+            source.backup(destination)
+            check = destination.execute("PRAGMA integrity_check").fetchone()
+            if not check or str(check[0]).lower() != "ok":
+                raise RuntimeError(f"backup failed SQLite integrity check: {check}")
+        finally:
+            destination.close()
+            source.close()
+        try:
+            for suffix in ("-wal", "-shm"):
+                Path(str(target) + suffix).unlink(missing_ok=True)
+            os.replace(temp, target)
+        finally:
+            temp.unlink(missing_ok=True)
+        return safety or target

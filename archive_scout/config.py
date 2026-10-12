@@ -363,6 +363,7 @@ class NetworkConfig:
     failure_pause_threshold: int = 8
     connection_failure_pause_threshold: int = 3
     connection_retry_seconds: float = 3.0
+    coordinated_connection_recovery: bool = False
     diagnostics: bool = True
 
     def normalized(self) -> "NetworkConfig":
@@ -388,6 +389,7 @@ class NetworkConfig:
             failure_pause_threshold=min(100, max(2, int(self.failure_pause_threshold))),
             connection_failure_pause_threshold=min(10, max(2, int(self.connection_failure_pause_threshold))),
             connection_retry_seconds=min(30.0, max(1.0, float(self.connection_retry_seconds))),
+            coordinated_connection_recovery=bool(self.coordinated_connection_recovery),
             diagnostics=bool(self.diagnostics),
         )
 
@@ -606,7 +608,14 @@ def save_project_config(config: ProjectConfig) -> Path:
 
 
 def load_project_config(path: Path) -> ProjectConfig:
+    path = Path(path).expanduser()
     payload = json.loads(path.read_text(encoding="utf-8"))
+    saved_root = Path(payload.get("output_dir") or path.parent).expanduser()
+    # The standard project.json belongs inside the project directory. When a
+    # complete project is moved or copied, use the colocated database instead
+    # of silently returning to a different folder.
+    if saved_root != path.parent and (path.parent / "archive_scout.sqlite3").is_file():
+        saved_root = path.parent
     keyword_sets = list(payload.get("keyword_sets") or [])
     media_payload = payload.get("media") or {}
     analysis_payload = payload.get("analysis") or {}
@@ -685,7 +694,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         loaded_workers = 10
         loaded_download_delay = 0.125
     return ProjectConfig(
-        output_dir=Path(payload.get("output_dir") or path.parent),
+        output_dir=saved_root,
         targets=list(payload.get("targets") or []),
         keywords=list(payload.get("keywords") or []),
         keyword_set_name=str(payload.get("keyword_set_name") or "Current keywords"),
@@ -788,6 +797,7 @@ def load_project_config(path: Path) -> ProjectConfig:
             failure_pause_threshold=int(network_payload.get("failure_pause_threshold", 8)),
             connection_failure_pause_threshold=int(network_payload.get("connection_failure_pause_threshold", 3)),
             connection_retry_seconds=float(network_payload.get("connection_retry_seconds", 3.0)),
+            coordinated_connection_recovery=bool(network_payload.get("coordinated_connection_recovery", False)),
             diagnostics=bool(network_payload.get("diagnostics", True)),
         ),
         target_settings=dict(payload.get("target_settings") or {}),
