@@ -642,6 +642,21 @@ def cdx_response_budget(page_size: int) -> int:
     return min(256 * 1024 * 1024, max(64 * 1024 * 1024, size * 1536))
 
 
+def _reconcile_paged_completion(current: PendingWindow, completed_pages: set[int]) -> bool:
+    """End-of-window safeguard; one O(page-count) pass only on completion.
+
+    Page counters and the cursor are a scheduling hint, not durable evidence of
+    complete coverage. Every page must have a committed row-ledger entry.
+    """
+    if current.page_count < 0:
+        return False
+    missing = [page for page in range(current.page_count) if page not in completed_pages]
+    if missing:
+        current.retry_pages = sorted(set(current.retry_pages).union(missing))
+        return False
+    return True
+
+
 def _select_page_batch(current: PendingWindow, workers: int) -> tuple[list[int], int]:
     workers = max(1, int(workers))
     retry_pages = sorted({page for page in current.retry_pages if 0 <= page < current.page_count})
@@ -973,9 +988,16 @@ def index_archive(
                                 connection_failure_streak = 0
                                 transient_failure_streak = 0
                             if batch.finished:
-                                plan.pending.pop(0)
-                                plan.completed += 1
-                                completed_windows += 1
+                                # A crash after a successful page commit may
+                                # leave the plan cursor behind its page ledger.
+                                # Never mark a window complete on a cursor
+                                # alone: every numbered page must be durable.
+                                if not _reconcile_paged_completion(current, completed_pages):
+                                    batch.finished = False
+                                else:
+                                    plan.pending.pop(0)
+                                    plan.completed += 1
+                                    completed_windows += 1
                             complete = not plan.pending
                             persist_task_state(encode_plan(plan), complete, seen, None if complete else error_id)
                             if error_id and not failures:

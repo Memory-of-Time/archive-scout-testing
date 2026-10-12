@@ -98,17 +98,24 @@ def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jo
     return paths
 
 
-def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000):
+def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size: int = 1000,
+                           include_exhausted_pending: bool = False):
     """Yield each eligible capture at most once per pass, without an ID-sized list."""
     signature = cdx_query_signature(config)
     last_id = 0
     while True:
+        # Explicit retry includes pending captures which a lifetime attempt
+        # ceiling prevented from entering the normal queue. Automatic recovery
+        # still considers only recorded retryable errors, once per sweep.
+        exhausted = " OR (c.state='pending' AND c.download_attempts>=?)" if include_exhausted_pending else ""
         rows = database.execute(
             """SELECT c.id FROM captures c WHERE c.id>? AND c.query_signature=?
-               AND c.state='error' AND EXISTS (
+               AND ((c.state='error' AND EXISTS (
                    SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                   AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
-               ORDER BY c.id LIMIT ?""", (last_id, signature, batch_size)
+                   AND e.resolved=0 AND e.ignored=0 AND e.retryable=1))"""
+            + exhausted + ") ORDER BY c.id LIMIT ?",
+            (last_id, signature, config.max_attempts, batch_size)
+            if include_exhausted_pending else (last_id, signature, batch_size),
         ).fetchall()
         if not rows:
             return
@@ -141,12 +148,12 @@ def recover_transient_text_errors(
 
 def retry_capture_downloads(config, database, stop_event, callback) -> None:
     """Explicit acquisition-only retry, with no scan jobs or keyword matching."""
-    for ids in _retryable_text_batches(config, database):
+    for ids in _retryable_text_batches(config, database, include_exhausted_pending=True):
         if stop_event.is_set():
             raise Stopped
-        emit(callback, ProgressEvent("download_retry", f"Retrying {len(ids):,} failed downloads without scanning"))
+        emit(callback, ProgressEvent("download_retry", f"Retrying {len(ids):,} failed or attempt-exhausted downloads without scanning"))
         download_archive(config, database, 0, stop_event, callback,
-                         states=("error",), capture_ids=ids, acquire_only=True)
+                         states=("error", "pending"), capture_ids=ids, acquire_only=True)
 
 
 @guard_project

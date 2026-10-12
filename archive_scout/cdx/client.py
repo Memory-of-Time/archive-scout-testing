@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import random
+import gzip
+import io
+import zlib
 import re
 import threading
 import time
@@ -337,14 +340,21 @@ class HttpClient:
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
 
+    @staticmethod
+    def _discard_untracked_partial(destination: Path) -> None:
+        from ..network.transports import _partial_metadata_path
+        if not _partial_metadata_path(destination).is_file():
+            destination.unlink(missing_ok=True)
+
     def download_to_path(
         self,
         url: str,
         destination: Path,
         max_bytes: int,
         accept: str = "*/*",
+        *, expected_digest: str = "",
     ) -> dict:
-        """Stream a response to disk while retaining the normal Wayback policy."""
+        """Stream a response to disk; retain verifiable partial media on failures."""
         headers = {
             "User-Agent": self.user_agent,
             "Accept": accept,
@@ -360,20 +370,28 @@ class HttpClient:
 
         while True:
             ensure_frozen_bundle_available()
-            destination.unlink(missing_ok=True)
+            from ..network.transports import _partial_metadata_path
+            if not _partial_metadata_path(destination).is_file():
+                destination.unlink(missing_ok=True)
             permit = self.host_gate.acquire_request(self.stop_event)
             try:
                 with self.limiter.slot(self.stop_event):
                     if not self.host_gate.permit_is_current(permit):
                         self.host_gate.finish_request(permit, recovered=False)
                         continue
-                    response = self.transport.download(
-                        url, headers, destination, max_bytes, self.stop_event
-                    )
+                    if isinstance(self.transport, ResilientTransport):
+                        response = self.transport.download(
+                            url, headers, destination, max_bytes, self.stop_event,
+                            retain_partial=True, expected_digest=expected_digest,
+                        )
+                    else:
+                        response = self.transport.download(
+                            url, headers, destination, max_bytes, self.stop_event
+                        )
                 status = int(response.status)
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")
                 if status in {429, 503}:
-                    destination.unlink(missing_ok=True)
+                    self._discard_untracked_partial(destination)
                     retry_after = parse_retry_after(retry_after_header)
                     rate_attempt += 1
                     wait_seconds = self.host_gate.pause_for_rate_limit(retry_after, f"HTTP {status}")
@@ -394,7 +412,7 @@ class HttpClient:
 
                 self.host_gate.finish_request(permit, recovered=True)
                 if status >= 400:
-                    destination.unlink(missing_ok=True)
+                    self._discard_untracked_partial(destination)
                     if status not in RETRYABLE_STATUS:
                         raise RuntimeError(f"HTTP {status}: {url}")
                     generic_attempt += 1
@@ -418,11 +436,11 @@ class HttpClient:
                     "elapsed": response.elapsed,
                 }
             except (RateLimitDeferred, Stopped):
-                destination.unlink(missing_ok=True)
+                self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
             except RuntimeError as exc:
-                destination.unlink(missing_ok=True)
+                self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
                 if isinstance(exc, TransientRequestError):
                     raise
@@ -447,7 +465,7 @@ class HttpClient:
                     continue
                 raise
             except (httpx.HTTPError, urllib3.exceptions.HTTPError, TimeoutError, OSError) as exc:
-                destination.unlink(missing_ok=True)
+                self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
                 if is_missing_frozen_bundle_error(exc):
                     raise frozen_bundle_error_from_exception(exc) from exc
@@ -463,7 +481,7 @@ class HttpClient:
                     ) from exc
                 self.retry_wait(generic_attempt - 1, "read timeout" if timed_out else str(exc))
             except Exception:
-                destination.unlink(missing_ok=True)
+                self._discard_untracked_partial(destination)
                 self.host_gate.finish_request(permit, recovered=False)
                 raise
 
@@ -523,6 +541,8 @@ class HttpClient:
     @staticmethod
     def _cdx_json_body(data: bytes) -> bool:
         """Recognize a JSON body on a text-preferred endpoint without a re-GET."""
+        if bytes(data[:2]) == b"\x1f\x8b":
+            data = decode_cdx_encoded_body(data)
         prefix = bytes(data[:128]).lstrip(b"\xef\xbb\xbf \r\n\t")
         return prefix.startswith((b"[", b"{"))
 
@@ -874,8 +894,37 @@ def request_cdx_rows(
     )
     return parse_cdx_rows_payload(payload)
 
+def decode_cdx_encoded_body(data: bytes | bytearray, max_bytes: int = 256 * 1024 * 1024) -> bytes | bytearray:
+    """Handle servers/proxies that return a still-gzipped CDX representation.
+
+    The normal path is a two-byte prefix check and returns the original buffer.
+    Fully decoded JSON/text responses aren't copied. Decode errors must never
+    be interpreted as an empty CDX inventory.
+    """
+    if bytes(data[:2]) != b"\x1f\x8b":
+        return data
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as stream:
+            decoded = stream.read(max_bytes + 1)
+            if len(decoded) > max_bytes or stream.read(1):
+                raise ValueError("uncompressed CDX body exceeds safe byte budget")
+        return decoded
+    except (EOFError, OSError, ValueError, zlib.error) as exc:
+        raise MalformedCDXResponse(
+            f"CDX gzip body is incomplete/invalid or exceeds the safe byte budget: {exc}",
+            splittable=False,
+        ) from exc
+
+
 def parse_json_response(data: bytes, endpoint: str = "") -> object:
-    raw = data.decode("utf-8", "replace").lstrip("\ufeff").strip()
+    data = decode_cdx_encoded_body(data)
+    if bytes(data[:2]) in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            raw = data.decode("utf-16").lstrip("\ufeff").strip()
+        except UnicodeError as exc:
+            raise MalformedCDXResponse(f"Invalid UTF-16 CDX JSON: {exc}", splittable=False) from exc
+    else:
+        raw = data.decode("utf-8", "replace").lstrip("\ufeff").strip()
     if not raw:
         return []
     try:
@@ -971,6 +1020,12 @@ def parse_cdx_text_rows(
     """
     if not data:
         return CDXRows([])
+    data = decode_cdx_encoded_body(data)
+    # A gzip wrapper can hide a native JSON body even when the endpoint was
+    # requested in its efficient line-oriented representation.
+    json_prefix = bytes(data[:128]).lstrip(b"\xef\xbb\xbf \r\n\t")
+    if json_prefix.startswith((b"[", b"{")):
+        return parse_cdx_rows_payload(parse_json_response(data, endpoint))
     prefix = bytes(data[:1000]).lstrip(b"\xef\xbb\xbf").lower()
     if any(marker in prefix for marker in (b"<!doctype", b"<html", b"bad gateway", b"temporarily unavailable", b"too many requests")):
         preview = clean_space(bytes(data[:320]).decode("utf-8", "replace"))

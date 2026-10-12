@@ -134,11 +134,24 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
                 "hash": digest, "status": 200, "final_url": media_replay_url(row),
             }
     temp = path.with_name(path.name + ".part")
-    response = client.download_to_path(
-        media_replay_url(row),
-        temp,
-        config.media.max_file_bytes,
-    )
+    if isinstance(client, HttpClient):
+        try:
+            response = client.download_to_path(
+                media_replay_url(row), temp, config.media.max_file_bytes,
+                expected_digest=str(_media_row_value(row, "digest", "")),
+            )
+        except TypeError as exc:
+            # Compatibility with test/third-party clients that keep the old API.
+            # Never retry arbitrary TypeErrors from inside a real network call.
+            if "unexpected keyword argument" not in str(exc) or "expected_digest" not in str(exc):
+                raise
+            response = client.download_to_path(
+                media_replay_url(row), temp, config.media.max_file_bytes,
+            )
+    else:
+        response = client.download_to_path(
+            media_replay_url(row), temp, config.media.max_file_bytes,
+        )
     content_type = (
         response["headers"].get("content-type")
         or response["headers"].get("Content-Type")
@@ -431,10 +444,14 @@ def retry_media_errors(
     callback: Callable[[ProgressEvent], None] | None = None,
     media_capture_ids: list[int] | None = None,
 ) -> None:
-    clauses = ["resolved=0", "ignored=0", "retryable=1", "media_capture_id IS NOT NULL"]
-    params: list[object] = []
+    """Explicit bounded retry of recorded errors AND over-attempt pending work.
+
+    No unbounded Python ID list, no automatic sweep loop, and no changes to
+    normal acquisition eligibility. Retry pages are selected by stable ID.
+    """
     selected = media_capture_ids if media_capture_ids is not None else config.retry_media_capture_ids
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_retry_selection")
+    selection_sql = ""
     if selected:
         database.execute(
             "CREATE TEMP TABLE archive_scout_media_retry_selection(id INTEGER PRIMARY KEY) WITHOUT ROWID"
@@ -443,19 +460,25 @@ def retry_media_errors(
             "INSERT OR IGNORE INTO archive_scout_media_retry_selection(id) VALUES(?)",
             ((int(value),) for value in selected),
         )
-        clauses.append(
-            "EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=errors.media_capture_id)"
-        )
-    ids = [
-        int(row[0])
-        for row in database.execute(
-            "SELECT DISTINCT media_capture_id FROM errors WHERE "
-            + " AND ".join(clauses)
-            + " ORDER BY media_capture_id",
-            params,
-        )
-    ]
-    if callback:
-        callback(ProgressEvent("media_retry", f"Retrying {len(ids):,} errored media captures"))
-    if ids:
-        download_media(config, database, stop_event, callback, states=("error", "pending"), media_capture_ids=ids)
+        selection_sql = " AND EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=mc.id)"
+    last_id = 0
+    while True:
+        if stop_event.is_set():
+            raise Stopped
+        rows = database.execute(
+            """SELECT mc.id FROM media_captures mc WHERE mc.id>? AND
+                ((mc.state='error' AND EXISTS (
+                    SELECT 1 FROM errors e WHERE e.media_capture_id=mc.id
+                    AND e.resolved=0 AND e.ignored=0 AND e.retryable=1))
+                  OR (mc.state='pending' AND mc.download_attempts>=?))"""
+            + selection_sql + " ORDER BY mc.id LIMIT 1000",
+            (last_id, config.max_attempts),
+        ).fetchall()
+        if not rows:
+            break
+        ids = [int(row[0]) for row in rows]
+        last_id = ids[-1]
+        if callback:
+            callback(ProgressEvent("media_retry", f"Retrying {len(ids):,} errored or attempt-exhausted media captures"))
+        download_media(config, database, stop_event, callback,
+                       states=("error", "pending"), media_capture_ids=ids)

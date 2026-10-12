@@ -75,12 +75,32 @@ def generate_media_reports(config: ProjectConfig, database: sqlite3.Connection) 
     unresolved_count = int(database.execute(
         "SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0 AND media_capture_id IS NOT NULL"
     ).fetchone()[0])
+    over_attempt = int(database.execute(
+        "SELECT COUNT(*) FROM media_captures WHERE state='pending' AND download_attempts>=?",
+        (config.max_attempts,),
+    ).fetchone()[0])
+    path = reports / "media_unfinished_over_attempts.tsv"
+    atomic_write_lines(path, (
+        f"{r['id']}\t{r['download_attempts']}\t{r['timestamp']}\t{r['original_url']}"
+        for r in database.execute(
+            "SELECT id,download_attempts,timestamp,original_url FROM media_captures "
+            "WHERE state='pending' AND download_attempts>=? ORDER BY id",
+            (config.max_attempts,),
+        )
+    ))
+    paths["media_unfinished_over_attempts"] = path
+    over_attempt_errors = int(database.execute(
+        "SELECT COUNT(*) FROM media_captures WHERE state='error' AND download_attempts>=?",
+        (config.max_attempts,),
+    ).fetchone()[0])
     summary = [
         "Scout media report",
         f"Generated: {utc_now()}",
         f"Indexed media captures: {indexed_count:,}",
         f"Downloaded: {counts.get('downloaded', 0):,}",
         f"Pending: {counts.get('pending', 0):,}",
+        f"Pending excluded by attempt ceiling (UNFINISHED): {over_attempt:,}",
+        f"Errors with exhausted attempts (UNFINISHED): {over_attempt_errors:,}",
         f"Errors: {counts.get('error', 0):,}",
         f"Unresolved media errors: {unresolved_count:,}",
         f"Snapshot strategy: {config.media.snapshot_strategy}",

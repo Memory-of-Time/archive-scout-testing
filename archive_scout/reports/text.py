@@ -108,12 +108,27 @@ def _indexed_inventory_lines(database: sqlite3.Connection, fields: list[str]) ->
         yield "\t".join(values[name] for name in fields if name in values)
 
 
+def _write_over_attempt_inventory(config: ProjectConfig, database: sqlite3.Connection, root: Path) -> Path:
+    """Report unreachable-by-normal-queue work only when reports are requested."""
+    path = root / "unfinished_over_attempts.tsv"
+    atomic_write_lines(path, (
+        f"{row['id']}\t{row['download_attempts']}\t{row['state']}\t{row['timestamp']}\t{row['original_url']}"
+        for row in database.execute(
+            "SELECT id,download_attempts,state,timestamp,original_url FROM captures "
+            "WHERE state IN ('pending','error') AND download_attempts>=? ORDER BY id",
+            (config.max_attempts,),
+        )
+    ))
+    return path
+
+
 def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) -> dict[str, Path]:
     """Index-only reports; disabled outputs never execute their payload queries."""
     opts = _report_settings(config)
     root = config.output_dir / "reports"
     root.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
+    paths["unfinished_over_attempts"] = _write_over_attempt_inventory(config, database, root)
     if opts.output_enabled("all_indexed_urls"):
         _write_selected(root,None,"all_indexed_urls",
                         _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
+import base64
 import os
 import shutil
 import socket
@@ -185,6 +188,7 @@ def _write_limited(
     max_bytes: int,
     stop_event: threading.Event,
     preview_bytes: int = 20_000,
+    preserve_on_stream_error: bool = False,
 ) -> tuple[int, str, bytes]:
     destination.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
@@ -205,9 +209,159 @@ def _write_limited(
                 if len(preview) < preview_bytes:
                     preview.extend(chunk[: preview_bytes - len(preview)])
         return total, digest.hexdigest(), bytes(preview)
+    except (Stopped, httpx.HTTPError, urllib3.exceptions.HTTPError, OSError, TimeoutError):
+        if not preserve_on_stream_error:
+            destination.unlink(missing_ok=True)
+        raise
     except Exception:
         destination.unlink(missing_ok=True)
         raise
+
+
+def _partial_metadata_path(destination: Path) -> Path:
+    return destination.with_name(destination.name + ".resume.json")
+
+
+def _valid_cdx_digest(value: str) -> str:
+    value = str(value or "").upper().rstrip("=")
+    return value if re.fullmatch(r"[A-Z2-7]{32}", value) else ""
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _save_partial_metadata(destination: Path, url: str, final_url: str,
+                           headers: dict, expected_total: int) -> None:
+    """Commit a resumable prefix record after a failed full transfer only."""
+    size = destination.stat().st_size if destination.exists() else 0
+    encoding = str(headers.get("content-encoding", "identity")).casefold()
+    if not (0 < size < expected_total and final_url == url
+            and encoding in {"", "identity"}):
+        destination.unlink(missing_ok=True)
+        return
+    metadata = {
+        "url": url, "final_url": final_url, "size": size, "total": expected_total,
+        "etag": str(headers.get("etag") or ""),
+        "last_modified": str(headers.get("last-modified") or ""),
+        "sha256": _file_sha256(destination),
+    }
+    metadata_path = _partial_metadata_path(destination)
+    staging = metadata_path.with_name(metadata_path.name + ".tmp")
+    try:
+        staging.write_text(json.dumps(metadata, separators=(",", ":")), encoding="utf-8")
+        os.replace(staging, metadata_path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def _discard_partial(destination: Path) -> None:
+    destination.unlink(missing_ok=True)
+    _partial_metadata_path(destination).unlink(missing_ok=True)
+
+
+def _resume_partial_httpx(backend, url: str, headers: dict, destination: Path,
+                          max_bytes: int, stop_event: threading.Event,
+                          expected_digest: str = "") -> TransportFileResponse | None:
+    """Failure-only Range continuation. Never append if the identity is uncertain.
+
+    Return None to start a fresh full request. Preserve the prefix on temporary
+    transfer failures. All accepted 206 bodies match the saved offset and total.
+    """
+    meta_path = _partial_metadata_path(destination)
+    if not meta_path.is_file() or not destination.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        size = destination.stat().st_size
+        total = int(meta["total"])
+        if (meta["url"] != url or meta["final_url"] != url or
+                size != int(meta["size"]) or not 0 < size < total <= max_bytes or
+                _file_sha256(destination) != meta["sha256"]):
+            _discard_partial(destination)
+            return None
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        _discard_partial(destination)
+        return None
+    digest_expected = _valid_cdx_digest(expected_digest)
+    etag = str(meta.get("etag") or "")
+    strong_etag = etag if etag and not etag.startswith("W/") else ""
+    if not strong_etag and not digest_expected:
+        # No reliable identity validator; repeating a complete request is safer.
+        _discard_partial(destination)
+        return None
+    request_headers = dict(headers)
+    request_headers["Range"] = f"bytes={size}-"
+    request_headers["Accept-Encoding"] = "identity"
+    if strong_etag:
+        request_headers["If-Range"] = strong_etag
+    started = time.monotonic()
+    with backend.client.stream("GET", url, headers=request_headers, follow_redirects=False) as response:
+        status = int(response.status_code)
+        if status != 206:
+            if status in {429, 503}:
+                raise RuntimeError(f"Range recovery returned HTTP {status}; prefix preserved")
+            _discard_partial(destination)
+            return None
+        fields = _copy_headers(response.headers.items())
+        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", fields.get("content-range", "").strip())
+        if (not match or fields.get("content-encoding", "identity").casefold() not in {"", "identity"}
+                or str(response.url) != url):
+            _discard_partial(destination)
+            return None
+        start, end, length = map(int, match.groups())
+        if start != size or end + 1 != length or length != total:
+            _discard_partial(destination)
+            return None
+        new_etag = fields.get("etag", "")
+        if strong_etag and new_etag and new_etag != strong_etag:
+            _discard_partial(destination)
+            return None
+        # Derive the complete-file digests on this exceptional path only.
+        sha256 = hashlib.sha256()
+        sha1 = hashlib.sha1()
+        preview = bytearray()
+        with destination.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                sha256.update(chunk)
+                sha1.update(chunk)
+                if len(preview) < 20_000:
+                    preview.extend(chunk[:20_000 - len(preview)])
+        written = size
+        try:
+            with destination.open("ab") as stream:
+                for chunk in response.iter_bytes(1024 * 1024):
+                    if stop_event.is_set():
+                        raise Stopped
+                    written += len(chunk)
+                    if written > total:
+                        raise ValueError("Range body exceeds the advertised total")
+                    stream.write(chunk)
+                    sha256.update(chunk)
+                    sha1.update(chunk)
+                    if len(preview) < 20_000:
+                        preview.extend(chunk[:20_000 - len(preview)])
+        except (Stopped, httpx.HTTPError, TimeoutError, OSError):
+            # The last bytes came from a validated range of this exact body.
+            # Persist the newly accumulated prefix for a later retry.
+            _save_partial_metadata(destination, url, url, fields, total)
+            raise
+        if written != total:
+            _save_partial_metadata(destination, url, url, fields, total)
+            raise httpx.RemoteProtocolError("Incomplete 206 response; prefix preserved")
+        if digest_expected and base64.b32encode(sha1.digest()).decode("ascii").rstrip("=") != digest_expected:
+            _discard_partial(destination)
+            raise ValueError("Range-completed media disagrees with indexed CDX digest; never publish")
+        meta_path.unlink(missing_ok=True)
+        return TransportFileResponse(
+            status=200, headers=fields, final_url=url, path=destination,
+            bytes_written=written, content_hash=sha256.hexdigest(),
+            preview=bytes(preview), backend="httpx-range", elapsed=time.monotonic() - started,
+        )
 
 
 def _copy_headers(items: Iterable[tuple[object, object]]) -> dict[str, str]:
@@ -288,16 +442,41 @@ class HttpxBackend:
         destination: Path,
         max_bytes: int,
         stop_event: threading.Event,
+        *,
+        retain_partial: bool = False,
+        expected_digest: str = "",
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
+        if retain_partial and _partial_metadata_path(destination).exists():
+            resumed = _resume_partial_httpx(
+                self, url, headers, destination, max_bytes, stop_event, expected_digest
+            )
+            if resumed is not None:
+                return resumed
         started = time.monotonic()
-        with self.client.stream("GET", url, headers=headers) as response:
+        # Range requires byte-identity: never retain compressed representations.
+        request_headers = dict(headers)
+        if retain_partial:
+            request_headers["Accept-Encoding"] = "identity"
+        with self.client.stream("GET", url, headers=request_headers) as response:
             announced = response.headers.get("Content-Length")
             if announced and announced.isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-            total, content_hash, preview = _write_limited(
-                response.iter_bytes(1024 * 1024), destination, max_bytes, stop_event
-            )
+            try:
+                total, content_hash, preview = _write_limited(
+                    response.iter_bytes(64 * 1024 if retain_partial else 1024 * 1024),
+                    destination, max_bytes, stop_event,
+                    preserve_on_stream_error=retain_partial,
+                )
+            except (Stopped, httpx.HTTPError, OSError, TimeoutError):
+                announced = response.headers.get("Content-Length", "")
+                if (retain_partial and int(response.status_code) == 200 and
+                        announced.isdigit() and int(announced) <= max_bytes):
+                    _save_partial_metadata(destination, url, str(response.url),
+                                           _copy_headers(response.headers.items()), int(announced))
+                else:
+                    _discard_partial(destination)
+                raise
             return TransportFileResponse(
                 status=int(response.status_code),
                 headers=_copy_headers(response.headers.items()),
@@ -770,14 +949,25 @@ class ResilientTransport:
         destination: Path,
         max_bytes: int,
         stop_event: threading.Event,
+        *,
+        retain_partial: bool = False,
+        expected_digest: str = "",
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
-        for name in self._ordered_names():
+        names = (["httpx"] if retain_partial and _partial_metadata_path(destination).is_file()
+                 and "httpx" in self.backends else self._ordered_names())
+        for name in names:
             if stop_event.is_set():
                 raise Stopped
             backend = self.backends[name]
             try:
-                response = backend.download(url, headers, destination, max_bytes, stop_event)
+                if name == "httpx" and retain_partial:
+                    response = backend.download(
+                        url, headers, destination, max_bytes, stop_event,
+                        retain_partial=True, expected_digest=expected_digest,
+                    )
+                else:
+                    response = backend.download(url, headers, destination, max_bytes, stop_event)
                 with self.lock:
                     changed = self.last_success != name
                     self.last_success = name
@@ -793,10 +983,17 @@ class ResilientTransport:
                 failures.append((name, exc))
             except Exception as exc:
                 failures.append((name, exc))
-            destination.unlink(missing_ok=True)
+            partial_ready = bool(retain_partial and _partial_metadata_path(destination).is_file()
+                                 and destination.is_file())
+            if not partial_ready:
+                destination.unlink(missing_ok=True)
             with self.lock:
-                self.cooldown_until[name] = time.monotonic() + 30.0
+                if not partial_ready:
+                    self.cooldown_until[name] = time.monotonic() + 30.0
             last_error = failures[-1][1]
+            if partial_ready:
+                # Never overwrite an identity-bound prefix with another backend.
+                break
             if is_transport_read_timeout(last_error):
                 if self.callback:
                     self.callback(
