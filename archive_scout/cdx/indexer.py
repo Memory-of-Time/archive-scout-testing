@@ -642,11 +642,27 @@ def _adopt_compatible_range_coverage(
 
 
 def _record_network_event(database: sqlite3.Connection, stage: str, message: str, details: dict | None = None) -> None:
+    """Bound detailed incident storage but retain durable aggregate history."""
+    import hashlib
+    now = utc_now()
+    # Host-specific error strings often vary per URL. Group conservatively by
+    # stage and message prefix, not by throwing away capture evidence.
+    identity = hashlib.sha256((stage + "\0" + message[:200]).encode("utf-8", "replace")).hexdigest()[:20]
     try:
+        database.execute("""INSERT INTO network_event_summaries
+            (date,stage,message_fingerprint,sample_message,occurrence_count,first_seen,last_seen)
+            VALUES(?,?,?,?,1,?,?) ON CONFLICT(date,stage,message_fingerprint) DO UPDATE SET
+            occurrence_count=occurrence_count+1,last_seen=excluded.last_seen""",
+            (now[:10],stage,identity,message[:500],now,now))
         database.execute(
             "INSERT INTO network_events(stage,message,details_json,created_at) VALUES(?,?,?,?)",
-            (stage, message, json.dumps(details or {}, ensure_ascii=False, sort_keys=True), utc_now()),
+            (stage, message, json.dumps(details or {}, ensure_ascii=False, sort_keys=True), now),
         )
+        # Every 256th event, trim a bounded span by indexed primary key; this
+        # does not affect preserved capture errors, checkpoints or source files.
+        if database.execute("SELECT last_insert_rowid()").fetchone()[0] % 256 == 0:
+            database.execute("""DELETE FROM network_events WHERE id <
+                (SELECT COALESCE(MAX(id),0)-10000 FROM network_events)""")
     except sqlite3.OperationalError:
         pass
 
@@ -942,6 +958,23 @@ def _request_resume(
         if next_resume == current.resume_key:
             raise TransientRequestError("CDX returned the same resume key twice", splittable=True)
         return rows, False, next_resume
+    # If the service returned exactly a full requested page but omitted the
+    # resume token, exhaustion and a clean-prefix truncation look identical.
+    # Confirm once through alternate serialization, never silently advance a
+    # checkpoint whose continuation evidence is contradictory.
+    if len(rows) >= page_size and isinstance(client, HttpClient):
+        confirmation = request_cdx_rows(
+            client, cdx_endpoints(config),
+            build_cdx_params(config, target, current.start, current.end,
+                             current.resume_key, page_size=page_size),
+            max_bytes=cdx_response_budget(page_size), prefer_text=False,
+        )
+        if (confirmation.resume_key or len(confirmation.rows) != len(rows)
+                or confirmation.rows[:3] != rows[:3]
+                or confirmation.rows[-3:] != rows[-3:]):
+            raise MalformedCDXResponse(
+                "Full-sized CDX page had no continuation token and alternate "
+                "serialization did not confirm terminal membership", splittable=False)
     return rows, True, None
 
 

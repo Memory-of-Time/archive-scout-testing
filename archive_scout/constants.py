@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 SCHEMA_VERSION = 9
 APP_NAME = "Scout"
 CDX_URL = "https://web.archive.org/cdx/search/cdx"

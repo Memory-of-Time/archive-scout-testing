@@ -1,5 +1,17 @@
 # Changelog
 
+## Scout 1.2.4 — durable acquisition and audit integration
+
+- Persist per-capture transient-retry eligibility and preserve fair, resumable acquisition during outages; default operation automatically rechecks scheduled work until stopped.
+- Stream replay bytes to identity-bound atomic files, keep local scans on a separate bounded worker pipeline, and verify retained SHA-256, response MIME and length before scoring.
+- Make repeated project merges WAL-snapshot-consistent and source-ID-mapped, so already merged scan runs, notes and files are not duplicated on subsequent merges; refuse unsafe legacy remerge without ID reconciliation.
+- Coordinate one backend recovery probe at a time, rate-limit fallback connections, preserve proxy policy and close streamed redirect responses promptly.
+- Retain only bounded granular CDX diagnostic events and aggregate older incident counts; confirm suspicious full terminal CDX pages once before marking complete.
+- Distinguish connect, pool and read timeouts, track network/FS/DB hot-path timing, and preserve successful text/media classification and recovery settings.
+- Never delete or guess at already completed historical collapsed CDX selections; canonical URL key evidence is required for a true reconciliation.
+- Preserve schema-9 databases, existing project state, scan history, and Windows/macOS/Linux source compatibility.
+- See `docs/SCOUT_1_2_4_AUDIT_IMPLEMENTATION.md` for verification and substantial remaining limitations.
+
 ## Scout 1.2.3 — Acquisition/indexing integrity (incremental patch)
 
 - Route the 76 explicitly requested known non-text suffixes away from text acquisition even when Wayback reports `text/html`; retain evidence of MIME contradictions and descriptors/audio provenance.

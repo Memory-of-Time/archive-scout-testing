@@ -30,8 +30,9 @@ from ..scanning.scoring import analyze_content, prepare_analysis_fields
 from ..utils import atomic_write_bytes, hash_text, normalize_search, utc_now
 from .rate_limit import SharedFixedRateLimiter, shared_host_gate
 from .validation import classify_exception
+from .schedule import record_failure, clear_retry
 from .redirects import make_replay_redirect_validator
-from ..network.transports import RedirectPolicyError
+from ..network.transports import RedirectPolicyError, ResilientTransport
 
 
 class StorageFullError(OSError):
@@ -181,11 +182,21 @@ def prepare_download_rows(
         source += " JOIN targets t ON t.id=c.target_id"
         clauses.extend(["""EXISTS (SELECT 1 FROM archive_scout_download_scopes s
             WHERE s.pattern=t.pattern AND s.signature=c.query_signature)""",
-            "c.download_attempts<?"])
+            "(c.download_attempts<? OR c.state='error')"])
         params.append(config.max_attempts)
     if states:
         clauses.append("c.state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)
+        if "error" in states and not capture_ids:
+            # Revisit *due* transient failures fairly with untouched captures,
+            # without retrying permanent exclusions or ignoring time budgets.
+            clauses.append("""(c.state!='error' OR (
+                EXISTS (SELECT 1 FROM errors e WHERE e.capture_id=c.id
+                        AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
+                AND (NOT EXISTS(SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=c.id)
+                     OR EXISTS(SELECT 1 FROM text_retry_schedule s WHERE s.capture_id=c.id
+                                AND s.next_eligible_at<=?))))""")
+            params.append(time.time())
 
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     cursor = database.execute(
@@ -331,7 +342,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
         return {"capture_id": int(row["id"]), "path": path,
                 "bytes_saved": len(data), "content_hash": hashlib.sha256(data).hexdigest(),
                 "http_status": response["status"], "final_url": response["final_url"],
-                "deferred_scan": True}
+                "response_content_type": content_type, "deferred_scan": True}
     title, visible, links = parse_page(raw, original)
     # Avoid a second full HTML parser pass in the download hot path. The page
     # parser above already found ordinary attributes; this lightweight source
@@ -361,7 +372,73 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
         "bytes_saved": len(data),
         "http_status": response["status"],
         "final_url": response["final_url"],
+        "response_content_type": content_type,
     }
+
+
+def fetch_retain_streamed(row: sqlite3.Row, config: ProjectConfig, client: HttpClient) -> dict:
+    """Stream the full replay to a capture-identity-bound staging file.
+
+    Only a bounded payload prefix is retained in memory. The complete raw
+    response is never published until transport completeness, content routing,
+    and Wayback shell checks have passed. The local scanner handles full text.
+    """
+    acquisition_started = time.monotonic()
+    original = str(row["original_url"])
+    path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
+    stage = path.with_name(path.name + ".transfer")
+    stage.parent.mkdir(parents=True, exist_ok=True)
+    # No unvalidated prefix may be reused as if it were a complete capture.
+    stage.unlink(missing_ok=True)
+    try:
+        response = client.download_to_path(
+            replay_url(row["timestamp"], original), stage, config.max_file_bytes,
+            redirect_validator=make_replay_redirect_validator(config, original),
+            **({"retain_partial": False} if isinstance(client, HttpClient) else {}),
+        )
+        content_type = (response["headers"].get("content-type") or
+                        response["headers"].get("Content-Type") or row["mimetype"] or "")
+        preview = response["preview"]
+        decision = classify_payload_kind(preview, content_type, original)
+        if decision.resource_class not in {"text", "media_descriptor"}:
+            raise NonTextResponse(decision.resource_class, decision.reason, content_type)
+        # A recognizable archive error shell is not a saved original document.
+        preview_text = decode_bytes(preview, content_type)
+        replay_problem = classify_replay_content(preview_text, response["final_url"])
+        if replay_problem:
+            raise RuntimeError(replay_problem)
+        if int(response["bytes"]) != stage.stat().st_size:
+            raise OSError("streamed replay byte count differs from retained file")
+        publish_started = time.monotonic()
+        with stage.open("rb+") as stream:
+            os.fsync(stream.fileno())
+        os.replace(stage, path)
+        publish_seconds = time.monotonic() - publish_started
+        return {"network_and_pacing_seconds": publish_started-acquisition_started,
+            "file_fsync_publish_seconds": publish_seconds, "capture_id": int(row["id"]), "path": path,
+            "bytes_saved": int(response["bytes"]), "content_hash": response["content_hash"],
+            "http_status": response["status"], "final_url": response["final_url"],
+            "response_content_type": content_type, "deferred_scan": True}
+    finally:
+        # A partial text replay is NOT a resumable media transfer.  Discard
+        # both its bytes and HTTPX range/ETag sidecar.  A stale sidecar without
+        # its prefix could otherwise cause a future request to attempt an
+        # invalid partial replay or leak per-capture staging metadata.
+        stage.unlink(missing_ok=True)
+        stage.with_name(stage.name + ".resume.json").unlink(missing_ok=True)
+
+
+def _save_payload_evidence(database: sqlite3.Connection, result: dict) -> None:
+    database.execute("""INSERT INTO capture_payload_evidence
+        (capture_id,content_hash,bytes_saved,response_content_type,final_url,response_status,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(capture_id) DO UPDATE SET
+        content_hash=excluded.content_hash,bytes_saved=excluded.bytes_saved,
+        response_content_type=excluded.response_content_type,
+        final_url=excluded.final_url,response_status=excluded.response_status,
+        updated_at=excluded.updated_at""", (int(result["capture_id"]),
+        str(result["content_hash"]),int(result["bytes_saved"]),
+        str(result.get("response_content_type") or ""),str(result.get("final_url") or ""),
+        int(result["http_status"]),utc_now()))
 
 
 def save_success(database: sqlite3.Connection, result: dict) -> None:
@@ -377,6 +454,8 @@ def save_success(database: sqlite3.Connection, result: dict) -> None:
                        confident=1,routing='downloaded_awaiting_scan',updated_at=? WHERE capture_id=?""",
                 (utc_now(),result["capture_id"]),
             )
+            _save_payload_evidence(database, result)
+            clear_retry(database, result["capture_id"])
         return
     with database:
         document_id = upsert_document(
@@ -397,6 +476,8 @@ def save_success(database: sqlite3.Connection, result: dict) -> None:
         for scan_run_id, analysis in result["analyses"].items():
             save_match(database, int(scan_run_id), document_id, analysis)
         resolve_errors(database, capture_id=result["capture_id"], document_id=document_id)
+        _save_payload_evidence(database, result)
+        clear_retry(database, result["capture_id"])
 
 
 def download_archive(
@@ -479,8 +560,57 @@ def download_archive(
         connection_retry_seconds=config.network.connection_retry_seconds,
         network_callback=(lambda message: callback(ProgressEvent("network", message)) if callback else None),
     )
+    # The network pool should retain validated bytes, not burn connection slots
+    # on HTML parsing and keyword matching. A separate local scanner commits
+    # score-zero coverage and matches with its own WAL connection.
+    # SQLite WAL allows concurrent readers, but only one writer.  Guard the
+    # two owner threads' short write transactions; a busy scanner must not
+    # abort a multi-day acquisition or force another network retrieval.
+    database_write_lock = threading.Lock()
+    scanner_wakeup = threading.Event()
+    scanner_finish = threading.Event()
+    scanner_failures: list[BaseException] = []
+    scanner_thread = None
+    if jobs and not acquire_only:
+        def local_scanner() -> None:
+            from ..scanning.pending import scan_pending_saved
+            from ..database.connection import DATABASE_NAME
+            connection = sqlite3.connect(config.output_dir / DATABASE_NAME, timeout=60)
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA busy_timeout=60000")
+                connection.execute("PRAGMA temp_store=FILE")
+                while not stop_event.is_set():
+                    scanner_wakeup.wait(2.0)
+                    scanner_wakeup.clear()
+                    for target in config.targets:
+                        if stop_event.is_set():
+                            break
+                        # Bounded per-document bytes and CPU-side worker count;
+                        # do not multiply network worker thread count here.
+                        scan_pending_saved(connection, config.for_target(target), jobs,
+                            stop_event, callback, workers=max(1, min(4, (os.cpu_count() or 2)//2)),
+                            write_lock=database_write_lock)
+                    if scanner_finish.is_set():
+                        break
+            except Stopped:
+                pass
+            except BaseException as exc:
+                scanner_failures.append(exc)
+            finally:
+                connection.close()
+        scanner_thread = threading.Thread(target=local_scanner,
+                         name="archive-scout-local-scan-supervisor", daemon=False)
+        scanner_thread.start()
+        scanner_wakeup.set()
     completed = matched = failures = saved_this_pass = 0
     recent_commits: deque[float] = deque()
+    stage_stats = {"network_and_pacing_seconds": 0.0,
+                   "file_fsync_publish_seconds": 0.0,
+                   "database_commit_seconds": 0.0,
+                   "samples": 0}
     started = time.monotonic()
     max_inflight = max(config.workers, config.workers * 2)
     last_completion = time.monotonic()
@@ -506,13 +636,23 @@ def download_archive(
                 if not rows:
                     return
                 now = utc_now()
-                with database:
+                with database_write_lock, database:
                     database.executemany(
                         "UPDATE captures SET state='downloading',download_attempts=download_attempts+1,updated_at=? WHERE id=?",
                         ((now, int(row["id"])) for row in rows),
                     )
                 for row in rows:
-                    futures[pool.submit(fetch_parse_scan, row, config, jobs, client, not acquire_only)] = row
+                    # Real network acquisition streams directly to disk.
+                    # Nonstandard fixture transports retain the established
+                    # memory-based API for compatible plugins/tests.
+                    streamed = (isinstance(getattr(client, "transport", None), ResilientTransport)
+                        and getattr(type(client).get, "__module__", "") == "archive_scout.cdx.client")
+                    worker = fetch_retain_streamed if streamed else fetch_parse_scan
+                    if streamed:
+                        futures[pool.submit(worker, row, config, client)] = row
+                    else:
+                        futures[pool.submit(worker, row, config, jobs, client,
+                            False if scanner_thread is not None else not acquire_only)] = row
     
             submit_available()
             while futures:
@@ -543,7 +683,13 @@ def download_archive(
                     try:
                         result = future.result()
                         try:
-                            save_success(database, result)
+                            commit_started = time.monotonic()
+                            with database_write_lock:
+                                save_success(database, result)
+                            stage_stats["samples"] += 1
+                            stage_stats["database_commit_seconds"] += time.monotonic()-commit_started
+                            for stage in ("network_and_pacing_seconds", "file_fsync_publish_seconds"):
+                                stage_stats[stage] += float(result.get(stage, 0.0))
                         except Exception:
                             # The atomic body exists even if an INSERT or FTS
                             # write failed. Save an independent scan checkpoint
@@ -552,7 +698,7 @@ def download_archive(
                             path = Path(result.get("path", ""))
                             if path.is_file() and path.stat().st_size == result.get("bytes_saved"):
                                 try:
-                                    with database:
+                                    with database_write_lock, database:
                                         database.execute(
                                             """UPDATE captures SET state='downloaded_unscanned',
                                                bytes_saved=?,http_status=?,final_url=?,updated_at=? WHERE id=?""",
@@ -563,6 +709,8 @@ def download_archive(
                                     pass  # Backstop: adopt exact ID-bound file at next run.
                             raise
                         saved_this_pass += 1
+                        if scanner_thread is not None:
+                            scanner_wakeup.set()
                         last_save = time.monotonic()
                         recent_commits.append(last_save)
                         if "analyses" in result:
@@ -572,7 +720,7 @@ def download_archive(
                                 for analysis in result["analyses"].values()
                             ))
                     except NonTextResponse as exc:
-                        with database:
+                        with database_write_lock, database:
                             database.execute("UPDATE captures SET state='skipped',updated_at=? WHERE id=?", (utc_now(),row["id"]))
                             database.execute(
                                 """INSERT INTO capture_routing(capture_id,resource_class,evidence,confident,routing,updated_at)
@@ -600,7 +748,7 @@ def download_archive(
                                 )
                     except RateLimitDeferred:
                         stop_event.set()
-                        with database:
+                        with database_write_lock, database:
                             database.execute(
                                 """UPDATE captures SET state='pending',
                                    download_attempts=CASE WHEN download_attempts>0 THEN download_attempts-1 ELSE 0 END,
@@ -611,7 +759,7 @@ def download_archive(
                             pending.cancel()
                         raise
                     except Stopped:
-                        with database:
+                        with database_write_lock, database:
                             database.execute("UPDATE captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))
                         raise
                     except Exception as exc:
@@ -629,7 +777,7 @@ def download_archive(
                         issue_message = site_issue_message(
                             category, str(row["original_url"]), "text download", status
                         )
-                        with database:
+                        with database_write_lock, database:
                             database.execute(
                                 """UPDATE captures SET state='error',http_status=?,
                                    final_url=COALESCE(?,final_url),updated_at=?
@@ -650,6 +798,9 @@ def download_archive(
                                 http_status=status,
                                 retryable=retryable,
                             )
+                            record_failure(database, int(row["id"]), category, status, retryable,
+                                           config.network.retry_base_seconds,
+                                           config.network.retry_max_seconds)
                             if should_surface_site_issue(category):
                                 record_site_issue(
                                     database,
@@ -679,7 +830,7 @@ def download_archive(
                                 "download",
                                 f"Processed {cumulative_completed:,}/{cumulative_total:,}; "
                                 f"this pass {completed:,}/{total:,}; newly saved {saved_this_pass:,}; "
-                                f"matches {matched:,}; errors {failures:,}; recent successful saves {rate:.1f}/s (30s); "
+                                f"matches committed asynchronously; errors {failures:,}; recent successful saves {rate:.1f}/s (30s); "
                                 f"whole-pass average {invocation_rate:.1f}/s",
                                 cumulative_completed,
                                 cumulative_total,
@@ -690,13 +841,28 @@ def download_archive(
                                     "rolling_save_rate_30s": rate,
                                     "invocation_save_rate": invocation_rate,
                                     "new_saves": saved_this_pass,
+                                    "timing_samples": stage_stats["samples"],
+                                    "avg_acquisition_seconds": (stage_stats["network_and_pacing_seconds"] /
+                                        max(1, stage_stats["samples"])),
+                                    "avg_fsync_publish_seconds": (stage_stats["file_fsync_publish_seconds"] /
+                                        max(1, stage_stats["samples"])),
+                                    "avg_database_commit_seconds": (stage_stats["database_commit_seconds"] /
+                                        max(1, stage_stats["samples"])),
                                 },
                             )
                         )
                     submit_available()
     finally:
+        # Drain local scans on clean completion, but honor Stop promptly.
+        scanner_finish.set()
+        scanner_wakeup.set()
+        if scanner_thread is not None:
+            scanner_thread.join()
         client.close()
-    # Decouple complete HTML/source scanning from network request workers.
+    if scanner_failures:
+        raise RuntimeError("background scanner failed; retained bodies remain recoverable") from scanner_failures[0]
+    # Final safeguard catches a small race between the last network commit and
+    # the scanner wakeup; it does no work when the background drain succeeded.
     if not acquire_only:
         from ..scanning.pending import scan_pending_saved
         for target in config.targets:

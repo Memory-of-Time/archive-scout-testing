@@ -267,10 +267,13 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
                    WHERE s.pattern=t.pattern AND s.signature=c.query_signature)
                AND ((c.state='error' AND EXISTS (
                    SELECT 1 FROM errors e WHERE e.capture_id=c.id
-                   AND e.resolved=0 AND e.ignored=0 AND e.retryable=1))"""
+                   AND e.resolved=0 AND e.ignored=0 AND e.retryable=1)
+                   AND (NOT EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id)
+                        OR EXISTS (SELECT 1 FROM text_retry_schedule sched WHERE sched.capture_id=c.id
+                                   AND sched.next_eligible_at<=?)))"""
             + exhausted + ") ORDER BY c.id LIMIT ?",
-            (last_id, config.max_attempts, batch_size)
-            if include_exhausted_pending else (last_id, batch_size),
+            (last_id, time.time(), config.max_attempts, batch_size)
+            if include_exhausted_pending else (last_id, time.time(), batch_size),
         ).fetchall()
         if not rows:
             return
@@ -332,7 +335,24 @@ def recover_transient_text_errors(
         # a project-sized COUNT inside the hot capture-saving loop.
         remaining = next(_retryable_text_batches(config, database, batch_size=1), [])
         if not remaining:
-            return 0
+            from .downloads.schedule import next_due
+            scheduled_due = next_due(database, config)
+            if scheduled_due is None:
+                return 0
+            if not continuous or not config.network.persistent_retries:
+                return 1  # deferred work remains; never declare complete
+            if jobs and not acquire_only:
+                from .scanning.pending import scan_pending_saved
+                for target in config.targets:
+                    scan_pending_saved(database, config.for_target(target), jobs,
+                                       stop_event, callback, workers=config.workers)
+            wait_seconds = min(config.network.retry_max_seconds,
+                               max(0.05, scheduled_due - time.time()))
+            emit(callback, ProgressEvent("download_retry",
+                f"Transient errors are checkpointed; next eligible retry in {wait_seconds:.1f}s"))
+            if stop_event.wait(wait_seconds):
+                raise Stopped
+            continue
         if not continuous or not config.network.persistent_retries:
             return len(remaining)  # some retryable work is still incomplete
         # Local scanner remains eligible while network admission is cooling.
@@ -346,9 +366,11 @@ def recover_transient_text_errors(
         else:
             failures_without_progress = 0
         previous_remaining = attempted
+        from .downloads.schedule import next_due
+        earliest = next_due(database, config)
         pause = min(config.network.retry_max_seconds,
-                    max(1.0, config.network.retry_base_seconds) *
-                    2 ** min(8, max(0, failures_without_progress - 1)))
+                    max(0.05, (earliest-time.time()) if earliest is not None else
+                        config.network.retry_base_seconds))
         emit(callback, ProgressEvent(
             "download_retry", f"Temporary download failures remain. Work is checkpointed; "
             f"recovery sweep resumes in {pause:.1f}s. Local scanning is independent."))
@@ -607,7 +629,7 @@ def run_project(
         if mode in {"download_only", "retry_download_errors"}:
             if mode == "download_only":
                 download_archive(config, database, 0, stop_event, callback,
-                                 states=("pending",), acquire_only=True)
+                                 states=("pending", "error"), acquire_only=True)
                 recover_transient_text_errors(config, database, 0, [], stop_event,
                                               callback, continuous=True, acquire_only=True)
             else:
@@ -633,9 +655,9 @@ def run_project(
                 scan_prior_documents_once(database, jobs, config, stop_event, callback)
         primary_run_id = jobs[0].scan_run_id
         if mode in {"all", "external_media_after_scan"}:
-            download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
+            download_archive(config, database, primary_run_id, stop_event, callback, states=("pending", "error"), scan_jobs=jobs)
         elif mode in {"download", "resume"}:
-            download_archive(config, database, primary_run_id, stop_event, callback, states=("pending",), scan_jobs=jobs)
+            download_archive(config, database, primary_run_id, stop_event, callback, states=("pending", "error"), scan_jobs=jobs)
         elif mode == "rescan":
             # Existing document rows and saved-but-unscanned bodies are both
             # part of the searchable inventory.  Scanning documents first

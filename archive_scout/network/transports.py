@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -469,6 +470,8 @@ class HttpxBackend:
         *,
         retain_partial: bool = False,
         expected_digest: str = "",
+        redirect_validator: Callable[[str, str], None] | None = None,
+        _redirect_depth: int = 0,
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         if retain_partial and destination.exists() and _partial_metadata_path(destination).exists():
@@ -482,7 +485,19 @@ class HttpxBackend:
         request_headers = dict(headers)
         if retain_partial:
             request_headers["Accept-Encoding"] = "identity"
-        with self.client.stream("GET", url, headers=request_headers) as response:
+        if _redirect_depth > 10:
+            raise RuntimeError(f"too many redirects: {url}")
+        with self.client.stream("GET", url, headers=request_headers,
+                                **({"follow_redirects": False} if redirect_validator else {})) as response:
+            if redirect_validator and int(response.status_code) in {301,302,303,307,308}:
+                location = response.headers.get("location")
+                if location:
+                    next_url = urllib.parse.urljoin(url, location)
+                    redirect_validator(url, next_url)
+                    response.close()  # release pool slot before following another hop
+                    return self.download(next_url, headers, destination, max_bytes, stop_event,
+                        retain_partial=False, expected_digest="", redirect_validator=redirect_validator,
+                        _redirect_depth=_redirect_depth+1)
             announced = response.headers.get("Content-Length")
             if announced and announced.isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
@@ -517,18 +532,45 @@ class HttpxBackend:
 class Urllib3Backend:
     name = "urllib3"
 
-    def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float) -> None:
+    def __init__(self, pool_size: int, connect_timeout: float, read_timeout: float,
+                 trust_env: bool = True) -> None:
         self.timeout = urllib3.Timeout(connect=max(1.0, connect_timeout), read=max(1.0, read_timeout))
+        self.trust_env = bool(trust_env)
+        self.pool_size = max(2, int(pool_size))
         self.pool = urllib3.PoolManager(
-            num_pools=4,
-            maxsize=max(2, int(pool_size)),
-            block=True,
-            ssl_context=_ssl_context(),
-            retries=False,
+            num_pools=4, maxsize=self.pool_size, block=True,
+            ssl_context=_ssl_context(), retries=False,
         )
+        self.proxy_pools: dict[str, object] = {}
+        self.proxy_lock = threading.Lock()
+
+    def _pool_for(self, url: str):
+        if not self.trust_env:
+            return self.pool
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.hostname and urllib.request.proxy_bypass(parsed.hostname):
+            return self.pool
+        proxy = urllib.request.getproxies().get(parsed.scheme)
+        if not proxy:
+            return self.pool
+        # Proxy clients are created lazily and reused; credentials are never
+        # included in diagnostics. SOCKS without support must fail closed.
+        with self.proxy_lock:
+            if proxy not in self.proxy_pools:
+                if proxy.lower().startswith(("socks4://", "socks5://", "socks5h://")):
+                    from urllib3.contrib.socks import SOCKSProxyManager
+                    pool = SOCKSProxyManager(proxy, num_pools=4,
+                        maxsize=self.pool_size, block=True, retries=False)
+                else:
+                    pool = urllib3.ProxyManager(proxy, num_pools=4,
+                        maxsize=self.pool_size, block=True, retries=False)
+                self.proxy_pools[proxy] = pool
+            return self.proxy_pools[proxy]
 
     def close(self) -> None:
         self.pool.clear()
+        for pool in self.proxy_pools.values():
+            pool.clear()
 
     @staticmethod
     def _discard(response) -> None:
@@ -557,7 +599,7 @@ class Urllib3Backend:
         response = None
         try:
             for _ in range(11):
-                response = self.pool.request(
+                response = self._pool_for(current_url).request(
                     "GET",
                     current_url,
                     headers=headers,
@@ -609,6 +651,7 @@ class Urllib3Backend:
         destination: Path,
         max_bytes: int,
         stop_event: threading.Event,
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -616,7 +659,7 @@ class Urllib3Backend:
         response = None
         try:
             for _ in range(11):
-                response = self.pool.request(
+                response = self._pool_for(current_url).request(
                     "GET", current_url, headers=headers, preload_content=False,
                     redirect=False, retries=False, timeout=self.timeout,
                 )
@@ -625,9 +668,12 @@ class Urllib3Backend:
                 location = response.headers.get("Location")
                 if not location:
                     break
+                destination_url = urllib.parse.urljoin(current_url, location)
+                if redirect_validator:
+                    redirect_validator(current_url, destination_url)
                 self._discard(response)
                 response = None
-                current_url = urllib.parse.urljoin(current_url, location)
+                current_url = destination_url
             else:
                 raise RuntimeError(f"too many redirects: {url}")
             assert response is not None
@@ -660,7 +706,9 @@ class Urllib3Backend:
 class CurlBackend:
     name = "curl"
 
-    def __init__(self, connect_timeout: float, read_timeout: float) -> None:
+    def __init__(self, connect_timeout: float, read_timeout: float,
+                 trust_env: bool = True) -> None:
+        self.trust_env = bool(trust_env)
         executable = shutil.which("curl")
         if not executable:
             raise BackendUnavailable("curl executable was not found")
@@ -670,6 +718,12 @@ class CurlBackend:
 
     def close(self) -> None:
         return
+
+    def _curl_environment(self) -> dict[str, str] | None:
+        if self.trust_env:
+            return None
+        return {key: value for key, value in os.environ.items()
+                if key.casefold() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
 
     @staticmethod
     def _parse_headers(raw: str) -> dict[str, str]:
@@ -719,7 +773,7 @@ class CurlBackend:
             body_path = Path(temp_dir) / "body.bin"
             command = [
                 self.executable,
-                "--location",
+                "--disable", "--location",
                 "--compressed",
                 "--http1.1",
                 "--silent",
@@ -748,7 +802,7 @@ class CurlBackend:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                creationflags=creationflags,
+                creationflags=creationflags, env=self._curl_environment(),
             )
             while proc.poll() is None:
                 if stop_event.wait(0.2):
@@ -786,6 +840,8 @@ class CurlBackend:
         destination: Path,
         max_bytes: int,
         stop_event: threading.Event,
+        redirect_validator: Callable[[str, str], None] | None = None,
+        _redirect_depth: int = 0,
     ) -> TransportFileResponse:
         ensure_frozen_bundle_available()
         started = time.monotonic()
@@ -794,19 +850,21 @@ class CurlBackend:
         with tempfile.TemporaryDirectory(prefix="archive-scout-curl-") as temp_dir:
             header_path = Path(temp_dir) / "headers.txt"
             command = [
-                self.executable, "--location", "--compressed", "--http1.1",
+                self.executable, "--disable", "--location", "--compressed", "--http1.1",
                 "--silent", "--show-error", "--connect-timeout", str(int(self.connect_timeout)),
                 "--max-time", str(int(self.connect_timeout + self.read_timeout)),
                 "--max-filesize", str(int(max_bytes)), "--dump-header", str(header_path),
                 "--output", str(destination), "--write-out", "%{http_code}\n%{url_effective}",
             ]
+            if redirect_validator:
+                command.remove("--location")
             for key, value in headers.items():
                 command.extend(["--header", f"{key}: {value}"])
             command.extend(["--", url])
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             proc = subprocess.Popen(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                creationflags=creationflags,
+                creationflags=creationflags, env=self._curl_environment(),
             )
             while proc.poll() is None:
                 if stop_event.wait(0.2):
@@ -839,8 +897,17 @@ class CurlBackend:
             status = int(lines[-2]) if len(lines) >= 2 and lines[-2].isdigit() else 0
             final_url = lines[-1] if lines else url
             raw_headers = header_path.read_text(encoding="iso-8859-1", errors="replace") if header_path.exists() else ""
+            parsed_headers = self._parse_headers(raw_headers)
+            location = parsed_headers.get("location")
+            if redirect_validator and status in {301,302,303,307,308} and location:
+                if _redirect_depth >= 10:
+                    raise RuntimeError(f"too many redirects: {url}")
+                next_url = urllib.parse.urljoin(url, location)
+                redirect_validator(url, next_url)
+                return self.download(next_url, headers, destination, max_bytes, stop_event,
+                    redirect_validator=redirect_validator, _redirect_depth=_redirect_depth+1)
             return TransportFileResponse(
-                status=status, headers=self._parse_headers(raw_headers), final_url=final_url,
+                status=status, headers=parsed_headers, final_url=final_url,
                 path=destination, bytes_written=size, content_hash=digest.hexdigest(),
                 preview=bytes(preview), backend=self.name, elapsed=time.monotonic() - started,
             )
@@ -871,14 +938,17 @@ class ResilientTransport:
             raise ValueError("network backend must be auto, httpx, urllib3, or curl")
         self.callback = callback
         self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.recovery_probes: set[str] = set()
         self.cooldown_until: dict[str, float] = {}
+        self.fallback_pacer = None
         self.last_success: str | None = None
         # Explicit backends must not instantiate unused stacks. In particular,
         # a missing optional SOCKS dependency must not break urllib3-only mode.
         factories = {
             "httpx": lambda: HttpxBackend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
-            "urllib3": lambda: Urllib3Backend(pool_size, connect_timeout, read_timeout),
-            "curl": lambda: CurlBackend(connect_timeout, read_timeout),
+            "urllib3": lambda: Urllib3Backend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
+            "curl": lambda: CurlBackend(connect_timeout, read_timeout, trust_env=trust_env),
         }
         self.backends: dict[str, object] = {}
         names = ("httpx", "urllib3", "curl") if requested == "auto" else (requested,)
@@ -917,12 +987,33 @@ class ResilientTransport:
         return available
 
     def _await_backend(self, name: str, stop_event: threading.Event) -> None:
-        with self.lock:
-            delay = max(0.0, self.cooldown_until.get(name, 0.0) - time.monotonic())
-        if delay and stop_event.wait(delay):
-            raise Stopped
-        if stop_event.is_set():
-            raise Stopped
+        """One recovery probe per cooling backend, without blocking healthy peers."""
+        if not hasattr(self, "condition"):
+            # Compatibility with legacy injected transports made via __new__.
+            self.condition = threading.Condition(self.lock)
+            self.recovery_probes = set()
+        while True:
+            if stop_event.is_set():
+                raise Stopped
+            with self.condition:
+                until = self.cooldown_until.get(name)
+                if until is None:
+                    return
+                delay = max(0.0, until - time.monotonic())
+                if delay > 0 or name in self.recovery_probes:
+                    self.condition.wait(timeout=min(0.5, max(0.05, delay)))
+                    continue
+                self.recovery_probes.add(name)
+                return
+
+    def _backend_result(self, name: str, succeeded: bool) -> None:
+        with self.condition:
+            if succeeded:
+                self.cooldown_until.pop(name, None)
+            else:
+                self.cooldown_until[name] = time.monotonic() + 30.0
+            self.recovery_probes.discard(name)
+            self.condition.notify_all()
 
     def request(
         self,
@@ -935,8 +1026,10 @@ class ResilientTransport:
         failures: list[tuple[str, BaseException]] = []
         # An alternate stack is a diagnosis/recovery trial, not three new
         # physical connections for every failed logical URL attempt.
-        for name in self._ordered_names()[:2]:
+        for attempt_number, name in enumerate(self._ordered_names()[:2]):
             self._await_backend(name, stop_event)
+            if attempt_number and getattr(self, "fallback_pacer", None) is not None:
+                self.fallback_pacer.wait(stop_event)
             if stop_event.is_set():
                 raise Stopped
             backend = self.backends[name]
@@ -946,11 +1039,17 @@ class ResilientTransport:
                 with self.lock:
                     changed = self.last_success != name
                     self.last_success = name
-                    self.cooldown_until.pop(name, None)
+                self._backend_result(name, True)
                 if changed and self.callback:
                     self.callback(f"Network backend: {name}")
                 return response
-            except (Stopped, RedirectPolicyError):
+            except RedirectPolicyError:
+                self._backend_result(name, True)  # successful response, policy refused redirect
+                raise
+            except Stopped:
+                with self.condition:
+                    self.recovery_probes.discard(name)
+                    self.condition.notify_all()
                 raise
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
@@ -960,8 +1059,7 @@ class ResilientTransport:
                 failures.append((name, exc))
             except Exception as exc:
                 failures.append((name, exc))
-            with self.lock:
-                self.cooldown_until[name] = time.monotonic() + 30.0
+            self._backend_result(name, False)
             last_error = failures[-1][1]
             if is_transport_read_timeout(last_error):
                 # Once a server has accepted the connection and stalled while
@@ -988,31 +1086,42 @@ class ResilientTransport:
         *,
         retain_partial: bool = False,
         expected_digest: str = "",
+        redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
         names = (["httpx"] if retain_partial and destination.exists() and _partial_metadata_path(destination).is_file()
                  and "httpx" in self.backends else self._ordered_names()[:2])
-        for name in names:
+        for attempt_number, name in enumerate(names):
             self._await_backend(name, stop_event)
+            if attempt_number and getattr(self, "fallback_pacer", None) is not None:
+                self.fallback_pacer.wait(stop_event)
             if stop_event.is_set():
                 raise Stopped
             backend = self.backends[name]
             try:
+                kwargs = ({"redirect_validator": redirect_validator}
+                          if redirect_validator is not None else {})
                 if name == "httpx" and retain_partial:
                     response = backend.download(
                         url, headers, destination, max_bytes, stop_event,
-                        retain_partial=True, expected_digest=expected_digest,
+                        retain_partial=True, expected_digest=expected_digest, **kwargs,
                     )
                 else:
-                    response = backend.download(url, headers, destination, max_bytes, stop_event)
+                    response = backend.download(url, headers, destination, max_bytes, stop_event, **kwargs)
                 with self.lock:
                     changed = self.last_success != name
                     self.last_success = name
-                    self.cooldown_until.pop(name, None)
+                self._backend_result(name, True)
                 if changed and self.callback:
                     self.callback(f"Network backend: {name}")
                 return response
+            except RedirectPolicyError:
+                self._backend_result(name, True)  # successful response, policy refused redirect
+                raise
             except Stopped:
+                with self.condition:
+                    self.recovery_probes.discard(name)
+                    self.condition.notify_all()
                 raise
             except RuntimeError as exc:
                 if str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
@@ -1024,9 +1133,12 @@ class ResilientTransport:
                                  and destination.is_file())
             if not partial_ready:
                 destination.unlink(missing_ok=True)
-            with self.lock:
-                if not partial_ready:
-                    self.cooldown_until[name] = time.monotonic() + 30.0
+            if partial_ready:
+                with self.condition:
+                    self.recovery_probes.discard(name)
+                    self.condition.notify_all()
+            else:
+                self._backend_result(name, False)
             last_error = failures[-1][1]
             if partial_ready or is_transport_read_timeout(last_error):
                 # Never overwrite identity-bound prefixes or repeat a remote

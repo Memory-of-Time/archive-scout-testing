@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import nullcontext
 import hashlib
 import os
 import sqlite3
@@ -11,11 +12,19 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from ..cdx.parameters import cdx_query_signature
-from ..content import decode_bytes, parse_page
+from ..content import decode_bytes, parse_page, classify_replay_content
 from ..database.repositories import record_error, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
 from ..utils import hash_text, utc_now
 from .jobs import ScanJob
+
+
+class PayloadIntegrityError(OSError):
+    """A saved body no longer matches its durable raw-byte checkpoint."""
+
+
+class ArchivedErrorShell(RuntimeError):
+    """Wayback returned an origin/error page instead of the intended body."""
 from .scoring import analyze_content, prepare_analysis_fields
 
 SCAN_BYTE_BUDGET = 64 * 1024 * 1024
@@ -24,7 +33,14 @@ SCAN_BYTE_BUDGET = 64 * 1024 * 1024
 def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
     path = Path(row["path"])
     data = path.read_bytes()
-    raw = decode_bytes(data, row.get("mimetype") or "")
+    actual_hash = hashlib.sha256(data).hexdigest()
+    if row.get("expected_hash") and (actual_hash != row["expected_hash"]
+            or len(data) != int(row.get("expected_size") or 0)):
+        raise PayloadIntegrityError(f"local retained body failed SHA-256/size validation: capture {row['id']}")
+    raw = decode_bytes(data, row.get("response_content_type") or row.get("mimetype") or "")
+    replay_problem = classify_replay_content(raw, row.get("final_url") or "")
+    if replay_problem:
+        raise ArchivedErrorShell(replay_problem)
     title, visible, links = parse_page(raw, row["original_url"])
     fields, normalized = prepare_analysis_fields(row["original_url"], title, visible, raw, links)
     analyses = {
@@ -37,7 +53,7 @@ def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
     return {
         "capture_id": row["id"], "path": path, "title": title, "visible": visible,
         "links": links, "bytes_saved": len(data),
-        "content_hash": hashlib.sha256(data).hexdigest(),
+        "content_hash": actual_hash,
         "normalized_hash": hash_text(normalized["body"]), "analyses": analyses,
     }
 
@@ -52,9 +68,12 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
     target_slots = ",".join("?" for _ in targets)
     while True:
         batch = database.execute(
-            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.length,d.path
+            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,c.length,d.path,
+                 v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
+                 v.response_content_type AS response_content_type,v.final_url AS final_url
                FROM captures c JOIN targets t ON t.id=c.target_id
                LEFT JOIN documents d ON d.capture_id=c.id
+               LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                WHERE (c.state='downloaded_unscanned' OR
                      (c.state='downloaded' AND d.id IS NULL))
                AND c.query_signature=? AND t.pattern IN (""" + target_slots + """)
@@ -79,6 +98,7 @@ def scan_pending_saved(
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None = None,
     workers: int | None = None,
+    write_lock: threading.Lock | None = None,
 ) -> int:
     """Scan after acquisition; unaffected by Wayback's request admission clock.
 
@@ -139,7 +159,9 @@ def scan_pending_saved(
             )
             if not done:
                 continue
-            with database:
+            # The download owner and local scanner share a transaction mutex
+            # when running concurrently. Other operations use a no-op context.
+            with (write_lock if write_lock is not None else nullcontext()), database:
                 for future in done:
                     row, estimate = futures.pop(future)
                     in_flight_bytes -= estimate
@@ -169,15 +191,19 @@ def scan_pending_saved(
                         database.execute("ROLLBACK TO SAVEPOINT scout_capture_scan")
                         # Missing retained bytes need reacquisition; a transient
                         # SQLite or parser failure does NOT need network access.
-                        missing = isinstance(exc, FileNotFoundError)
+                        missing = isinstance(exc, (FileNotFoundError, PayloadIntegrityError, ArchivedErrorShell))
                         if missing:
                             database.execute(
                                 "UPDATE captures SET state='error',updated_at=? WHERE id=?",
                                 (utc_now(), row["id"]),
                             )
                         record_error(
-                            database, "scan", "missing_local_file" if missing else "scan_failure",
-                            repr(exc), capture_id=row["id"], retryable=True,
+                            database, "scan", ("local_integrity_failure" if isinstance(exc, PayloadIntegrityError)
+                             else "invalid_archive_replay" if isinstance(exc, ArchivedErrorShell)
+                             else "missing_local_file" if missing else "scan_failure"),
+                            repr(exc), capture_id=row["id"],
+                            retryable=not isinstance(exc, ArchivedErrorShell)
+                                or str(exc) == "origin_unavailable",
                         )
                     finally:
                         database.execute("RELEASE SAVEPOINT scout_capture_scan")
@@ -210,7 +236,10 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
     adopted = 0
     while True:
         rows = database.execute(
-            """SELECT c.id,c.timestamp,c.original_url,c.mimetype FROM captures c
+            """SELECT c.id,c.timestamp,c.original_url,c.mimetype,
+                       v.content_hash AS expected_hash,v.bytes_saved AS expected_size
+                   FROM captures c
+                   LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
                LEFT JOIN documents d ON d.capture_id=c.id
                JOIN targets t ON t.id=c.target_id
                WHERE c.id>? AND c.query_signature=? AND t.pattern=?
@@ -230,8 +259,18 @@ def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: thre
                     length = path.stat().st_size
                     if not (0 < length <= config.max_file_bytes):
                         continue
-                    # Exact identity is encoded in the filename; validate the
-                    # retained bytes and reject Wayback's own error shells.
+                    # Exact capture identity is encoded in the filename, but a
+                    # previously committed SHA-256 is stronger and mandatory
+                    # whenever available. Do not silently adopt altered bytes.
+                    if row["expected_hash"]:
+                        if length != int(row["expected_size"] or 0):
+                            continue
+                        digest = hashlib.sha256()
+                        with path.open("rb") as check:
+                            for segment in iter(lambda: check.read(1024*1024), b""):
+                                digest.update(segment)
+                        if digest.hexdigest() != row["expected_hash"]:
+                            continue
                     with path.open("rb") as handle:
                         preview = handle.read(min(length, 65536))
                     decision = classify_payload_kind(preview, row["mimetype"] or "", row["original_url"])

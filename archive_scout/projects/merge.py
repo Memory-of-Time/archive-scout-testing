@@ -5,6 +5,7 @@ import json
 import shutil
 import sqlite3
 import threading
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -15,10 +16,31 @@ from ..media.downloader import media_path
 from ..utils import atomic_write_text, utc_now
 
 
-def _fingerprint(path: Path) -> str:
-    stat = path.stat()
-    raw = f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "replace")
-    return hashlib.sha256(raw).hexdigest()[:24]
+def _fingerprint(path: Path, source_root: Path | None = None) -> str:
+    """Hash a consistent SQLite backup, including any previously uncheckpointed WAL.
+
+    The file's mtime/size cannot identify a changing SQLite database. The path
+    scopes otherwise-identical snapshots from different source projects.
+    """
+    digest = hashlib.sha256(str((source_root or path).resolve()).encode("utf-8", "replace"))
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:24]
+
+
+def _snapshot_source(source_db_path: Path, destination: Path) -> None:
+    # SQLite's online backup API provides a logically consistent snapshot of
+    # the main database AND its WAL, even while the source receives writes.
+    source = sqlite3.connect(source_db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
+    try:
+        backup = sqlite3.connect(destination)
+        try:
+            source.backup(backup, pages=1000, sleep=0.05)
+        finally:
+            backup.close()
+    finally:
+        source.close()
 
 
 def _source_file(source_root: Path, value: str) -> Path | None:
@@ -85,13 +107,39 @@ def merge_projects(
     source_db_path = source_root / DATABASE_NAME
     if not source_db_path.exists():
         raise FileNotFoundError(f"Scout database not found: {source_db_path}")
-    fingerprint = _fingerprint(source_db_path)
-    existing = database.execute("SELECT summary_json FROM project_merges WHERE source_fingerprint=?", (fingerprint,)).fetchone()
-    if existing:
-        return json.loads(existing["summary_json"] or "{}")
-
-    source = sqlite3.connect(f"file:{source_db_path}?mode=ro", uri=True)
-    source.row_factory = sqlite3.Row
+    source_key = str(source_root.resolve())
+    # Snapshot files live outside the source project so a live project need not
+    # be checkpointed or modified for a merge.
+    snapshot_dir = tempfile.TemporaryDirectory(prefix="scout-merge-snapshot-")
+    snapshot_path = Path(snapshot_dir.name) / "source.sqlite3"
+    try:
+        _snapshot_source(source_db_path, snapshot_path)
+        fingerprint = _fingerprint(snapshot_path, source_root)
+        existing = database.execute(
+            "SELECT summary_json FROM project_merges WHERE source_fingerprint=?", (fingerprint,)
+        ).fetchone()
+        if existing:
+            return json.loads(existing["summary_json"] or "{}")
+        # Older merges have no stable source->destination scan mapping. Never
+        # duplicate their historical scans when a live WAL changes: explicitly
+        # require a one-time reconciliation instead of guessing identities.
+        old_merges = database.execute(
+            "SELECT 1 FROM project_merges WHERE source_path=? LIMIT 1", (source_key,)
+        ).fetchone()
+        new_links = database.execute(
+            "SELECT 1 FROM project_merge_scan_links WHERE source_path=? LIMIT 1", (source_key,)
+        ).fetchone()
+        if old_merges and not new_links:
+            raise RuntimeError(
+                "This source was merged by a legacy release without source-run identity mappings. "
+                "An updated snapshot cannot be merged safely without historical-run reconciliation; "
+                "original project and previously merged data have not been modified."
+            )
+        source = sqlite3.connect(snapshot_path)
+        source.row_factory = sqlite3.Row
+    except BaseException:
+        snapshot_dir.cleanup()
+        raise
     stop_event = stop_event or threading.Event()
     summary = {"captures": 0, "documents": 0, "media": 0, "scan_runs": 0, "matches": 0, "reviews": 0, "notes": 0, "extractions": 0}
     target_map: dict[int, int] = {}
@@ -145,17 +193,30 @@ def merge_projects(
                 old_capture = int(row["capture_id"])
                 if old_capture not in capture_map:
                     continue
-                source_path = _source_file(source_root, str(row["path"]))
-                destination_path = _copy_file(source_path, destination_root, "captures", fingerprint)
-                if destination_path is None:
-                    destination_path = (
-                        destination_root / "captures" / "merged" / fingerprint / f"recovered_{int(row['id'])}.txt"
-                    )
-                    atomic_write_text(destination_path, str(row["body_text"] or ""))
-                existing_doc = database.execute("SELECT id FROM documents WHERE capture_id=?", (capture_map[old_capture],)).fetchone()
+                existing_doc = database.execute(
+                    "SELECT id,content_hash FROM documents WHERE capture_id=?",
+                    (capture_map[old_capture],)
+                ).fetchone()
                 if existing_doc:
                     document_id = int(existing_doc["id"])
+                    if (row["content_hash"] and existing_doc["content_hash"] and
+                            str(row["content_hash"]) != str(existing_doc["content_hash"])):
+                        raise RuntimeError(
+                            "Merge source changed the raw hash of an existing capture. "
+                            "Automatic replacement would invalidate historical scan evidence; "
+                            "destination has not been modified."
+                        )
                 else:
+                    # Repeated merges of a changing WAL must never recopy every
+                    # previously imported file into a new fingerprint directory.
+                    source_path = _source_file(source_root, str(row["path"]))
+                    destination_path = _copy_file(source_path, destination_root, "captures", fingerprint)
+                    reconstructed = destination_path is None
+                    if reconstructed:
+                        destination_path = (
+                            destination_root / "captures" / "merged" / fingerprint / f"recovered_{int(row['id'])}.txt"
+                        )
+                        atomic_write_text(destination_path, str(row["body_text"] or ""))
                     cursor = database.execute(
                         """
                         INSERT INTO documents(
@@ -169,6 +230,22 @@ def merge_projects(
                     )
                     document_id = int(cursor.lastrowid)
                     database.execute("UPDATE captures SET document_id=?,state='downloaded' WHERE id=?", (document_id, capture_map[old_capture]))
+                    # Indexed FTS insertion is proportional to newly imported
+                    # documents; rebuilding every existing row grows with the
+                    # destination on every incremental merge.
+                    fts = database.execute("SELECT value FROM project_meta WHERE key='fts5'").fetchone()
+                    if fts and fts[0] == '1':
+                        database.execute("""INSERT INTO documents_fts(rowid,title,body_text,original_url)
+                            VALUES(?,?,?,?)""", (document_id,row["title"],row["body_text"],
+                                                  source.execute("SELECT original_url FROM captures WHERE id=?",
+                                                      (old_capture,)).fetchone()[0]))
+                    if reconstructed:
+                        # A derived text reconstruction cannot be misrepresented
+                        # as the original raw-byte SHA-256 capture.
+                        database.execute("""INSERT OR REPLACE INTO capture_routing
+                            (capture_id,resource_class,evidence,confident,routing,updated_at)
+                            VALUES(?,'text','merge:derived_text_original_raw_unavailable',0,'downloaded_scanned',?)""",
+                            (capture_map[old_capture],utc_now()))
                 document_map[int(row["id"])] = document_id
                 summary["documents"] += 1
 
@@ -227,6 +304,20 @@ def merge_projects(
 
             scan_columns = _columns(source, "scan_runs")
             for row in source.execute("SELECT * FROM scan_runs ORDER BY id"):
+                existing_link = database.execute(
+                    "SELECT destination_run_id FROM project_merge_scan_links "
+                    "WHERE source_path=? AND source_run_id=?", (source_key, int(row["id"]))
+                ).fetchone()
+                if existing_link:
+                    linked_id = int(existing_link["destination_run_id"])
+                    scan_map[int(row["id"])] = linked_id
+                    database.execute("""UPDATE scan_runs SET status=?,completed_at=?,
+                        document_count=?,match_count=?,duration_seconds=? WHERE id=?""",
+                        (row["status"],row["completed_at"],
+                         int(_value(row, scan_columns, "document_count", 0) or 0),
+                         int(_value(row, scan_columns, "match_count", 0) or 0),
+                         float(_value(row, scan_columns, "duration_seconds", 0) or 0),linked_id))
+                    continue
                 cursor = database.execute(
                     """
                     INSERT INTO scan_runs(
@@ -244,6 +335,9 @@ def merge_projects(
                     ),
                 )
                 scan_map[int(row["id"])] = int(cursor.lastrowid)
+                database.execute("""INSERT INTO project_merge_scan_links
+                    (source_path,source_run_id,destination_run_id) VALUES(?,?,?)""",
+                    (source_key,int(row["id"]),int(cursor.lastrowid)))
                 summary["scan_runs"] += 1
 
             match_columns = _columns(source, "document_matches")
@@ -253,10 +347,16 @@ def merge_projects(
                     continue
                 cursor = database.execute(
                     """
-                    INSERT OR IGNORE INTO document_matches(
+                    INSERT INTO document_matches(
                         scan_run_id,document_id,score,hits_json,fields_json,snippets_json,interesting_links_json,
                         excluded,required_missing,proximity_json,created_at,updated_at
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(scan_run_id,document_id) DO UPDATE SET
+                        score=excluded.score,hits_json=excluded.hits_json,
+                        fields_json=excluded.fields_json,snippets_json=excluded.snippets_json,
+                        interesting_links_json=excluded.interesting_links_json,
+                        excluded=excluded.excluded,required_missing=excluded.required_missing,
+                        proximity_json=excluded.proximity_json,updated_at=excluded.updated_at
                     """,
                     (
                         scan_map[int(row["scan_run_id"])], document_map[old_document], row["score"], row["hits_json"],
@@ -294,10 +394,17 @@ def merge_projects(
                     capture_id = capture_map.get(int(row["capture_id"])) if row["capture_id"] is not None else None
                     if match_id is None and capture_id is None:
                         continue
-                    database.execute(
+                    if database.execute(
+                        "SELECT 1 FROM project_merge_note_links WHERE source_path=? AND source_note_id=?",
+                        (source_key,int(row["id"]))
+                    ).fetchone():
+                        continue
+                    cursor = database.execute(
                         "INSERT INTO notes(match_id,capture_id,text,author,created_at,updated_at) VALUES(?,?,?,?,?,?)",
                         (match_id, capture_id, row["text"], row["author"], row["created_at"], row["updated_at"]),
                     )
+                    database.execute("INSERT INTO project_merge_note_links VALUES(?,?,?)",
+                                     (source_key,int(row["id"]),int(cursor.lastrowid)))
                     summary["notes"] += 1
             if _table_exists(source, "tags"):
                 for row in source.execute("SELECT * FROM tags ORDER BY id"):
@@ -315,7 +422,12 @@ def merge_projects(
                 for row in source.execute("SELECT * FROM extractions ORDER BY id"):
                     if int(row["document_id"]) not in document_map:
                         continue
-                    database.execute(
+                    if database.execute(
+                        "SELECT 1 FROM project_merge_extraction_links WHERE source_path=? AND source_extraction_id=?",
+                        (source_key,int(row["id"]))
+                    ).fetchone():
+                        continue
+                    cursor = database.execute(
                         """
                         INSERT INTO extractions(document_id,extractor_name,extractor_type,field,value,context,start_offset,end_offset,created_at)
                         VALUES(?,?,?,?,?,?,?,?,?)
@@ -328,9 +440,10 @@ def merge_projects(
                             row["end_offset"] if "end_offset" in columns else None, row["created_at"],
                         ),
                     )
+                    database.execute("INSERT INTO project_merge_extraction_links VALUES(?,?,?)",
+                                     (source_key,int(row["id"]),int(cursor.lastrowid)))
                     summary["extractions"] += 1
 
-            _rebuild_fts(database)
             database.execute(
                 "INSERT INTO project_merges(source_path,source_fingerprint,merged_at,summary_json) VALUES(?,?,?,?)",
                 (str(source_root), fingerprint, utc_now(), json.dumps(summary, sort_keys=True)),
@@ -339,3 +452,4 @@ def merge_projects(
         return summary
     finally:
         source.close()
+        snapshot_dir.cleanup()

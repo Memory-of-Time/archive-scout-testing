@@ -168,6 +168,8 @@ class HttpClient:
             trust_env=trust_environment,
             callback=network_callback,
         )
+        if isinstance(self.transport, ResilientTransport):
+            self.transport.fallback_pacer = limiter
 
     def close(self) -> None:
         self.transport.close()
@@ -352,9 +354,10 @@ class HttpClient:
         destination: Path,
         max_bytes: int,
         accept: str = "*/*",
-        *, expected_digest: str = "",
+        *, expected_digest: str = "", redirect_validator=None,
+        retain_partial: bool = True,
     ) -> dict:
-        """Stream a response to disk; retain verifiable partial media on failures."""
+        """Stream a response to disk; only media may retain validated partials."""
         headers = {
             "User-Agent": self.user_agent,
             "Accept": accept,
@@ -382,11 +385,13 @@ class HttpClient:
                     if isinstance(self.transport, ResilientTransport):
                         response = self.transport.download(
                             url, headers, destination, max_bytes, self.stop_event,
-                            retain_partial=True, expected_digest=expected_digest,
+                            retain_partial=retain_partial, expected_digest=expected_digest,
+                            **({"redirect_validator": redirect_validator} if redirect_validator else {}),
                         )
                     else:
                         response = self.transport.download(
-                            url, headers, destination, max_bytes, self.stop_event
+                            url, headers, destination, max_bytes, self.stop_event,
+                            **({"redirect_validator": redirect_validator} if redirect_validator else {}),
                         )
                 status = int(response.status)
                 retry_after_header = response.headers.get("retry-after") or response.headers.get("Retry-After")

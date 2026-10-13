@@ -215,6 +215,25 @@ CREATE TABLE IF NOT EXISTS errors(
 CREATE INDEX IF NOT EXISTS errors_unresolved_idx ON errors(resolved,ignored,retryable,operation,category);
 CREATE INDEX IF NOT EXISTS errors_capture_lookup_idx ON errors(capture_id,operation,category,resolved,ignored,id DESC);
 CREATE INDEX IF NOT EXISTS errors_media_lookup_idx ON errors(media_capture_id,operation,category,resolved,ignored,id DESC);
+-- Backward-compatible, durable per-capture transient recovery.  This table is
+-- deliberately separate from index and capture identity; no reindex is needed.
+CREATE TABLE IF NOT EXISTS capture_payload_evidence(
+    capture_id INTEGER PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    content_hash TEXT NOT NULL, bytes_saved INTEGER NOT NULL,
+    response_content_type TEXT NOT NULL DEFAULT '',
+    final_url TEXT NOT NULL DEFAULT '',
+    response_status INTEGER,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS text_retry_schedule(
+    capture_id INTEGER PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    next_eligible_at REAL NOT NULL,
+    failure_count INTEGER NOT NULL DEFAULT 1,
+    last_category TEXT NOT NULL,
+    last_status INTEGER,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS text_retry_due_idx ON text_retry_schedule(next_eligible_at,capture_id);
 CREATE TABLE IF NOT EXISTS index_state(
     target_id INTEGER NOT NULL,
     year INTEGER NOT NULL,
@@ -458,6 +477,14 @@ CREATE TABLE IF NOT EXISTS network_events(
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS network_events_created_idx ON network_events(created_at,id);
+-- Historic transient network incidents are aggregated rather than retained as
+-- millions of repetitive detail rows. Capture/CDX evidence is never pruned.
+CREATE TABLE IF NOT EXISTS network_event_summaries(
+    date TEXT NOT NULL, stage TEXT NOT NULL, message_fingerprint TEXT NOT NULL,
+    sample_message TEXT NOT NULL, occurrence_count INTEGER NOT NULL,
+    first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+    PRIMARY KEY(date,stage,message_fingerprint)
+);
 CREATE TABLE IF NOT EXISTS project_backups(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL UNIQUE,
@@ -649,6 +676,23 @@ CREATE TABLE IF NOT EXISTS research_ai_claims(
 );
 CREATE INDEX IF NOT EXISTS research_ai_claims_run_idx ON research_ai_claims(ai_run_id,id);
 
+-- Durable source-identity mappings make repeated merges idempotent when the
+-- source SQLite/WAL changes. Never reuse a source row ID across distinct paths.
+CREATE TABLE IF NOT EXISTS project_merge_scan_links(
+    source_path TEXT NOT NULL, source_run_id INTEGER NOT NULL,
+    destination_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    PRIMARY KEY(source_path,source_run_id)
+);
+CREATE TABLE IF NOT EXISTS project_merge_note_links(
+    source_path TEXT NOT NULL, source_note_id INTEGER NOT NULL,
+    destination_note_id INTEGER NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    PRIMARY KEY(source_path,source_note_id)
+);
+CREATE TABLE IF NOT EXISTS project_merge_extraction_links(
+    source_path TEXT NOT NULL, source_extraction_id INTEGER NOT NULL,
+    destination_extraction_id INTEGER NOT NULL REFERENCES extractions(id) ON DELETE CASCADE,
+    PRIMARY KEY(source_path,source_extraction_id)
+);
 CREATE TABLE IF NOT EXISTS project_merges(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_path TEXT NOT NULL,

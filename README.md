@@ -1,4 +1,4 @@
-# Scout 1.2.3
+# Scout 1.2.4
 
 **Scout** is a cross-platform desktop and command-line workspace for finding, preserving, downloading, searching, and reviewing public Wayback Machine captures.
 
@@ -60,7 +60,21 @@ The [test matrix](.github/workflows/tests.yml) covers Python 3.11/3.12 on Window
 
 Source overview: [`archive_scout/`](archive_scout/) application code; [`tests/`](tests/) regression tests; [`scripts/`](scripts/) benchmarking/build automation; [`packaging/`](packaging/) OS setup; [`docs/`](docs/) operational and developer guides. See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), [Indexing and recovery](docs/INDEXING_RECOVERY.md), [Privacy](docs/PRIVACY.md), [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md).
 
-## Scout 1.2.3 acquisition and indexing safety patch
+## Scout 1.2.4 acquisition, retries, scanning and merge integrity
+
+This release builds on 1.2.3 with durable per-capture retry eligibility,
+identity-bound disk streaming with a separate local scanner, saved-body SHA-256
+and response-MIME evidence, WAL-consistent/idempotent project merge identities,
+bounded indexing-event diagnostics, network backend recovery/proxy improvements,
+and a bounded terminal-CDX confirmation path. The normal fixed replay pacing,
+text/media routing policy, schema-9 project identity, existing scans, and
+CLI/GUI workflow are preserved. Existing project folders are not overwritten.
+
+The full audit checklist, deferred items, test evidence, and migration guidance
+are in [v1.2.4 audit implementation](docs/SCOUT_1_2_4_AUDIT_IMPLEMENTATION.md).
+A passing local test is not proof of multi-day Wayback performance.
+
+## Scout 1.2.4 acquisition and indexing safety patch
 
 This release retains schema 9 and the existing project/query identities. It adds
 an explicit non-text suffix policy for 76 requested formats (including archived

@@ -1,3 +1,23 @@
+# Scout 1.2.4 — audited acquisition/streaming/recovery improvements
+
+Extends v1.2.3 with durable per-capture transient retry scheduling, disk-streamed
+retention and locally independent scoring, consistent raw-payload evidence,
+WAL-safe repeated merges, coordinated fallback/proxy behavior, bounded CDX
+diagnostics, and conditional terminal-page validation. Keeps schema 9, legacy
+CDX selection identities, project and user settings, and the existing 76-suffix
+non-text policy. Does not delete previous scan results or old collapsed capture
+selection evidence.
+
+**Important:** Inherited collapsed ranges whose historical canonical CDX `urlkey`
+was never saved cannot be reconstructed exactly from persisted capture URLs.
+They remain untouched; manual/service-side reconciliation is still required.
+Legacy repeated merges without source-run links explicitly fail safe. A CDX
+endpoint that returns a syntactically valid but short complete-looking prefix
+can still be undetectable. Native Windows/macOS CI and sustained live Wayback
+throughput are unverified. Full testing details in the v1.2.4 audit ledger.
+
+---
+
 # Scout 1.2.3 — Acquisition/indexing correctness and retry recovery
 
 This is an incremental patch based on the complete v1.2.2 operations-audited source. It responds to the October 13 acquisition/indexing audit without claiming that every proposed architectural redesign has been implemented. Schema 9, text/media download modes, existing project folders, scan scores, reports, and user pacing settings are retained. Known suffixes are excluded from *text scanning* as explicitly requested, even if Wayback presents incorrect MIME; audio and descriptors are reported honestly rather than forcibly treated as video.

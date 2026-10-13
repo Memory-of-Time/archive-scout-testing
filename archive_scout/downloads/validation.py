@@ -8,6 +8,30 @@ import urllib.error
 def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     message = str(exc).casefold()
     status = getattr(exc, "status", None)
+    # Resolve nested transport exceptions by type before guessing from their
+    # textual messages. Pool exhaustion is not an archive read timeout.
+    import httpx
+    import urllib3
+    from ..network.transports import TransportExhaustedError
+    pending: list[BaseException] = [exc]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(current, httpx.PoolTimeout) or isinstance(current, urllib3.exceptions.EmptyPoolError):
+            return "connection_pool_timeout", status, True
+        if isinstance(current, (httpx.ConnectTimeout, urllib3.exceptions.ConnectTimeoutError)):
+            return "connect_timeout", status, True
+        if isinstance(current, (httpx.ReadTimeout, urllib3.exceptions.ReadTimeoutError)):
+            return "read_timeout", status, True
+        if isinstance(current, TransportExhaustedError):
+            pending.extend(error for _, error in current.failures)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
     explicit_category = str(getattr(exc, "category", "") or "")
     if explicit_category in {"wayback_excluded", "robots_blocked", "wayback_forbidden", "missing_capture", "http_client_error"}:
         return explicit_category, int(status) if status else None, False
