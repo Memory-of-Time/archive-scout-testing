@@ -274,6 +274,81 @@ def split_window(window: PendingWindow) -> list[PendingWindow]:
 
 
 
+def coalesce_unstarted_micro_windows(
+    plan: IndexPlan, *, seen: int, collapse_enabled: bool,
+    minimum_run: int = 8, maximum_seconds: int = 3600,
+) -> int:
+    """Repair inherited second-sized plans without losing committed cursors.
+
+    A collapsed query may only be reassembled if *nothing* from this scope has
+    been committed, because collapse:urlkey is not compositionally equivalent
+    across date ranges. Non-collapsed windows have stable member semantics.
+    No cursor, numbered-page ledger, or window with failure state is touched.
+    Returns the number of redundant windows removed, for checkpoint reporting.
+    """
+    if collapse_enabled and (seen or plan.completed):
+        return 0
+    if len(plan.pending) < minimum_run:
+        return 0
+
+    def eligible(window: PendingWindow) -> bool:
+        if (window.resume_key is not None or window.page or window.page_count >= 0
+                or window.retry_pages or window.page_failures or window.failures
+                or window.gateway_504_failures):
+            return False
+        try:
+            width = (datetime.strptime(window.end, "%Y%m%d%H%M%S") -
+                     datetime.strptime(window.start, "%Y%m%d%H%M%S")).total_seconds()
+        except ValueError:
+            return False
+        return 0 <= width <= 5
+
+    pending = plan.pending
+    repaired: list[PendingWindow] = []
+    position = 0
+    while position < len(pending):
+        current = pending[position]
+        if not eligible(current):
+            repaired.append(current)
+            position += 1
+            continue
+        next_pos = position + 1
+        while next_pos < len(pending):
+            next_window = pending[next_pos]
+            if not eligible(next_window):
+                break
+            if (current.strategy != next_window.strategy or
+                current.page_size != next_window.page_size or
+                current.page_blocks != next_window.page_blocks or
+                current.pagination_supported != next_window.pagination_supported):
+                break
+            try:
+                left = datetime.strptime(pending[next_pos - 1].end, "%Y%m%d%H%M%S")
+                right = datetime.strptime(next_window.start, "%Y%m%d%H%M%S")
+                start = datetime.strptime(current.start, "%Y%m%d%H%M%S")
+                finish = datetime.strptime(next_window.end, "%Y%m%d%H%M%S")
+            except ValueError:
+                break
+            if right - left != timedelta(seconds=1) or (finish - start).total_seconds() > maximum_seconds:
+                break
+            next_pos += 1
+        if next_pos - position < minimum_run:
+            repaired.append(current)
+            position += 1
+            continue
+        # Reconstruction retains original scope, page size, and strategy.
+        repaired.append(PendingWindow(current.start, pending[next_pos - 1].end,
+                                       page_size=current.page_size, strategy=current.strategy,
+                                       page_blocks=current.page_blocks,
+                                       pagination_supported=current.pagination_supported))
+        position = next_pos
+    removed = len(pending) - len(repaired)
+    if removed:
+        plan.pending = repaired
+        plan.planned = max(plan.completed + len(repaired), plan.planned - removed)
+    return removed
+
+
 def _bisect_persistent_gateway_504(window: PendingWindow) -> list[PendingWindow]:
     """Conservatively split a not-yet-started CDX range after repeated 504s.
 
@@ -316,6 +391,7 @@ def _maybe_subdivide_persistent_gateway_504(
     callback: Callable[[ProgressEvent], None] | None,
     completed_windows: int,
     total_windows: int,
+    collapse_enabled: bool = False,
 ) -> bool:
     """Durably replace a stuck broad range with two halves, never drop work.
 
@@ -327,7 +403,7 @@ def _maybe_subdivide_persistent_gateway_504(
     mixed_endpoint_outage = ("all cdx endpoints failed" in details and any(
         f"http {status}" in details for status in (408, 425, 429, 500, 502, 503)
     ))
-    if (exc.status != 504 or exc.connection_failed or isinstance(exc, RateLimitDeferred)
+    if (collapse_enabled or exc.status != 504 or exc.connection_failed or isinstance(exc, RateLimitDeferred)
             or mixed_endpoint_outage):
         current.gateway_504_failures = 0
         return False
@@ -981,6 +1057,23 @@ def index_archive(
             seen = int(state["seen"] or 0) if state else 0
             error_id = int(state["error_id"]) if state and state["error_id"] else None
             plan = decode_plan(state_plan, default_windows)
+            old_pending, old_planned = plan.pending, plan.planned
+            removed = coalesce_unstarted_micro_windows(
+                plan, seen=seen, collapse_enabled=bool(target_config.cdx_collapses))
+            if removed:
+                try:
+                    with database:
+                        persist_task_state(encode_plan(plan), False, seen, error_id)
+                        record_recovery_event(database, "index", "inherited_micro_window_repair",
+                            f"Combined {removed:,} untouched one-second CDX windows without altering committed checkpoints.",
+                            details={"target": target, "remaining_windows": len(plan.pending)})
+                except BaseException:
+                    plan.pending, plan.planned = old_pending, old_planned
+                    raise
+                emit(callback, ProgressEvent("index", f"Repaired {removed:,} inherited tiny CDX windows; saved checkpoint before new requests."))
+            elif target_config.cdx_collapses and seen and len(plan.pending) >= 8:
+                emit(callback, ProgressEvent("index", "Existing fragmented collapsed CDX checkpoint retained: "
+                    "automatic reassembly could change which timestamp represents a URL."))
             completed_windows += plan.completed
             total_windows += max(0, plan.planned - len(default_windows))
 
@@ -1319,6 +1412,7 @@ def index_archive(
                     if _maybe_subdivide_persistent_gateway_504(
                         database, plan, current, exc, persist_task_state, seen, error_id,
                         callback, completed_windows, total_windows,
+                        collapse_enabled=bool(target_config.cdx_collapses),
                     ):
                         total_windows += 1
                         transient_failure_streak = 0
@@ -1349,7 +1443,7 @@ def index_archive(
                         )
                         continue
                     if current.strategy == "resume" and current.pagination_supported:
-                        parts = split_window(current) if _can_split_cdx_window(current, exc) else []
+                        parts = split_window(current) if (not target_config.cdx_collapses and _can_split_cdx_window(current, exc)) else []
                         if parts:
                             plan.pending[0:1] = parts
                             added = len(parts) - 1
@@ -1359,7 +1453,7 @@ def index_archive(
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
                             emit(callback, ProgressEvent("index", f"CDX query-size/timeout recovery: split {target} {label} into {len(parts)} smaller windows (unfinished ranges retained).", completed_windows, total_windows))
                             continue
-                        if _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
+                        if not target_config.cdx_collapses and _can_split_cdx_window(current, exc) and preferred_index_strategy(target_config, target) == "paged":
                             current.strategy = "paged"
                             current.page = 0
                             current.page_count = -1

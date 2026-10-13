@@ -1,4 +1,4 @@
-# Scout 1.2.2
+# Scout 1.2.3
 
 **Scout** is a cross-platform desktop and command-line workspace for finding, preserving, downloading, searching, and reviewing public Wayback Machine captures.
 
@@ -60,11 +60,28 @@ The [test matrix](.github/workflows/tests.yml) covers Python 3.11/3.12 on Window
 
 Source overview: [`archive_scout/`](archive_scout/) application code; [`tests/`](tests/) regression tests; [`scripts/`](scripts/) benchmarking/build automation; [`packaging/`](packaging/) OS setup; [`docs/`](docs/) operational and developer guides. See [Architecture](docs/ARCHITECTURE.md), [Operations](docs/OPERATIONS.md), [Indexing and recovery](docs/INDEXING_RECOVERY.md), [Privacy](docs/PRIVACY.md), [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md).
 
+## Scout 1.2.3 acquisition and indexing safety patch
+
+This release retains schema 9 and the existing project/query identities. It adds
+an explicit non-text suffix policy for 76 requested formats (including archived
+media mislabeled as HTML), collapse-safe error handling for CDX, conservative
+repair of inherited one-second windows, storage-full hard stops, file-backed
+SQLite download queues, local saved-body recovery, and a fair autonomous sweep
+for retryable text acquisition failures while persistent retries are enabled.
+The existing fixed healthy request pacing is not raised automatically.
+
+**Upgrade an existing project in place.** Stop Scout, take a consistent backup,
+replace only source/program files, then reopen the same `project.json`. Do not
+copy only the `.sqlite3` file from an active WAL project. [Implementation notes
+and limitations](docs/SCOUT_1_2_3_PATCH_VALIDATION.md) explain remaining risks.
+
 ## Upgrade and resume existing projects
 
 Scout **1.2.2** retains the v1.2.0 **schema-9** database and CDX query identity. Existing project folders hold their own indexed inventory, durable download states, scan matches, and CDX checkpoints. **Do not create a new project** when upgrading a large archive. Stop the old Scout process, take a consistent backup of the project (including all capture/media folders), and open the existing `project.json` in the new app. Keep original targets, date range, filters, and collapse options while verifying the upgrade. Changing network pacing does not alter CDX identity.
 
 Before/after inventory verification: `python scripts/check_project_resume.py "PATH_TO_EXISTING_PROJECT" --snapshot before.json` before opening v1.2.2, then `python scripts/check_project_resume.py "PATH_TO_EXISTING_PROJECT" --compare before.json` after upgrading. This is **read-only** and refuses a missing database instead of silently creating one. See [Upgrade v1.2.0 projects](docs/UPGRADE_1_2_0_TO_1_2_1.md) for exact instructions and limitations.
+
+**Keyword scan selection:** The **Keyword sets** page's **Use in next scan** checkbox selects a single set of rules for each new download/scan or rescan. Only that set is used; each operation creates at most one new scan run and one matching scan-report folder. Checking a different set replaces the selection. Simply opening an unchecked set does not change the selection. Uncheck the currently selected set to disable keyword scanning until another set is selected. Older projects with several checked sets use the first checked set, retaining the others for later selection. Prior reports and scan history are intentionally not deleted.
 
 See the [1.2.2 indexing and scanning audit](docs/SCOUT_1_2_2_INDEX_SCAN_AUDIT.md) for the new recovery behavior and verification limits.
 

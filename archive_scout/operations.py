@@ -38,6 +38,13 @@ from .scanning.rescanner import rescan_keyword_sets
 
 from .scanning.hitlist import load_hitlist, search_with_hitlist
 
+class IncompleteCoverage(RuntimeError):
+    """Files/reports are retained, but scan completeness could not be established."""
+    def __init__(self, message: str, paths: dict[str, Path]):
+        super().__init__(message)
+        self.paths = paths
+
+
 SUPPORTED_MODES = {
     "hitlist",
     "all", "external_media_after_scan", "index", "download", "download_only", "retry_download_errors", "resume", "rescan", "retry_errors", "report", "integrity",
@@ -184,7 +191,8 @@ def scan_prior_documents_once(database: sqlite3.Connection, jobs: list[ScanJob],
         return
     rescan_keyword_sets(database, jobs, stop_event, callback,
                         workers=config.workers, missing_only=True,
-                        scope_pairs=scopes)
+                        scope_pairs=scopes,
+                        empty_message="Existing-document check complete: no outstanding saved-body scans; continuing with this operation.")
 
 
 def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
@@ -214,10 +222,20 @@ def finish_jobs(database: sqlite3.Connection, jobs: list[ScanJob], status: str,
         finish_scan_run(database, job.scan_run_id, actual)
 
 
-def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob]) -> dict[str, Path]:
+def generate_job_reports(config: ProjectConfig, database: sqlite3.Connection, jobs: list[ScanJob],
+                         callback: Callable[[ProgressEvent], None] | None = None,
+                         stop_event: threading.Event | None = None) -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for index, job in enumerate(jobs, 1):
-        generated = generate_reports(config, database, job.scan_run_id)
+        if callback:
+            callback(ProgressEvent("report", f"Generating reports for scan {job.scan_run_id} ({index}/{len(jobs)})"))
+        generated = generate_reports(
+            config, database, job.scan_run_id,
+            progress=(lambda name, count, done: callback(ProgressEvent(
+                "report", f"{'Wrote' if done else 'Writing'} {name}.txt: {count:,} rows"
+            ))) if callback else None,
+            stop_event=stop_event,
+        )
         if index == 1:
             paths.update(generated)
         paths[f"scan_{job.scan_run_id}_folder"] = generated["scan_folder"]
@@ -261,6 +279,23 @@ def _retryable_text_batches(config, database: sqlite3.Connection, *, batch_size:
         yield ids
 
 
+def remaining_acquisition_gaps(config: ProjectConfig, database: sqlite3.Connection) -> int:
+    """Count unfinished acquisition in the current target/signature scope.
+
+    Reports may still be generated, but a successful export must not turn
+    unresolved downloads into a falsely complete operation status.
+    """
+    from .downloads.downloader import _populate_download_scopes
+    _populate_download_scopes(database, config)
+    return int(database.execute(
+        """SELECT COUNT(*) FROM captures c JOIN targets t ON t.id=c.target_id
+           WHERE EXISTS(SELECT 1 FROM archive_scout_download_scopes s
+                WHERE s.pattern=t.pattern AND s.signature=c.query_signature)
+             AND (c.state='error' OR (c.state='pending' AND c.download_attempts>=?))""",
+        (config.max_attempts,),
+    ).fetchone()[0])
+
+
 def recover_transient_text_errors(
     config: ProjectConfig,
     database: sqlite3.Connection,
@@ -268,19 +303,59 @@ def recover_transient_text_errors(
     jobs: list[ScanJob],
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None,
-) -> None:
-    """One fair recovery sweep per operation; failures remain retryable later.
+    *,
+    continuous: bool = False,
+    acquire_only: bool = False,
+) -> int:
+    """Fair, bounded-memory retries with autonomous outage recovery.
 
-    A permanently unavailable host must not trap a days-long operation retrying
-    the same low-numbered captures indefinitely. No new timers or per-capture
-    database probes are added to the healthy acquisition path.
+    Every round walks the eligible failures in ID order once. A persistent run
+    remains active through outages, but the entire network workload waits at a
+    single interruptible cooldown between rounds. No per-capture sleep and no
+    requirement to click Resume when a temporary transport problem clears.
+    Explicit retry operations and callers not opting in retain one-sweep mode.
     """
-    for ids in _retryable_text_batches(config, database):
-        if stop_event.is_set():
+    failures_without_progress = 0
+    previous_remaining = None
+    while True:
+        attempted = 0
+        for ids in _retryable_text_batches(config, database):
+            if stop_event.is_set():
+                raise Stopped
+            attempted += len(ids)
+            emit(callback, ProgressEvent(
+                "download_retry", f"Recovering {len(ids):,} transient text failures (fair retry sweep)"))
+            download_archive(config, database, scan_run_id, stop_event, callback,
+                             states=("error",), capture_ids=ids, scan_jobs=jobs,
+                             acquire_only=acquire_only)
+        # Query one bounded batch to test whether retryable work remains. Avoid
+        # a project-sized COUNT inside the hot capture-saving loop.
+        remaining = next(_retryable_text_batches(config, database, batch_size=1), [])
+        if not remaining:
+            return 0
+        if not continuous or not config.network.persistent_retries:
+            return len(remaining)  # some retryable work is still incomplete
+        # Local scanner remains eligible while network admission is cooling.
+        if jobs and not acquire_only:
+            from .scanning.pending import scan_pending_saved
+            for target in config.targets:
+                scan_pending_saved(database, config.for_target(target), jobs,
+                                   stop_event, callback, workers=config.workers)
+        if previous_remaining is None or attempted == previous_remaining:
+            failures_without_progress += 1
+        else:
+            failures_without_progress = 0
+        previous_remaining = attempted
+        pause = min(config.network.retry_max_seconds,
+                    max(1.0, config.network.retry_base_seconds) *
+                    2 ** min(8, max(0, failures_without_progress - 1)))
+        emit(callback, ProgressEvent(
+            "download_retry", f"Temporary download failures remain. Work is checkpointed; "
+            f"recovery sweep resumes in {pause:.1f}s. Local scanning is independent."))
+        if stop_event.wait(pause):
             raise Stopped
-        emit(callback, ProgressEvent("download_retry", f"Retrying {len(ids):,} recoverable text failures in this sweep"))
-        download_archive(config, database, scan_run_id, stop_event, callback,
-                         states=("error",), capture_ids=ids, scan_jobs=jobs)
+
+
 
 
 def retry_capture_downloads(config, database, stop_event, callback) -> None:
@@ -366,6 +441,11 @@ def run_project(
             original_callback(event)
 
     callback = operation_callback
+    def report_progress(name: str, count: int, done: bool) -> None:
+        emit(callback, ProgressEvent(
+            "report", f"{'Wrote' if done else 'Writing'} {name}.txt: {count:,} rows"
+        ))
+    report_finalization_started = False
     try:
         save_project_config(config)
         if mode == "hitlist":
@@ -442,8 +522,10 @@ def run_project(
             return {"merge_summary": merge_report}
         if mode == "index":
             index_archive(config, database, stop_event, callback)
-            classify_indexed_captures(database, cdx_query_signature(config), stop_event)
-            paths = generate_index_reports(config, database)
+            for signature in {cdx_query_signature(config.for_target(target)) for target in config.targets}:
+                classify_indexed_captures(database, signature, stop_event)
+            paths = generate_index_reports(config, database,
+                progress=report_progress, stop_event=stop_event)
             paths["project"] = config.output_dir / "project.json"
             finish_operation_run(database, operation_run_id, "complete", "Index complete")
             database.commit()
@@ -456,11 +538,18 @@ def run_project(
             existing = int(latest[0]) if latest else None
             if existing is None:
                 if database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]:
-                    paths = generate_index_reports(config, database)
+                    paths = generate_index_reports(config, database,
+                        progress=report_progress, stop_event=stop_event)
                 else:
                     raise RuntimeError("this project does not contain indexed captures or a completed scan run")
             else:
-                paths = generate_reports(config, database, existing)
+                paths = generate_reports(
+                    config, database, existing,
+                    progress=lambda name, count, done: emit(callback, ProgressEvent(
+                        "report", f"{'Wrote' if done else 'Writing'} {name}.txt: {count:,} rows"
+                    )),
+                    stop_event=stop_event,
+                )
             emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
             finish_operation_run(database, operation_run_id, "complete", "Reports regenerated")
             database.commit()
@@ -491,6 +580,13 @@ def run_project(
             database.commit()
             return paths
 
+        # Filesystem and database are not one transaction. Recover complete
+        # raw bodies after an interrupted SQLite/FTS commit before network work.
+        if mode in {"all", "resume", "download", "external_media_after_scan", "rescan"}:
+            from .scanning.pending import adopt_orphaned_bodies
+            for target in config.targets:
+                adopt_orphaned_bodies(database, config.for_target(target), stop_event, callback, target=target)
+
         # Scanning retained bodies is local work and must not wait for CDX.
         # On a Resume with an unreachable indexing endpoint, every previously
         # saved capture can still be recovered and scored before the outage.
@@ -512,16 +608,22 @@ def run_project(
             if mode == "download_only":
                 download_archive(config, database, 0, stop_event, callback,
                                  states=("pending",), acquire_only=True)
+                recover_transient_text_errors(config, database, 0, [], stop_event,
+                                              callback, continuous=True, acquire_only=True)
             else:
                 retry_capture_downloads(config, database, stop_event, callback)
             if mode == "download_only" and config.media.enabled:
                 index_media(config, database, stop_event, callback)
                 download_media(config, database, stop_event, callback)
-            paths = generate_index_reports(config, database)
+            paths = generate_index_reports(config, database,
+                operation="download_only", progress=report_progress, stop_event=stop_event)
             paths["project"] = config.output_dir / "project.json"
             if config.media.enabled and mode == "download_only":
                 paths.update(generate_media_reports(config, database))
-            finish_operation_run(database, operation_run_id, "complete", "Acquisition-only operation complete")
+            gaps = remaining_acquisition_gaps(config, database)
+            finish_operation_run(database, operation_run_id, "incomplete" if gaps else "complete",
+                                 f"Acquisition-only: {gaps:,} unresolved capture(s)" if gaps
+                                 else "Acquisition-only operation complete")
             database.commit()
             return paths
 
@@ -562,10 +664,21 @@ def run_project(
                     config.retry_media_capture_ids or None,
                 )
         if mode in {"all", "external_media_after_scan", "download", "resume"}:
-            recover_transient_text_errors(config, database, primary_run_id, jobs, stop_event, callback)
+            recover_transient_text_errors(config, database, primary_run_id, jobs, stop_event,
+                                          callback, continuous=True)
+        if mode in {"all", "download", "resume", "external_media_after_scan", "retry_errors"}:
+            from .scanning.pending import scan_pending_saved
+            for target in config.targets:
+                scan_pending_saved(database, config.for_target(target), jobs, stop_event,
+                                   callback, workers=config.workers)
+        emit(callback, ProgressEvent("scan_finalize", "Scanning finished. Verifying saved-document coverage."))
         finish_jobs(database, jobs, "complete", config)
         database.commit()
-        paths = generate_job_reports(config, database, jobs)
+        # Reporting may involve project-sized exports; keep the scan results
+        # durable and report progress so the GUI does not appear frozen at 100%.
+        report_finalization_started = True
+        emit(callback, ProgressEvent("report", "Scanning committed. Generating scan reports."))
+        paths = generate_job_reports(config, database, jobs, callback=callback, stop_event=stop_event)
         if mode == "retry_errors" and database.execute("SELECT COUNT(*) FROM media_captures").fetchone()[0]:
             paths.update(generate_media_reports(config, database))
         if mode == "external_media_after_scan":
@@ -606,9 +719,33 @@ def run_project(
             research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
             paths["research_index"] = research_report
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-        finish_operation_run(database, operation_run_id, "complete", "Operation complete")
+        incomplete_runs = []
+        for job in jobs:
+            run_state = database.execute(
+                "SELECT status FROM scan_runs WHERE id=?", (job.scan_run_id,)
+            ).fetchone()
+            # Compatibility harnesses can inject synthetic jobs without a
+            # persisted scan_runs row. Real jobs always have a durable row.
+            if run_state is not None and run_state[0] != "complete":
+                incomplete_runs.append(int(job.scan_run_id))
+        if incomplete_runs:
+            raise IncompleteCoverage(
+                f"Reports saved, but scan coverage is incomplete for run(s) "
+                f"{', '.join(map(str, incomplete_runs))}. Check unresolved scan errors "
+                "and rerun Rescan to recover missing bodies.", paths,
+            )
+        unresolved = remaining_acquisition_gaps(config, database)
+        finish_operation_run(database, operation_run_id,
+                             "incomplete" if unresolved else "complete",
+                             f"{unresolved:,} unresolved capture(s) remain in the selected scope" if unresolved
+                             else "Operation complete")
         database.commit()
         return paths
+    except IncompleteCoverage as exc:
+        finish_operation_run(database, operation_run_id, "incomplete", str(exc))
+        database.commit()
+        emit(callback, ProgressEvent("scan_incomplete", str(exc)))
+        raise
     except ConnectivityPaused as exc:
         with database:
             database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
@@ -650,7 +787,12 @@ def run_project(
             database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
             database.execute("UPDATE media_captures SET state='pending' WHERE state='downloading'")
             if jobs:
-                finish_jobs(database, jobs, "failed")
+                # A filesystem/report export failure after the last scan result
+                # is NOT a failed scan. Leave an explicit rescan retry point so
+                # the same run (and its existing zero-hit/match evidence) can
+                # be reused to regenerate the missing reports on next Rescan.
+                finish_jobs(database, jobs, "interrupted" if
+                            (mode == "rescan" and report_finalization_started) else "failed")
         finish_operation_run(database, operation_run_id, "failed", f"{type(exc).__name__}: {exc}")
         database.commit()
         raise

@@ -43,4 +43,4 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
         return "oversized_response", status, False
     if "network failure" in message or "urlopen" in message or "connection" in message:
         return "connection", status, True
-    return "unknown", status, True
+    return "local_processing_error", status, False

@@ -873,25 +873,26 @@ class ResilientTransport:
         self.lock = threading.Lock()
         self.cooldown_until: dict[str, float] = {}
         self.last_success: str | None = None
-        available: dict[str, object] = {
-            "httpx": HttpxBackend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
-            "urllib3": Urllib3Backend(pool_size, connect_timeout, read_timeout),
+        # Explicit backends must not instantiate unused stacks. In particular,
+        # a missing optional SOCKS dependency must not break urllib3-only mode.
+        factories = {
+            "httpx": lambda: HttpxBackend(pool_size, connect_timeout, read_timeout, trust_env=trust_env),
+            "urllib3": lambda: Urllib3Backend(pool_size, connect_timeout, read_timeout),
+            "curl": lambda: CurlBackend(connect_timeout, read_timeout),
         }
-        try:
-            available["curl"] = CurlBackend(connect_timeout, read_timeout)
-        except BackendUnavailable:
-            pass
-        if requested == "auto":
-            self.backends = available
-            self.order = [name for name in ("httpx", "urllib3", "curl") if name in available]
-        else:
-            if requested not in available:
-                raise BackendUnavailable(f"requested network backend is unavailable: {requested}")
-            self.backends = {requested: available[requested]}
-            self.order = [requested]
-            for name, backend in available.items():
-                if name != requested:
-                    backend.close()
+        self.backends: dict[str, object] = {}
+        names = ("httpx", "urllib3", "curl") if requested == "auto" else (requested,)
+        for name in names:
+            try:
+                self.backends[name] = factories[name]()
+            except (BackendUnavailable, ImportError, ValueError, RuntimeError, OSError) as exc:
+                if requested != "auto":
+                    raise BackendUnavailable(f"requested network backend unavailable: {name}: {exc}") from exc
+                if callback:
+                    callback(f"Network backend {name} unavailable during initialization; using an available backend.")
+        if not self.backends:
+            raise BackendUnavailable("no network backend available")
+        self.order = list(self.backends)
 
     @property
     def backend_names(self) -> tuple[str, ...]:
@@ -907,13 +908,21 @@ class ResilientTransport:
             preferred = self.last_success
             available = [name for name in self.order if self.cooldown_until.get(name, 0.0) <= now]
         if not available:
-            # All backends are cooling down. Try all of them instead of blocking
-            # forever; the caller owns retry/backoff and can save progress.
-            available = list(self.order)
+            # At most one scheduled recovery probe when all routes have failed.
+            # Never bypass every backend cooldown for every waiting capture.
+            available = [min(self.order, key=lambda name: self.cooldown_until.get(name, 0))]
         if preferred in available:
             available.remove(preferred)
             available.insert(0, preferred)
         return available
+
+    def _await_backend(self, name: str, stop_event: threading.Event) -> None:
+        with self.lock:
+            delay = max(0.0, self.cooldown_until.get(name, 0.0) - time.monotonic())
+        if delay and stop_event.wait(delay):
+            raise Stopped
+        if stop_event.is_set():
+            raise Stopped
 
     def request(
         self,
@@ -924,7 +933,10 @@ class ResilientTransport:
         redirect_validator: Callable[[str, str], None] | None = None,
     ) -> TransportResponse:
         failures: list[tuple[str, BaseException]] = []
-        for name in self._ordered_names():
+        # An alternate stack is a diagnosis/recovery trial, not three new
+        # physical connections for every failed logical URL attempt.
+        for name in self._ordered_names()[:2]:
+            self._await_backend(name, stop_event)
             if stop_event.is_set():
                 raise Stopped
             backend = self.backends[name]
@@ -979,8 +991,9 @@ class ResilientTransport:
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
         names = (["httpx"] if retain_partial and destination.exists() and _partial_metadata_path(destination).is_file()
-                 and "httpx" in self.backends else self._ordered_names())
+                 and "httpx" in self.backends else self._ordered_names()[:2])
         for name in names:
+            self._await_backend(name, stop_event)
             if stop_event.is_set():
                 raise Stopped
             backend = self.backends[name]
@@ -1015,8 +1028,9 @@ class ResilientTransport:
                 if not partial_ready:
                     self.cooldown_until[name] = time.monotonic() + 30.0
             last_error = failures[-1][1]
-            if partial_ready:
-                # Never overwrite an identity-bound prefix with another backend.
+            if partial_ready or is_transport_read_timeout(last_error):
+                # Never overwrite identity-bound prefixes or repeat a remote
+                # read/response failure via a different Python HTTP client.
                 break
             if is_transport_read_timeout(last_error):
                 if self.callback:

@@ -19,8 +19,8 @@ from archive_scout.scanning.jobs import ScanJob
 
 class RoutingRegressionTests(unittest.TestCase):
     def test_conflicts_remain_eligible_for_payload_validation(self):
-        self.assertEqual(classify_indexed_resource('http://x.test/a.jpg', 'text/html').resource_class, 'unknown')
-        self.assertEqual(classify_payload_kind(b'<html>needle</html>', 'image/jpeg', 'http://x.test/a.jpg').resource_class, 'text')
+        self.assertEqual(classify_indexed_resource('http://x.test/a.jpg', 'text/html').resource_class, 'image')
+        self.assertEqual(classify_payload_kind(b'<html>needle</html>', 'image/jpeg', 'http://x.test/a.jpg').resource_class, 'image')
         self.assertEqual(classify_payload_kind(b'BMW owners', 'text/plain', 'http://x.test/a').resource_class, 'text')
         self.assertEqual(classify_payload_kind(b'\x89PNG\r\n\x1a\n'+b'\0'*48, 'text/plain', 'http://x.test/a.html').resource_class, 'image')
         self.assertEqual(classify_payload_kind(b'<svg xmlns="http://www.w3.org/2000/svg"/>', 'image/svg+xml', 'http://x.test/a.svg').resource_class, 'image')

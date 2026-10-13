@@ -7,10 +7,19 @@ from pathlib import Path
 
 from .constants import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, TEXT_EXTENSIONS, VIDEO_EXTENSIONS
 
-RESOURCE_CLASSIFIER_REVISION = 3
+RESOURCE_CLASSIFIER_REVISION = 4
 PREVIEW_BUDGET = 64 * 1024
 
-MEDIA_DESCRIPTOR_EXTENSIONS = {".asx", ".m3u", ".m3u8", ".mpd", ".pls", ".ram", ".smil", ".smi", ".vtt", ".srt"}
+MEDIA_DESCRIPTOR_EXTENSIONS = {".asx", ".m3u", ".m3u8", ".mpd", ".pls", ".ram", ".smil", ".smi", ".vtt", ".srt", ".wax", ".wvx", ".wmx", ".wpl"}
+
+# Explicit preservation policy: these suffixes never enter *text* replay, even
+# when historical CDX metadata incorrectly claims text/html. This is separate
+# from the best-evidence content type (audio/descriptor/unknown may be nuanced).
+SUFFIX_NON_TEXT_IMAGES = set(".jpeg .jpg .png .bmp .gif .tiff .psd .dib .webp .sr .ras .jfif .xxx".split())
+SUFFIX_NON_TEXT_MEDIA = set(".webm .mpeg .mpg .wmv .mjpg .mjpeg .rv .avi .mov .3gp .rm .swf .flv .mkv .vob .ogv .ogg .drc .gifv .mng .mts .m2ts .ts .qt .yuv .rmvb .viv .asf .amv .m4p .m4v .mp2 .mpe .mpv .svi .3g2 .mxf .roq .nsv .f4v .f4p .f4a .f4b .asx .avchd .m2v .wma .wm .wax .wvx .wmx .wpl .dvr-ms .wmd .m1v .mpa .m3u .ivf .m4a .mp4 .mp4v .3gp2 .3gpp".split())
+SUFFIX_NON_TEXT = SUFFIX_NON_TEXT_IMAGES | SUFFIX_NON_TEXT_MEDIA
+SUFFIX_AUDIO = set(".ogg .mp2 .mpa .m4a .wma .f4a .f4b".split())
+
 OTHER_BINARY_EXTENSIONS = {
     ".7z", ".ace", ".bin", ".bz2", ".cab", ".class", ".dmg", ".doc", ".docx", ".eot",
     ".exe", ".gz", ".iso", ".jar", ".otf", ".pdf", ".ppt", ".pptx", ".rar", ".tar",
@@ -45,7 +54,9 @@ def path_extension(url: str) -> str:
     except (ValueError, TypeError, UnicodeError):
         return ""
     name = Path(urllib.parse.unquote(path)).name.casefold()
-    suffix = Path(name).suffix.casefold()
+    # Legacy archives use filename.wmv;session and filename.wmv&token in
+    # the URL *path*; query strings are never used to determine routing.
+    suffix = Path(re.split(r"[;&]", name, maxsplit=1)[0]).suffix.casefold()
     return suffix if suffix.startswith(".") else ""
 
 
@@ -93,6 +104,24 @@ def _extension_class(ext: str) -> str | None:
 
 
 
+def suffix_non_text_decision(url: str) -> ResourceDecision | None:
+    """Explicit suffix policy, independent of misleading CDX/replay MIME."""
+    ext = path_extension(url)
+    if ext not in SUFFIX_NON_TEXT:
+        return None
+    if ext in MEDIA_DESCRIPTOR_EXTENSIONS:
+        kind = "media_descriptor"
+    elif ext == ".xxx":
+        kind = "other_binary"  # uncertain actual format, still excluded from text
+    elif ext in SUFFIX_NON_TEXT_IMAGES:
+        kind = "image"
+    elif ext in SUFFIX_AUDIO:
+        kind = "audio"
+    else:
+        kind = "video"  # routing group, not proof of video codec
+    return ResourceDecision(kind, f"suffix_policy:{ext}", True)
+
+
 def classify_indexed_resource(url: str, mimetype: str | None) -> ResourceDecision:
     """Classify CDX metadata without pretending metadata can prove payload bytes.
 
@@ -100,6 +129,9 @@ def classify_indexed_resource(url: str, mimetype: str | None) -> ResourceDecisio
     confident when the URL has no contradictory known suffix. Conflicts and weak
     metadata intentionally remain unknown so the replay prefix validator can decide.
     """
+    policy = suffix_non_text_decision(url)
+    if policy is not None:
+        return policy
     mime = normalized_mime(mimetype)
     ext = path_extension(url)
     mime_kind = _mime_class(mime)
@@ -130,6 +162,9 @@ def classify_indexed_resource(url: str, mimetype: str | None) -> ResourceDecisio
 
 def classify_payload_kind(data: bytes, content_type: str, original_url: str) -> ResourceDecision:
     """Cheap structural check; a misleading text MIME cannot override magic bytes."""
+    policy = suffix_non_text_decision(original_url)
+    if policy is not None:
+        return policy
     sample = data[:65536]
     if sample.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")):
         return ResourceDecision("image", "payload:image_magic", True)

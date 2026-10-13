@@ -427,7 +427,7 @@ class ProjectConfig:
     connect_timeout: float = 30.0
     read_timeout: float = 180.0
     max_attempts: int = 4
-    user_agent: str = "Scout/1.2.2 public web archive research client"
+    user_agent: str = "Scout/1.2.3 public web archive research client"
     retry_error_categories: list[str] = field(default_factory=list)
     retry_capture_ids: list[int] = field(default_factory=list)
     retry_media_capture_ids: list[int] = field(default_factory=list)
@@ -481,12 +481,22 @@ class ProjectConfig:
         return list(unique.values())
 
     def selected_keyword_sets(self) -> list[KeywordSetConfig]:
-        return [item for item in self.normalized_keyword_sets() if item.selected]
+        # One operation scans exactly one explicitly enabled set.  Older
+        # projects can have several selected=True sets, so choose the first
+        # deterministically without losing any saved sets or their rules.
+        return [item for item in self.normalized_keyword_sets() if item.selected][:1]
 
     def normalized(self) -> "ProjectConfig":
         targets = list(dict.fromkeys(normalize_target(value) for value in self.targets if value.strip()))
         keyword_sets = self.normalized_keyword_sets()
-        first = keyword_sets[0] if keyword_sets else KeywordSetConfig(self.keyword_set_name, [], True)
+        active_index = next((index for index, item in enumerate(keyword_sets) if item.selected), None)
+        # Canonicalize imported/older multi-selection configurations. Preserve
+        # unselected sets for future runs, but never create parallel scan runs.
+        keyword_sets = [replace(item, selected=index == active_index)
+                        for index, item in enumerate(keyword_sets)]
+        primary = (keyword_sets[active_index] if active_index is not None
+                   else keyword_sets[0] if keyword_sets
+                   else KeywordSetConfig(self.keyword_set_name, [], True))
         output_dir = Path(self.output_dir).expanduser().resolve()
         from_date = normalize_cdx_date(self.from_date or str(self.from_year), end=False)
         to_date = normalize_cdx_date(self.to_date or str(self.to_year), end=True)
@@ -519,8 +529,8 @@ class ProjectConfig:
         return ProjectConfig(
             output_dir=output_dir,
             targets=targets,
-            keywords=list(first.rules),
-            keyword_set_name=first.name,
+            keywords=list(primary.rules),
+            keyword_set_name=primary.name,
             keyword_sets=keyword_sets,
             from_year=int(from_date[:4]),
             to_year=int(to_date[:4]),
@@ -545,7 +555,7 @@ class ProjectConfig:
             connect_timeout=max(1.0, float(self.connect_timeout)),
             read_timeout=max(1.0, float(self.read_timeout)),
             max_attempts=min(20, max(1, int(self.max_attempts))),
-            user_agent=self.user_agent.strip() or "Scout/1.2.2 public web archive research client",
+            user_agent=self.user_agent.strip() or "Scout/1.2.3 public web archive research client",
             retry_error_categories=list(dict.fromkeys(value.strip() for value in self.retry_error_categories if value.strip())),
             retry_capture_ids=sorted({int(value) for value in self.retry_capture_ids if int(value) > 0}),
             retry_media_capture_ids=sorted({int(value) for value in self.retry_media_capture_ids if int(value) > 0}),
@@ -722,7 +732,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         connect_timeout=float(payload.get("connect_timeout", 30.0)),
         read_timeout=float(payload.get("read_timeout", 180.0)),
         max_attempts=int(payload.get("max_attempts", 4)),
-        user_agent=str(payload.get("user_agent", "Scout/1.2.2 public web archive research client")),
+        user_agent=str(payload.get("user_agent", "Scout/1.2.3 public web archive research client")),
         retry_error_categories=list(payload.get("retry_error_categories") or []),
         retry_capture_ids=[int(value) for value in payload.get("retry_capture_ids") or []],
         retry_media_capture_ids=[int(value) for value in payload.get("retry_media_capture_ids") or []],

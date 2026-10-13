@@ -1,7 +1,22 @@
 # Changelog
 
+## Scout 1.2.3 — Acquisition/indexing integrity (incremental patch)
+
+- Route the 76 explicitly requested known non-text suffixes away from text acquisition even when Wayback reports `text/html`; retain evidence of MIME contradictions and descriptors/audio provenance.
+- Prevent error-recovery subdivision from changing `collapse=urlkey` capture selection; conservatively coalesce untouched inherited one-second windows where semantic scope permits.
+- Stop acquisition on disk-full errors instead of recording thousands of retryable URL errors.
+- Retain validated raw bodies before local parsing; adopt exact ID-bound complete files after a SQLite/FTS interruption, then rescan locally.
+- Fair repeated recovery sweeps for transient text failures in persistent modes, with interruptible shared pauses and scan progress preserved; mark unresolved acquisition states incomplete.
+- Construct only requested transport backends, avoid bypassing all backend cooldowns, and limit fallback trials.
+- Move the large SQLite TEMP queue to file-backed storage for more predictable memory use.
+- Preserve schema-9 databases, historical scans, user pacing, CLI/GUI settings and prior operation audit corrections.
+- The full streaming/scanning architecture and live multi-day throughput remain unverified; see `docs/SCOUT_1_2_3_PATCH_VALIDATION.md`.
+
 ## Scout 1.2.2 — Indexing, scanning and report integrity
 
+- One explicitly selected keyword set per scan/rescan operation, producing one new scan report directory rather than multiple; other sets and past scan history remain available.
+- Browsing an unchecked keyword set no longer silently clears the checked "Use in next scan" selection. Legacy projects with multiple checked sets use the first checked set only.
+- Includes the previously missing `scripts/check_project_resume.py` and the canonical Windows/macOS path-safe resume compatibility test.
 - Scan text inline with downloads; independently recover retained bodies before further network indexing.
 - Resume partial scans and backfill missing document outcomes without repeating completed scoring.
 - Recover downloaded bodies lacking document records; make scan results and state atomic.

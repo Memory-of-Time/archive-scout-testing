@@ -1,3 +1,13 @@
+# Scout 1.2.3 — Acquisition/indexing correctness and retry recovery
+
+This is an incremental patch based on the complete v1.2.2 operations-audited source. It responds to the October 13 acquisition/indexing audit without claiming that every proposed architectural redesign has been implemented. Schema 9, text/media download modes, existing project folders, scan scores, reports, and user pacing settings are retained. Known suffixes are excluded from *text scanning* as explicitly requested, even if Wayback presents incorrect MIME; audio and descriptors are reported honestly rather than forcibly treated as video.
+
+**Safety:** Back up your project before replacing the program source. Disk-full halts acquisition; non-storage transient failures can recover autonomously when persistent retries are enabled. The new retry loop is intentionally long-running during actual outages until the user requests Stop. Existing capture and CDX checkpoints are retained.
+
+**Unverified:** sustained live Wayback throughput, Windows/macOS CI for this exact zip, multi-day recovery, byte-streaming into a separate scanner, a durable per-capture next-attempt schedule, full reconciliation of inherited collapsed query plans, clean-prefix CDX truncation detection, repeated evolving-WAL project merges and one-million-row maintenance performance. See detailed patch validation.
+
+---
+
 # Scout 1.2.2 — Indexing and scanning recovery
 
 This release repairs incomplete scan coverage, empty reports, and repeat CDX failures. Scans run alongside text downloads and recover prior saved bodies before the next indexing request in an existing project. Per-target query overrides stay in the download/retry queue. CDX errors no longer masquerade as empty inventories, and reports distinguish incomplete indexing, missing scan outcomes and legitimate zero matches. Text/media differentiation and schema 9 are unchanged.

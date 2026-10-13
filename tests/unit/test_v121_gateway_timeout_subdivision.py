@@ -24,7 +24,7 @@ def configuration(root: Path) -> ProjectConfig:
     return ProjectConfig(
         output_dir=root, targets=["*.liveleak.com/*"], keywords=[],
         from_date="20060101", to_date="20081231", cdx_delay=0,
-        retries=1, text_collapse_scope="range",
+        retries=1, text_collapse_scope="range", cdx_collapses=[],
         network=NetworkConfig(index_strategy="resume"),
     ).normalized()
 

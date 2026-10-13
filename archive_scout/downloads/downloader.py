@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import concurrent.futures
 from collections import deque
+import json
 import hashlib
+import errno
+import os
 import sqlite3
 import threading
 import time
@@ -31,6 +34,24 @@ from .redirects import make_replay_redirect_validator
 from ..network.transports import RedirectPolicyError
 
 
+class StorageFullError(OSError):
+    """Hard operation blocker; never classify a full disk as a URL retry."""
+
+
+def _storage_full(exc: BaseException) -> bool:
+    visited = set()
+    while isinstance(exc, BaseException) and id(exc) not in visited:
+        visited.add(id(exc))
+        if isinstance(exc, OSError) and (exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}
+                                            or getattr(exc, "winerror", None) in {39, 112}):
+            return True
+        if isinstance(exc, sqlite3.Error) and (getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL
+                                               or "database or disk is full" in str(exc).casefold()):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def replay_url(timestamp: str, original: str, modifier: str = "id_") -> str:
     encoded = urllib.parse.quote(original, safe=":/?&=#%+;,[]@!$'()*")
     clean_modifier = modifier if modifier in {"id_", "if_", "oe_"} else "id_"
@@ -52,6 +73,45 @@ def _populate_download_scopes(database: sqlite3.Connection, config: ProjectConfi
         "INSERT OR IGNORE INTO archive_scout_download_scopes VALUES(?,?)",
         ((target, cdx_query_signature(config.for_target(target))) for target in config.targets),
     )
+
+
+
+def _restore_changed_url_filter_skips(database: sqlite3.Connection, config: ProjectConfig) -> None:
+    """A changed URL keyword selection must reconsider prior filter skips.
+
+    Cache only the selection identity in project_meta; leave skipped rows alone
+    on unchanged runs. The reset and identity update commit together so a crash
+    cannot permanently hide rows when new keywords are chosen.
+    """
+    selection = {
+        "scope": config.download_scope,
+        "targets": sorted((target, cdx_query_signature(config.for_target(target)))
+                          for target in config.targets),
+        "rules": [item.rules for item in config.selected_keyword_sets()],
+    }
+    digest = hashlib.sha256(json.dumps(selection, ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    key = "text_url_filter_selection_v1"
+    old = database.execute("SELECT value FROM project_meta WHERE key=?", (key,)).fetchone()
+    if old and old[0] == digest:
+        return
+    # Only current target/signature pairs, and only specifically URL-filtered
+    # exclusions, are reopened. Media/policy skips remain permanently routed.
+    with database:
+        database.execute("""UPDATE captures SET state='pending',updated_at=?
+            WHERE state='skipped' AND EXISTS (
+                SELECT 1 FROM capture_routing r WHERE r.capture_id=captures.id
+                AND r.routing='skipped_url_filter')
+            AND EXISTS (SELECT 1 FROM targets t JOIN archive_scout_download_scopes s
+                ON s.pattern=t.pattern AND s.signature=captures.query_signature
+                WHERE t.id=captures.target_id)""", (utc_now(),))
+        database.execute("""UPDATE capture_routing SET routing='pending',updated_at=?
+            WHERE routing='skipped_url_filter' AND EXISTS (
+                SELECT 1 FROM captures c JOIN targets t ON t.id=c.target_id
+                JOIN archive_scout_download_scopes s
+                ON s.pattern=t.pattern AND s.signature=c.query_signature
+                WHERE c.id=capture_routing.capture_id AND c.state='pending')""", (utc_now(),))
+        database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES(?,?)", (key,digest))
 
 
 def cumulative_download_progress(
@@ -87,7 +147,8 @@ def prepare_download_rows(
     dependent parameter limit when a large retry selection is supplied.
     """
     if not capture_ids:
-        classify_indexed_captures(database, cdx_query_signature(config))
+        for signature in {cdx_query_signature(config.for_target(target)) for target in config.targets}:
+            classify_indexed_captures(database, signature)
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_download_queue")
     database.execute(
         """CREATE TEMP TABLE archive_scout_download_queue(
@@ -101,6 +162,8 @@ def prepare_download_rows(
     )
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_capture_selection")
     _populate_download_scopes(database, config)
+    if not capture_ids:
+        _restore_changed_url_filter_skips(database, config)
 
     source = "captures c"
     clauses: list[str] = []
@@ -136,16 +199,16 @@ def prepare_download_rows(
         if not chunk:
             break
         selected_ids: list[tuple[int, int, int]] = []
-        binary_ids: list[int] = []
+        binary_ids: list[tuple[int, str, str]] = []
         keyword_skips: list[tuple[str, int]] = []
         for row in chunk:
             capture_id = int(row["id"])
             decision = classify_indexed_resource(row["original_url"], row["mimetype"] or "")
             if decision.resource_class in {"image","video","audio","other_binary"} and decision.confident:
-                binary_ids.append(capture_id)
+                binary_ids.append((capture_id, decision.resource_class, decision.reason))
                 continue
             if decision.resource_class == "media_descriptor" and decision.confident:
-                binary_ids.append(capture_id)
+                binary_ids.append((capture_id, decision.resource_class, decision.reason))
                 continue
             if config.download_scope == "keyword_urls" and url_prefilter is not None:
                 original_url = str(row["original_url"])
@@ -176,12 +239,19 @@ def prepare_download_rows(
             if binary_ids:
                 database.executemany(
                     "UPDATE captures SET state='skipped',updated_at=? WHERE id=?",
-                    ((now, capture_id) for capture_id in binary_ids),
+                    ((now, capture_id) for capture_id, _, _ in binary_ids),
                 )
                 database.executemany(
                     """UPDATE capture_routing SET routing=?,updated_at=? WHERE capture_id=?""",
-                    (("deferred_to_media" if config.media.enabled else "skipped_non_text", now, capture_id)
-                     for capture_id in binary_ids),
+                    (("deferred_to_media" if config.media.enabled and kind in {"image", "video"}
+                      else "unsupported_non_text" if config.media.enabled and kind in {"audio", "media_descriptor"}
+                      else "skipped_non_text", now, capture_id)
+                     for capture_id, kind, _ in binary_ids),
+                )
+                database.executemany(
+                    """UPDATE capture_routing SET resource_class=?,evidence=?,confident=1,updated_at=?
+                       WHERE capture_id=?""",
+                    ((kind, evidence, now, capture_id) for capture_id, kind, evidence in binary_ids),
                 )
     total = int(database.execute(
         "SELECT COUNT(*) FROM archive_scout_download_queue"
@@ -253,9 +323,11 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
     replay_problem = classify_replay_content(raw, response["final_url"])
     if replay_problem:
         raise RuntimeError(replay_problem)
+    # Publish validated replay bytes before expensive local parsing/scoring.
+    # Even a failed parser or SQLite transaction must not force reacquisition.
+    path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
+    atomic_write_bytes(path, bytes(data))
     if not scan_now:
-        path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
-        atomic_write_bytes(path, bytes(data))
         return {"capture_id": int(row["id"]), "path": path,
                 "bytes_saved": len(data), "content_hash": hashlib.sha256(data).hexdigest(),
                 "http_status": response["status"], "final_url": response["final_url"],
@@ -277,8 +349,6 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
         )
         for job in jobs
     }
-    path = capture_path(config.output_dir, int(row["id"]), row["timestamp"], original)
-    atomic_write_bytes(path, bytes(data))
     return {
         "capture_id": int(row["id"]),
         "path": path,
@@ -348,6 +418,13 @@ def download_archive(
     if not acquire_only and (not jobs or any(not job.patterns for job in jobs)):
         raise ValueError("at least one keyword rule is required")
     combined_patterns = [item for job in jobs for item in job.patterns]
+    if acquire_only and config.download_scope == "keyword_urls":
+        # Download-only does not create scan runs, but URL-only filtering must
+        # still honor the explicitly selected keyword box.
+        selected = config.selected_keyword_sets()
+        if not selected:
+            raise ValueError("URL-only downloads require a selected keyword set")
+        combined_patterns = ScanJob.create(0, selected[0].name, selected[0].rules).patterns
     with database:
         database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
     total, row_iter = prepare_download_rows(
@@ -465,7 +542,26 @@ def download_archive(
                     row = futures.pop(future)
                     try:
                         result = future.result()
-                        save_success(database, result)
+                        try:
+                            save_success(database, result)
+                        except Exception:
+                            # The atomic body exists even if an INSERT or FTS
+                            # write failed. Save an independent scan checkpoint
+                            # when SQLite is still writable; otherwise the
+                            # orphan-file adopter on restart finds it by ID.
+                            path = Path(result.get("path", ""))
+                            if path.is_file() and path.stat().st_size == result.get("bytes_saved"):
+                                try:
+                                    with database:
+                                        database.execute(
+                                            """UPDATE captures SET state='downloaded_unscanned',
+                                               bytes_saved=?,http_status=?,final_url=?,updated_at=? WHERE id=?""",
+                                            (result["bytes_saved"], result["http_status"],
+                                             result["final_url"], utc_now(), result["capture_id"]),
+                                        )
+                                except sqlite3.Error:
+                                    pass  # Backstop: adopt exact ID-bound file at next run.
+                            raise
                         saved_this_pass += 1
                         last_save = time.monotonic()
                         recent_commits.append(last_save)
@@ -484,7 +580,8 @@ def download_archive(
                                    resource_class=excluded.resource_class,evidence=excluded.evidence,
                                    confident=excluded.confident,routing=excluded.routing,updated_at=excluded.updated_at""",
                                 (row["id"], exc.resource_class,exc.reason,1,
-                                 "deferred_to_media" if config.media.enabled else "skipped_non_text",utc_now()),
+                                 ("deferred_to_media" if config.media.enabled and exc.resource_class in {"image","video"}
+                                  else "unsupported_non_text" if config.media.enabled else "skipped_non_text"),utc_now()),
                             )
                             if config.media.enabled and exc.resource_class in {"image","video"}:
                                 from ..media.indexer import media_query_signature
@@ -518,6 +615,12 @@ def download_archive(
                             database.execute("UPDATE captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))
                         raise
                     except Exception as exc:
+                        if _storage_full(exc):
+                            for pending in futures:
+                                pending.cancel()
+                            if callback:
+                                callback(ProgressEvent("storage_full", "Storage full: stopped new acquisition; saved project checkpoints remain resumable."))
+                            raise StorageFullError("storage full while retaining a capture or committing its results") from exc
                         failures += 1
                         if isinstance(exc, RedirectPolicyError):
                             category, status, retryable = exc.category, None, False
@@ -528,11 +631,14 @@ def download_archive(
                         )
                         with database:
                             database.execute(
-                                "UPDATE captures SET state='error',http_status=?,final_url=COALESCE(?,final_url),updated_at=? WHERE id=?",
+                                """UPDATE captures SET state='error',http_status=?,
+                                   final_url=COALESCE(?,final_url),updated_at=?
+                                   WHERE id=? AND state!='downloaded_unscanned'""",
                                 (status, getattr(exc, "destination", None), utc_now(), row["id"]),
                             )
                             database.execute(
-                                "UPDATE capture_routing SET routing='failed',updated_at=? WHERE capture_id=?",
+                                """UPDATE capture_routing SET routing='failed',updated_at=?
+                                   WHERE capture_id=? AND (SELECT state FROM captures WHERE id=capture_id)!='downloaded_unscanned'""",
                                 (utc_now(), row["id"]),
                             )
                             record_error(

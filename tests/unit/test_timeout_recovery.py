@@ -16,7 +16,7 @@ class TimeoutRecoveryTests(unittest.TestCase):
     def test_one_hour_timeout_is_split_and_does_not_interrupt(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(text_collapse_scope="year", 
+            config = ProjectConfig(text_collapse_scope="year", cdx_collapses=[], 
                 output_dir=root,
                 targets=["flashback.org/*"],
                 keywords=["x"],
@@ -42,7 +42,7 @@ class TimeoutRecoveryTests(unittest.TestCase):
     def test_one_second_timeout_retries_until_success(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            config = ProjectConfig(text_collapse_scope="year", 
+            config = ProjectConfig(text_collapse_scope="year", cdx_collapses=[], 
                 output_dir=root,
                 targets=["example.com/*"],
                 keywords=["x"],

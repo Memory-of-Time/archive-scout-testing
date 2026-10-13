@@ -188,3 +188,71 @@ def scan_pending_saved(
                     completed, count,
                 ))
     return completed
+
+
+def adopt_orphaned_bodies(database: sqlite3.Connection, config, stop_event: threading.Event,
+                          callback=None, *, target: str | None = None) -> int:
+    """Recover atomically saved bytes whose DB commit was interrupted.
+
+    Only previous attempted captures are checked; a million untouched URLs
+    must not produce a million filesystem stats on every Resume. Files are
+    identity-bound to (capture ID, original URL), not guessed by basename.
+    """
+    from ..downloads.downloader import capture_path
+    from ..classification import classify_payload_kind
+    from ..content import classify_replay_content, decode_bytes
+    from ..cdx.parameters import cdx_query_signature
+    target = target or (config.targets[0] if config.targets else None)
+    if not target:
+        return 0
+    sig = cdx_query_signature(config)
+    cursor = 0
+    adopted = 0
+    while True:
+        rows = database.execute(
+            """SELECT c.id,c.timestamp,c.original_url,c.mimetype FROM captures c
+               LEFT JOIN documents d ON d.capture_id=c.id
+               JOIN targets t ON t.id=c.target_id
+               WHERE c.id>? AND c.query_signature=? AND t.pattern=?
+                 AND c.state IN ('pending','error') AND c.download_attempts>0
+                 AND d.id IS NULL ORDER BY c.id LIMIT 500""",
+            (cursor, sig, target),
+        ).fetchall()
+        if not rows:
+            break
+        with database:
+            for row in rows:
+                if stop_event.is_set():
+                    raise Stopped
+                cursor = int(row["id"])
+                path = capture_path(config.output_dir, cursor, row["timestamp"], row["original_url"])
+                try:
+                    length = path.stat().st_size
+                    if not (0 < length <= config.max_file_bytes):
+                        continue
+                    # Exact identity is encoded in the filename; validate the
+                    # retained bytes and reject Wayback's own error shells.
+                    with path.open("rb") as handle:
+                        preview = handle.read(min(length, 65536))
+                    decision = classify_payload_kind(preview, row["mimetype"] or "", row["original_url"])
+                    if decision.resource_class != 'text':
+                        continue
+                    if classify_replay_content(decode_bytes(preview, row["mimetype"] or ""), ''):
+                        continue
+                    database.execute(
+                        """UPDATE captures SET state='downloaded_unscanned',bytes_saved=?,updated_at=?
+                           WHERE id=? AND state IN ('error','pending')""",
+                        (length, utc_now(), cursor),
+                    )
+                    database.execute(
+                        """UPDATE capture_routing SET routing='downloaded_awaiting_scan',
+                           evidence='validated_local_retained_body',resource_class='text',
+                           confident=1,updated_at=? WHERE capture_id=?""",
+                        (utc_now(), cursor),
+                    )
+                    adopted += 1
+                except (OSError, ValueError, UnicodeError):
+                    continue
+    if adopted and callback:
+        callback(ProgressEvent('scan', f'Recovered {adopted:,} complete previously saved bodies without network access.'))
+    return adopted

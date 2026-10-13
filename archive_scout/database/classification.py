@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections import Counter
 
-from ..classification import classify_indexed_resource
+from ..classification import classify_indexed_resource, suffix_non_text_decision, RESOURCE_CLASSIFIER_REVISION
 from ..utils import utc_now
 
 KINDS = ("text", "image", "video", "audio", "media_descriptor", "other_binary", "unknown")
@@ -28,6 +28,7 @@ def classify_indexed_captures(database: sqlite3.Connection, signature: str, stop
             (signature,cursor,max(1,batch_size)),
         ).fetchall()
         if not rows:
+            updated += refresh_suffix_policy_for_existing_rows(database, signature, stop_event, batch_size)
             return updated
         now=utc_now()
         values=[]
@@ -41,6 +42,54 @@ def classify_indexed_captures(database: sqlite3.Connection, signature: str, stop
                    (capture_id,resource_class,evidence,confident,routing,updated_at)
                    VALUES (?,?,?,?,?,?)""",values)
         updated+=len(values)
+
+def refresh_suffix_policy_for_existing_rows(
+    database: sqlite3.Connection, signature: str, stop_event=None, batch_size: int = 5000,
+) -> int:
+    """Once per classifier revision, correct pending inventory only.
+
+    Earlier versions could persist a text/html classification for a .mov URL.
+    Revisit old *unprocessed* rows in bounded keyset batches, preserving all
+    historical document/scan/skip decisions and CDX query identity.
+    """
+    key = f"nontext_suffix_revision:{RESOURCE_CLASSIFIER_REVISION}:{signature}"
+    if database.execute("SELECT 1 FROM project_meta WHERE key=?", (key,)).fetchone():
+        return 0
+    last_id = 0
+    modified = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            from ..events import Stopped
+            raise Stopped
+        rows = database.execute(
+            """SELECT c.id,c.original_url FROM captures c
+               JOIN capture_routing r ON r.capture_id=c.id
+               WHERE c.query_signature=? AND c.id>?
+                 AND c.state IN ('pending','skipped')
+                 AND r.routing IN ('pending','skipped_non_text','deferred_to_media','unsupported_non_text')
+               ORDER BY c.id LIMIT ?""",
+            (signature,last_id,max(1,batch_size)),
+        ).fetchall()
+        if not rows:
+            break
+        changes = []
+        now = utc_now()
+        for row in rows:
+            last_id = int(row["id"])
+            decision = suffix_non_text_decision(str(row["original_url"]))
+            if decision:
+                changes.append((decision.resource_class,decision.reason,now,last_id))
+        if changes:
+            with database:
+                database.executemany(
+                    """UPDATE capture_routing SET resource_class=?,evidence=?,confident=1,updated_at=?
+                       WHERE capture_id=?""", changes,
+                )
+            modified += len(changes)
+    with database:
+        database.execute("INSERT OR IGNORE INTO project_meta(key,value) VALUES(?,?)", (key,"complete"))
+    return modified
+
 
 def classification_counts(database: sqlite3.Connection, signature: str|None=None) -> dict[str,int]:
     """One grouped read on demand, never on the capture-saving hot path."""
