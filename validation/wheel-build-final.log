@@ -1,0 +1,9 @@
+Processing ./.
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: archive-scout
+  Building wheel for archive-scout (pyproject.toml): started
+  Building wheel for archive-scout (pyproject.toml): finished with status 'done'
+  Created wheel for archive-scout: filename=archive_scout-1.2.3-py3-none-any.whl size=468366 sha256=2301a61577c652e91aa209f34ec0293cac1685fdde38d24109eccaec3e6bbbf3
+  Stored in directory: /tmp/pip-ephem-wheel-cache-at7krdjr/wheels/66/c3/2a/ceadf2179803693c5d02d07b56f72917fa82bcfcca6ccf5129
+Successfully built archive-scout

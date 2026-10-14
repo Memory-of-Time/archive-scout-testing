@@ -1,0 +1,71 @@
+[
+  {
+    "history_rows": 100000,
+    "fixture_seed_seconds": 1.615,
+    "scanner_count_ms": 0.0077,
+    "scanner_first_pending_ms": 0.0269,
+    "legacy_count_ms_same_database": 30.2822,
+    "scanner_plan": [
+      "SEARCH t USING COVERING INDEX sqlite_autoindex_targets_1 (pattern=?)",
+      "SEARCH c USING INDEX captures_download_length_idx (query_signature=? AND state=?)",
+      "SEARCH d USING COVERING INDEX sqlite_autoindex_documents_1 (capture_id=?) LEFT-JOIN"
+    ],
+    "media_queue_setup_ms_once": 32.719,
+    "media_batch_ms": {
+      "early": 0.369,
+      "middle": 0.3208,
+      "late": 0.3441
+    },
+    "media_plan": [
+      "SEARCH q USING COVERING INDEX archive_scout_media_queue_order ((length,id)>(?,?))",
+      "SEARCH mc USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    "peak_rss_kib": 195796
+  },
+  {
+    "history_rows": 500000,
+    "fixture_seed_seconds": 6.925,
+    "scanner_count_ms": 0.0063,
+    "scanner_first_pending_ms": 0.0275,
+    "legacy_count_ms_same_database": 180.5041,
+    "scanner_plan": [
+      "SEARCH t USING COVERING INDEX sqlite_autoindex_targets_1 (pattern=?)",
+      "SEARCH c USING INDEX captures_download_length_idx (query_signature=? AND state=?)",
+      "SEARCH d USING COVERING INDEX sqlite_autoindex_documents_1 (capture_id=?) LEFT-JOIN"
+    ],
+    "media_queue_setup_ms_once": 189.05,
+    "media_batch_ms": {
+      "early": 0.4526,
+      "middle": 0.3711,
+      "late": 0.4875
+    },
+    "media_plan": [
+      "SEARCH q USING COVERING INDEX archive_scout_media_queue_order ((length,id)>(?,?))",
+      "SEARCH mc USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    "peak_rss_kib": 372100
+  },
+  {
+    "history_rows": 1000000,
+    "fixture_seed_seconds": 9.512,
+    "scanner_count_ms": 0.0073,
+    "scanner_first_pending_ms": 0.0234,
+    "legacy_count_ms_same_database": 370.3719,
+    "scanner_plan": [
+      "SEARCH t USING COVERING INDEX sqlite_autoindex_targets_1 (pattern=?)",
+      "SEARCH c USING INDEX captures_download_length_idx (query_signature=? AND state=?)",
+      "SEARCH d USING COVERING INDEX sqlite_autoindex_documents_1 (capture_id=?) LEFT-JOIN"
+    ],
+    "media_queue_setup_ms_once": 367.801,
+    "media_batch_ms": {
+      "early": 0.3219,
+      "middle": 0.4485,
+      "late": 0.3458
+    },
+    "media_plan": [
+      "SEARCH q USING COVERING INDEX archive_scout_media_queue_order ((length,id)>(?,?))",
+      "SEARCH mc USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    "peak_rss_kib": 372100
+  }
+]

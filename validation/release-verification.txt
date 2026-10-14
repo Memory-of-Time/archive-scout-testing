@@ -1,0 +1,1 @@
+Archive Scout 1.2.3: source, package, platform links and release workflow verified
