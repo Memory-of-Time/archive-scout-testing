@@ -165,7 +165,9 @@ class V101AuditTests(unittest.TestCase):
             database.close()
         payload = json.loads(row["progress_json"])
         self.assertEqual(row["message"], "Index complete")
-        self.assertEqual(payload, {"completed": 2, "total": 5, "stage": "index"})
+        # Index-only reports are now an independently observable finishing
+        # phase, rather than silently preserving an old index-stage percentage.
+        self.assertEqual(payload, {"completed": None, "total": None, "stage": "report"})
 
     def test_recoverable_pause_contract(self):
         self.assertTrue(is_recoverable_pause(ConnectivityPaused("saved")))

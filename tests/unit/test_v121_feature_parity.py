@@ -15,7 +15,7 @@ from archive_scout.database.repositories import (
     upsert_capture, upsert_document, save_match,
 )
 from archive_scout.reports.text import generate_reports
-from archive_scout.ui.main_window import enforce_active_keyword_set_selection
+from archive_scout.ui.main_window import enforce_active_keyword_set_selection, save_keyword_editor_state
 from archive_scout.utils import hash_text
 
 class FeatureRestorationTests(unittest.TestCase):
@@ -30,6 +30,24 @@ class FeatureRestorationTests(unittest.TestCase):
         self.assertEqual([v['rules'][0] for v in sets], ['alpha', 'beta', 'gamma'])
         enforce_active_keyword_set_selection(sets, 1, False)
         self.assertFalse(any(v['selected'] for v in sets))
+
+    def test_switching_editor_does_not_clear_previous_selection(self):
+        sets = [
+            {"name": "A", "rules": ["alpha"], "selected": True},
+            {"name": "B", "rules": ["beta"], "selected": False},
+        ]
+        # Switching from an unchecked editor must NOT uncheck the previously
+        # selected set; only a deliberate checkbox change can do so.
+        save_keyword_editor_state(sets, 0, ["alpha edited"], True)
+        save_keyword_editor_state(sets, 1, ["beta edited"], False)
+        self.assertEqual([s["selected"] for s in sets], [True, False])
+        save_keyword_editor_state(sets, 1, ["beta selected"], True)
+        self.assertEqual([s["selected"] for s in sets], [False, True])
+        save_keyword_editor_state(sets, 0, ["alpha more"], False)
+        self.assertEqual([s["selected"] for s in sets], [False, True])
+        save_keyword_editor_state(sets, 1, ["beta selected"], False)
+        self.assertEqual([s["selected"] for s in sets], [False, False])
+        self.assertEqual([s["rules"] for s in sets], [["alpha more"], ["beta selected"]])
 
     def test_automatic_resume_preserves_existing_paged_work_and_fixed_policy(self):
         config = ProjectConfig(output_dir=Path('.'), targets=['example.com/*'], keywords=['text']).normalized()
