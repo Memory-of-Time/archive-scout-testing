@@ -6,7 +6,9 @@ import shutil
 import sqlite3
 from collections import Counter
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
+import threading
+import tempfile
 
 from ..config import ProjectConfig
 from ..downloads.downloader import replay_url
@@ -53,12 +55,21 @@ def safe_run_name(value: str) -> str:
 
 
 def _copy_latest(run_path: Path, latest_path: Path) -> None:
+    """Publish the latest report atomically, preserving the old one on failure."""
     latest_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=latest_path.name + ".", suffix=".tmp",
+                                       dir=str(latest_path.parent))
+    os.close(descriptor)
+    staging = Path(name)
     try:
-        latest_path.unlink(missing_ok=True)
-        os.link(run_path, latest_path)
-    except OSError:
-        shutil.copyfile(run_path, latest_path)
+        try:
+            staging.unlink()
+            os.link(run_path, staging)
+        except OSError:
+            shutil.copyfile(run_path, staging)
+        os.replace(staging, latest_path)
+    finally:
+        staging.unlink(missing_ok=True)
 
 
 
@@ -71,15 +82,31 @@ def _report_settings(config: ProjectConfig):
     return ReportConfig(**value).normalized() if isinstance(value, dict) else ReportConfig()
 
 
-def _write_selected(root: Path, run_dir: Path | None, name: str, lines: Iterator[str], paths: dict[str, Path]) -> None:
+def _write_selected(root: Path, run_dir: Path | None, name: str, lines: Iterator[str], paths: dict[str, Path],
+                    progress: Callable[[str, int, bool], None] | None = None,
+                    stop_event: threading.Event | None = None) -> None:
     destination = (run_dir or root) / (name + ".txt")
-    atomic_write_lines(destination, lines)
+    count = 0
+    def tracked_lines() -> Iterator[str]:
+        nonlocal count
+        for line in lines:
+            if stop_event is not None and stop_event.is_set():
+                from ..events import Stopped
+                raise Stopped
+            count += 1
+            if progress is not None and count % 10000 == 0:
+                progress(name, count, False)
+            yield line
+    # Preserve the previous complete output if export is interrupted or fails.
+    atomic_write_lines(destination, tracked_lines())
     if run_dir is not None:
         current = root / (name + ".txt")
         _copy_latest(destination, current)
         paths[name] = current
     else:
         paths[name] = destination
+    if progress is not None:
+        progress(name, count, True)
 
 
 def _indexed_inventory_lines(database: sqlite3.Connection, fields: list[str]) -> Iterator[str]:
@@ -108,17 +135,21 @@ def _indexed_inventory_lines(database: sqlite3.Connection, fields: list[str]) ->
         yield "\t".join(values[name] for name in fields if name in values)
 
 
-def _write_over_attempt_inventory(config: ProjectConfig, database: sqlite3.Connection, root: Path) -> Path:
+def _write_over_attempt_inventory(config: ProjectConfig, database: sqlite3.Connection, root: Path,
+                                  stop_event: threading.Event | None = None) -> Path:
     """Report unreachable-by-normal-queue work only when reports are requested."""
     path = root / "unfinished_over_attempts.tsv"
-    atomic_write_lines(path, (
-        f"{row['id']}\t{row['download_attempts']}\t{row['state']}\t{row['timestamp']}\t{row['original_url']}"
+    def rows() -> Iterator[str]:
         for row in database.execute(
             "SELECT id,download_attempts,state,timestamp,original_url FROM captures "
             "WHERE state IN ('pending','error') AND download_attempts>=? ORDER BY id",
             (config.max_attempts,),
-        )
-    ))
+        ):
+            if stop_event is not None and stop_event.is_set():
+                from ..events import Stopped
+                raise Stopped
+            yield f"{row['id']}\t{row['download_attempts']}\t{row['state']}\t{row['timestamp']}\t{row['original_url']}"
+    atomic_write_lines(path, rows())
     return path
 
 
@@ -138,22 +169,29 @@ def _index_coverage_status(database: sqlite3.Connection) -> str:
             f"checkpoint windows complete; {incomplete:,} incomplete")
 
 
-def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) -> dict[str, Path]:
-    """Index-only reports; disabled outputs never execute their payload queries."""
+def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection,
+                           *, operation: str = "index",
+                           progress: Callable[[str, int, bool], None] | None = None,
+                           stop_event: threading.Event | None = None) -> dict[str, Path]:
+    """Index/acquisition reports, with safe cancellation and explicit semantics."""
+    if stop_event is not None and stop_event.is_set():
+        from ..events import Stopped
+        raise Stopped
     opts = _report_settings(config)
     root = config.output_dir / "reports"
     root.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
-    paths["unfinished_over_attempts"] = _write_over_attempt_inventory(config, database, root)
+    paths["unfinished_over_attempts"] = _write_over_attempt_inventory(config, database, root, stop_event)
     if opts.output_enabled("all_indexed_urls"):
         _write_selected(root,None,"all_indexed_urls",
-                        _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths)
+                        _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths,progress,stop_event)
     if opts.output_enabled("summary"):
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         values = {
             "heading": "Scout",
             "generated": f"Generated: {utc_now()}",
-            "operation": "Operation: Index URLs only",
+            "operation": ("Operation: Download text only (no keyword scan)" if operation == "download_only"
+                          else "Operation: Index URLs only"),
             "targets": f"Targets: {', '.join(config.targets) or '(none)'}",
             "date_range": f"Date range: {config.from_date}-{config.to_date}",
             "indexed_captures": f"Indexed captures: {int(database.execute('SELECT COUNT(*) FROM captures').fetchone()[0]):,}",
@@ -162,7 +200,7 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) 
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
         }
-        _write_selected(root, None, "summary", (values[field] for field in opts.summary_fields if field in values), paths)
+        _write_selected(root, None, "summary", (values[field] for field in opts.summary_fields if field in values), paths, progress, stop_event)
     if opts.output_enabled("errors"):
         def errors() -> Iterator[str]:
             for row in database.execute("""SELECT e.*,c.timestamp,c.original_url,d.path FROM errors e
@@ -170,9 +208,9 @@ def generate_index_reports(config: ProjectConfig, database: sqlite3.Connection) 
               WHERE e.resolved=0 ORDER BY e.operation,e.category,e.last_seen,e.id"""):
                 values = _error_fields(row)
                 yield "\t".join(values[field] for field in opts.fields_for("errors") if field in values)
-        _write_selected(root, None, "errors", errors(), paths)
+        _write_selected(root, None, "errors", errors(), paths, progress, stop_event)
     if opts.output_enabled("site_issues"):
-        _write_selected(root, None, "site_issues", _site_issue_rows(database, opts.fields_for("site_issues")), paths)
+        _write_selected(root, None, "site_issues", _site_issue_rows(database, opts.fields_for("site_issues")), paths, progress, stop_event)
     return paths
 
 
@@ -205,8 +243,13 @@ def _site_issue_rows(database: sqlite3.Connection, fields: list[str]) -> Iterato
         yield "\t".join(values[field] for field in fields if field in values)
 
 
-def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_run_id: int) -> dict[str, Path]:
+def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_run_id: int,
+                     progress: Callable[[str, int, bool], None] | None = None,
+                     stop_event: threading.Event | None = None) -> dict[str, Path]:
     """Stream exactly the enabled report outputs, without new acquisition work."""
+    if stop_event is not None and stop_event.is_set():
+        from ..events import Stopped
+        raise Stopped
     opts = _report_settings(config)
     run = database.execute("""SELECT sr.*,ks.name AS keyword_set_name,ks.keywords_json
        FROM scan_runs sr JOIN keyword_sets ks ON ks.id=sr.keyword_set_id WHERE sr.id=?""", (scan_run_id,)).fetchone()
@@ -278,7 +321,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             yield "\n".join(["=" * 100] + [values[key] for key in opts.ranked_fields if key in values] + [""])
 
     if need_ranked:
-        _write_selected(root, run_dir, "matches_ranked", ranked_lines(), paths)
+        _write_selected(root, run_dir, "matches_ranked", ranked_lines(), paths, progress, stop_event)
         # Root outputs always describe the latest scan, including legitimate
         # zero-hit scans. Preserve a separate last-nonempty discovery export.
         if database.execute(
@@ -300,7 +343,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
         if not opts.output_enabled(name):
             continue
         if not opts.fields_for(name):
-            _write_selected(root, run_dir, name, iter(()), paths)
+            _write_selected(root, run_dir, name, iter(()), paths, progress, stop_event)
             continue
         def urls(func=formatter) -> Iterator[str]:
             seen: set[str] = set()
@@ -309,14 +352,14 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
                 if value not in seen:
                     seen.add(value)
                     yield value
-        _write_selected(root, run_dir, name, urls(), paths)
+        _write_selected(root, run_dir, name, urls(), paths, progress, stop_event)
     if need_links:
         fields = opts.fields_for("interesting_links")
         def interesting() -> Iterator[str]:
             for row in database.execute("SELECT source,link FROM archive_scout_report_links ORDER BY source,link"):
                 vals = {"source_url": str(row["source"]), "link": str(row["link"])}
                 yield "\t".join(vals[field] for field in fields if field in vals)
-        _write_selected(root, run_dir, "interesting_links", interesting(), paths)
+        _write_selected(root, run_dir, "interesting_links", interesting(), paths, progress, stop_event)
         database.execute("DROP TABLE IF EXISTS temp.archive_scout_report_links")
     if need_counts:
         fields = opts.fields_for("keyword_counts")
@@ -324,10 +367,10 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             for label, count in counts.most_common():
                 vals = {"count": str(count), "keyword": str(label)}
                 yield "\t".join(vals[field] for field in fields if field in vals)
-        _write_selected(root, run_dir, "keyword_counts", keywords(), paths)
+        _write_selected(root, run_dir, "keyword_counts", keywords(), paths, progress, stop_event)
     if opts.output_enabled("all_indexed_urls"):
         _write_selected(root,run_dir,"all_indexed_urls",
-                        _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths)
+                        _indexed_inventory_lines(database,opts.fields_for("all_indexed_urls")),paths, progress, stop_event)
     if opts.output_enabled("errors"):
         def error_rows() -> Iterator[str]:
             for row in database.execute("""SELECT e.*,c.timestamp,c.original_url,d.path FROM errors e
@@ -335,9 +378,9 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
                  WHERE e.resolved=0 ORDER BY e.operation,e.category,e.last_seen,e.id"""):
                 values = _error_fields(row)
                 yield "\t".join(values[field] for field in opts.fields_for("errors") if field in values)
-        _write_selected(root, run_dir, "errors", error_rows(), paths)
+        _write_selected(root, run_dir, "errors", error_rows(), paths, progress, stop_event)
     if opts.output_enabled("site_issues"):
-        _write_selected(root, run_dir, "site_issues", _site_issue_rows(database, opts.fields_for("site_issues")), paths)
+        _write_selected(root, run_dir, "site_issues", _site_issue_rows(database, opts.fields_for("site_issues")), paths, progress, stop_event)
     if opts.output_enabled("summary"):
         state_counts = {str(row[0]): int(row[1]) for row in database.execute("SELECT state,COUNT(*) FROM captures GROUP BY state")}
         keywords = json.loads(run["keywords_json"])
@@ -367,7 +410,7 @@ def generate_reports(config: ProjectConfig, database: sqlite3.Connection, scan_r
             "site_issues": f"Open site-specific issues: {int(database.execute('SELECT COUNT(*) FROM site_issues WHERE resolved=0').fetchone()[0]):,}",
             "states": "States: " + ", ".join(f"{key}={value:,}" for key, value in sorted(state_counts.items())),
         }
-        _write_selected(root, run_dir, "summary", (values[name] for name in opts.summary_fields if name in values), paths)
+        _write_selected(root, run_dir, "summary", (values[name] for name in opts.summary_fields if name in values), paths, progress, stop_event)
     atomic_write_text(root / "latest_scan_run.txt", f"{scan_run_id}\n{run_dir}\n")
     paths["scan_folder"] = run_dir
     return paths

@@ -115,12 +115,17 @@ def rescan_keyword_sets(
     checkpoint: Callable[[int], None] | None = None,
     missing_only: bool = False,
     scope_pairs: list[tuple[str, str]] | None = None,
+    empty_message: str = "No saved documents to rescan.",
 ) -> None:
     if not jobs or any(not job.patterns for job in jobs):
         raise ValueError("at least one keyword rule is required in every selected keyword set")
     clauses: list[str] = ["d.id>?"] if after_document_id else []
     params: list[object] = [int(after_document_id)] if after_document_id else []
     if missing_only:
+        # Reacquisition-pending documents (including those flagged by Repair)
+        # do not have validated local bytes. Do not reread and overwrite their
+        # pending state during the pre-download local backfill.
+        clauses.append("c.state IN ('downloaded','downloaded_unscanned')")
         # A score=0 is still a persisted coverage marker; no need to reload
         # already-scored bodies into Python merely to rediscover no hits.
         placeholders = ",".join("?" for _ in jobs)
@@ -155,7 +160,7 @@ def rescan_keyword_sets(
     )
     if not total:
         if callback:
-            callback(ProgressEvent("rescan", "No saved documents to rescan.", 0, 0))
+            callback(ProgressEvent("rescan", empty_message, 0, 0))
         return
 
     worker_count = max(1, min(32, int(workers or min(8, os.cpu_count() or 4))))

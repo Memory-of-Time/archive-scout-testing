@@ -1,0 +1,2 @@
+6b7a7de49f1de00b31b5daa141ece0255db136415d88b7d5100026022b65ea05  archive_scout/reports/text.py
+e953b132dbc90e78f78ade1c112a28bca6ce0af723b19176e034b8689d064163  archive_scout/scanning/rescanner.py
