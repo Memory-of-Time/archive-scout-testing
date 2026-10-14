@@ -229,6 +229,7 @@ class RepairHistoricalEvidence(unittest.TestCase):
 class BackupUniqueness(unittest.TestCase):
     def test_back_to_back_manual_backups_preserve_both_snapshots(self):
         import sqlite3
+        from contextlib import closing
         from archive_scout.projects.backups import create_project_backup
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);db=open_database(root)
@@ -241,6 +242,8 @@ class BackupUniqueness(unittest.TestCase):
                 second=create_project_backup(root,'manual',keep=10)
                 self.assertNotEqual(first,second)
                 for path,expected in ((first,'old'),(second,'new')):
-                    with sqlite3.connect(path) as snapshot:
+                    # SQLite's connection context manager commits/rolls back but does
+                    # not close the file handle. Explicit closure is essential on Windows.
+                    with closing(sqlite3.connect(path)) as snapshot:
                         self.assertEqual(snapshot.execute("SELECT value FROM project_meta WHERE key='proof'").fetchone()[0], expected)
             finally:db.close()
