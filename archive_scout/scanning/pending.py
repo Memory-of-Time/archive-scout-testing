@@ -7,6 +7,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Callable, Iterator
@@ -28,6 +29,22 @@ class ArchivedErrorShell(RuntimeError):
 from .scoring import analyze_content, prepare_analysis_fields
 
 SCAN_BYTE_BUDGET = 64 * 1024 * 1024
+
+
+def _sqlite_write_busy(exc: BaseException) -> bool:
+    """SQLite busy/locked, including extended BUSY_SNAPSHOT, is not a scan error.
+
+    Retrying a failed write in the old read transaction can never fix
+    BUSY_SNAPSHOT. Roll back the *whole batch* and start a fresh write
+    transaction instead of recording a permanent per-capture scan failure.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return True
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
 
 
 def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
@@ -159,55 +176,86 @@ def scan_pending_saved(
             )
             if not done:
                 continue
-            # The download owner and local scanner share a transaction mutex
-            # when running concurrently. Other operations use a no-op context.
-            with (write_lock if write_lock is not None else nullcontext()), database:
-                for future in done:
-                    row, estimate = futures.pop(future)
-                    in_flight_bytes -= estimate
-                    # A scan and every match row are one atomic unit.  A failed
-                    # save_match must never commit upsert_document's state change,
-                    # which would otherwise strand a downloaded body as scanned.
-                    database.execute("SAVEPOINT scout_capture_scan")
-                    try:
-                        result = future.result()
-                        document_id = upsert_document(
-                            database, result["capture_id"], result["path"], result["title"],
-                            result["visible"], result["links"], result["content_hash"],
-                            result["normalized_hash"], result["bytes_saved"],
-                        )
-                        for run_id, analysis in result["analyses"].items():
-                            save_match(database, int(run_id), document_id, analysis)
-                        database.execute(
-                            "UPDATE captures SET state='downloaded',updated_at=? WHERE id=?",
-                            (utc_now(), result["capture_id"]),
-                        )
-                        database.execute(
-                            "UPDATE capture_routing SET routing='downloaded_scanned',updated_at=? WHERE capture_id=?",
-                            (utc_now(), result["capture_id"]),
-                        )
-                        resolve_errors(database, capture_id=result["capture_id"], document_id=document_id)
-                    except Exception as exc:
-                        database.execute("ROLLBACK TO SAVEPOINT scout_capture_scan")
-                        # Missing retained bytes need reacquisition; a transient
-                        # SQLite or parser failure does NOT need network access.
-                        missing = isinstance(exc, (FileNotFoundError, PayloadIntegrityError, ArchivedErrorShell))
-                        if missing:
-                            database.execute(
-                                "UPDATE captures SET state='error',updated_at=? WHERE id=?",
-                                (utc_now(), row["id"]),
-                            )
-                        record_error(
-                            database, "scan", ("local_integrity_failure" if isinstance(exc, PayloadIntegrityError)
-                             else "invalid_archive_replay" if isinstance(exc, ArchivedErrorShell)
-                             else "missing_local_file" if missing else "scan_failure"),
-                            repr(exc), capture_id=row["id"],
-                            retryable=not isinstance(exc, ArchivedErrorShell)
-                                or str(exc) == "origin_unavailable",
-                        )
-                    finally:
-                        database.execute("RELEASE SAVEPOINT scout_capture_scan")
-                    completed += 1
+            # CPU workers have finished.  Keep their results until the WHOLE
+            # SQLite batch has committed, so a busy/locked writer cannot lose
+            # an outcome or strand an already-retained body.
+            ready = [(future, *futures[future]) for future in done]
+            busy_started = None
+            busy_attempt = 0
+            while True:
+                if stop_event.is_set():
+                    for future in futures:
+                        future.cancel()
+                    raise Stopped
+                try:
+                    # The acquisition owner and scanner coordinate their writes
+                    # using a common mutex, while BEGIN IMMEDIATE claims the
+                    # SQLite WAL writer slot BEFORE any per-document changes.
+                    # It also avoids promoting a stale read snapshot mid-batch.
+                    with (write_lock if write_lock is not None else nullcontext()), database:
+                        if not database.in_transaction:
+                            database.execute("BEGIN IMMEDIATE")
+                        for future, row, estimate in ready:
+                            database.execute("SAVEPOINT scout_capture_scan")
+                            try:
+                                result = future.result()
+                                document_id = upsert_document(
+                                    database, result["capture_id"], result["path"], result["title"],
+                                    result["visible"], result["links"], result["content_hash"],
+                                    result["normalized_hash"], result["bytes_saved"],
+                                )
+                                for run_id, analysis in result["analyses"].items():
+                                    save_match(database, int(run_id), document_id, analysis)
+                                database.execute(
+                                    "UPDATE captures SET state='downloaded',updated_at=? WHERE id=?",
+                                    (utc_now(), result["capture_id"]),
+                                )
+                                database.execute(
+                                    "UPDATE capture_routing SET routing='downloaded_scanned',updated_at=? WHERE capture_id=?",
+                                    (utc_now(), result["capture_id"]),
+                                )
+                                resolve_errors(database, capture_id=result["capture_id"], document_id=document_id)
+                            except Exception as exc:
+                                database.execute("ROLLBACK TO SAVEPOINT scout_capture_scan")
+                                if _sqlite_write_busy(exc):
+                                    # Retry after the outer context rolls back.
+                                    # Error logging here would hit the same lock.
+                                    raise
+                                missing = isinstance(exc, (FileNotFoundError, PayloadIntegrityError, ArchivedErrorShell))
+                                if missing:
+                                    database.execute(
+                                        "UPDATE captures SET state='error',updated_at=? WHERE id=?",
+                                        (utc_now(), row["id"]),
+                                    )
+                                record_error(
+                                    database, "scan", ("local_integrity_failure" if isinstance(exc, PayloadIntegrityError)
+                                     else "invalid_archive_replay" if isinstance(exc, ArchivedErrorShell)
+                                     else "missing_local_file" if missing else "scan_failure"),
+                                    repr(exc), capture_id=row["id"],
+                                    retryable=not isinstance(exc, ArchivedErrorShell)
+                                        or str(exc) == "origin_unavailable",
+                                )
+                            finally:
+                                database.execute("RELEASE SAVEPOINT scout_capture_scan")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not _sqlite_write_busy(exc):
+                        raise
+                    busy_attempt += 1
+                    if busy_started is None:
+                        busy_started = time.monotonic()
+                    if callback and (busy_attempt == 3 or busy_attempt % 20 == 0):
+                        callback(ProgressEvent("scan", "SQLite writer busy; waiting to commit locally scanned bodies. "
+                            "Downloaded files and completed scan work are preserved."))
+                    # Interruptible cooldown: an active user Stop is honored,
+                    # but a temporary database lock is not an acquisition failure.
+                    delay = min(1.0, 0.1 * 2 ** min(4, busy_attempt - 1))
+                    if stop_event.wait(delay):
+                        raise Stopped
+            for future, row, estimate in ready:
+                futures.pop(future)
+                in_flight_bytes -= estimate
+            completed += len(ready)
             if callback and (completed % 100 == 0 or completed == count):
                 callback(ProgressEvent(
                     "scan", f"Locally scanned {completed:,}/{count:,} saved bodies",

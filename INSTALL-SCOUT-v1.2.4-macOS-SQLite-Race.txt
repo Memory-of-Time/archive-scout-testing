@@ -1,0 +1,34 @@
+Scout v1.2.4 macOS Intel Python 3.11 SQLite scanner race hotfix
+GitHub Actions run: https://github.com/Memory-of-Time/archive-scout-testing/actions/runs/38489927472
+
+Cause
+  A background local scanner could receive SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT
+  when claiming its SQLite write transaction. The code treated that as a
+  per-document scan error and attempted to log through the same locked
+  connection, causing the whole download/scan/report operation to fail.
+
+Changes
+  archive_scout/scanning/pending.py
+    - Begin an IMMEDIATE SQLite writer transaction before persisting scan rows.
+    - Roll back and retry whole atomic batches when SQLite reports busy/locked.
+    - Retain finished local CPU-scan outcomes until durable commit.
+    - Honor user Stop while waiting, and report prolonged writer contention.
+  archive_scout/downloads/downloader.py
+    - Reduce the background scanner connection's busy wait from 60s to 1.5s;
+      bounded interruptible retries are now handled in the scanner.
+  tests/unit/test_v124_sqlite_scanner_busy.py
+    - Regression tests for transient busy injection, a held external writer,
+      and correct busy/non-busy classification.
+
+Installation
+  Extract this ZIP directly into repository ROOT, preserving directories.
+  Overwrite the two source files and add the new test file.
+  Do NOT replace a project directory, SQLite database, captures, or settings.
+  Commit the 3 paths and rerun the full GitHub Actions matrix.
+
+Validation performed in local Linux container with Python 3.13:
+  - Canonical runner: 361 tests, 0 failures, 0 errors, 2 skipped.
+  - End-to-end download/scan/rescan/report: 100 consecutive passes.
+  - Targeted contention tests: all pass.
+  - Release verifier: passed.
+  Native macOS CI still requires rerun confirmation.

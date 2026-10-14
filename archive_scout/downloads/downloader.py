@@ -580,7 +580,7 @@ def download_archive(
             try:
                 connection.execute("PRAGMA journal_mode=WAL")
                 connection.execute("PRAGMA foreign_keys=ON")
-                connection.execute("PRAGMA busy_timeout=60000")
+                connection.execute("PRAGMA busy_timeout=1500")
                 connection.execute("PRAGMA temp_store=FILE")
                 while not stop_event.is_set():
                     scanner_wakeup.wait(2.0)
