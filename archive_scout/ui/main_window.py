@@ -43,7 +43,7 @@ from ..database.repositories import (
 from ..defaults import PRESETS
 from ..downloads.downloader import replay_url
 from ..events import ConnectivityPaused, ProgressEvent, Stopped
-from ..operations import run_project
+from ..operations import IncompleteCoverage, run_project
 from ..reports.compare import generate_scan_comparison
 from ..reports.export import export_review_package, export_scan
 from ..reports.text import generate_reports
@@ -68,11 +68,11 @@ MODE_HELP = {
     "download_only": "Indexes and saves text captures without scanning, keyword requirements or scan reports; optionally downloads supplemental media.",
     "retry_download_errors": "Retries unresolved text acquisition failures without creating scan jobs or scanning.",
     "download": "Downloads pending text captures and scans them with the keyword set marked Use in next scan.",
-    "resume": "Continues interrupted pending work without automatically retrying earlier errors.",
-    "rescan": "Reads saved files locally and creates new scan runs without making Wayback requests.",
+    "resume": "Continues interrupted indexing, downloading and scans; performs one bounded retry sweep for previously recorded transient text errors.",
+    "rescan": "Scans saved files locally, reusing an interrupted run with the same keywords and scope; no Wayback requests.",
     "retry_errors": "Retries unresolved text-page and media errors. Valid local text files are rescanned before redownloading.",
     "hitlist": "Searches all indexed URLs and saved text captures with a resumable literal hitlist; writes a CSV and coverage summary without downloading.",
-    "report": "Recreates reports from the latest completed scan without downloading or rescanning.",
+    "report": "Regenerates reports for the latest scan run (including incomplete scans, clearly labeled), without downloading or rescanning.",
     "integrity": "Checks saved files and database links without deleting project data.",
     "repair": "Creates a safety backup, repairs stuck states and missing-file records, and rebuilds full-text indexes.",
     "backup": "Creates a consistent SQLite backup inside the project backup folder.",
@@ -136,6 +136,21 @@ def enforce_active_keyword_set_selection(
         return
     for index, item in enumerate(keyword_sets):
         item["selected"] = bool(enabled and index == int(active_index))
+
+
+def save_keyword_editor_state(
+    keyword_sets: list[dict], active_index: int, rules: list[str], enabled: bool
+) -> None:
+    """Save one editor without changing selection merely by browsing sets."""
+    if not (0 <= active_index < len(keyword_sets)):
+        return
+    item = keyword_sets[active_index]
+    was_selected = bool(item.get("selected", True))
+    item["rules"] = list(rules)
+    if enabled and not was_selected:
+        enforce_active_keyword_set_selection(keyword_sets, active_index, True)
+    elif not enabled and was_selected:
+        item["selected"] = False
 
 
 class ArchiveScoutApp(tk.Tk):
@@ -1615,9 +1630,10 @@ class ArchiveScoutApp(tk.Tk):
         self.operation_help_var.set(MODE_HELP.get(MODE_LABELS.get(self.mode_var.get(), "all"), ""))
 
     def save_current_keyword_set(self) -> None:
-        if 0 <= self.current_keyword_set < len(self.keyword_sets):
-            self.keyword_sets[self.current_keyword_set]["rules"] = self.lines_from(self.keywords_text)
-            enforce_active_keyword_set_selection(self.keyword_sets, self.current_keyword_set, self.keyword_set_selected_var.get())
+        save_keyword_editor_state(
+            self.keyword_sets, self.current_keyword_set,
+            self.lines_from(self.keywords_text), self.keyword_set_selected_var.get(),
+        )
 
     def refresh_keyword_set_box(self, selected_index: int | None = None) -> None:
         names = [item["name"] for item in self.keyword_sets]
@@ -1919,6 +1935,8 @@ class ArchiveScoutApp(tk.Tk):
     def run_worker(self, config: ProjectConfig, mode: str) -> None:
         try:
             self.events.put(("complete", run_project(config, mode, self.stop_event, self.on_engine_event)))
+        except IncompleteCoverage as exc:
+            self.events.put(("incomplete", {"message": str(exc), "paths": exc.paths}))
         except (RateLimitDeferred, ConnectivityPaused) as exc:
             self.events.put(("deferred", str(exc)))
         except Stopped:
@@ -1993,6 +2011,17 @@ class ArchiveScoutApp(tk.Tk):
                     self.show_research_answer(payload)
                     self.status_var.set("Grounded AI review complete")
                     self.finish_run()
+                elif kind == "incomplete":
+                    self.last_paths = payload["paths"]
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate")
+                    self.status_var.set("Finished with incomplete scan coverage")
+                    self.log(payload["message"])
+                    self.finish_run()
+                    self.refresh_history()
+                    self.refresh_results()
+                    self.refresh_errors()
+                    messagebox.showwarning(APP_NAME, payload["message"])
                 elif kind == "stopped":
                     self.progress.stop()
                     self.status_var.set("Stopped. Progress was saved.")

@@ -7,6 +7,7 @@ from typing import Callable
 from ..events import ProgressEvent
 from ..projects.backups import create_project_backup
 from ..utils import atomic_write_text, utc_now
+from ..database.repositories import record_error
 
 
 def rebuild_full_text_index(database: sqlite3.Connection, batch_size: int = 500) -> int:
@@ -78,21 +79,35 @@ def repair_project(
                 if not path.is_file() or path.stat().st_size == 0:
                     invalid.append((int(row["id"]), int(row["capture_id"])))
             for document_id, capture_id in invalid:
+                # Never DELETE documents here: FK cascades would erase historical
+                # document_matches, including the only remaining evidence of
+                # past positive matches when the local source bytes are lost.
+                # Preserve stored text/links/scores and explicitly queue the
+                # capture for byte-for-byte reacquisition. upsert_document will
+                # reuse the same ID after a verified replacement is downloaded.
                 database.execute(
-                    "UPDATE captures SET state='pending',document_id=NULL,updated_at=? WHERE id=?",
+                    "UPDATE captures SET state='pending',updated_at=? WHERE id=?",
                     (utc_now(), capture_id),
                 )
-                database.execute("DELETE FROM documents_fts WHERE rowid=?", (document_id,))
-                database.execute("DELETE FROM documents WHERE id=?", (document_id,))
+                record_error(database, "scan", "missing_local_file",
+                             "Repair found a missing or empty saved body; preserving its historical scan evidence until reacquisition",
+                             capture_id=capture_id, document_id=document_id,
+                             retryable=True)
             missing += len(invalid)
         rebuilt = rebuild_full_text_index(database)
         database.execute("INSERT INTO repair_actions(action,details,created_at) VALUES(?,?,?)", ("repair", f"capture_reset={capture_reset}; media_reset={media_reset}; missing={missing}; fts={rebuilt}", utc_now()))
 
-    removed_parts = 0
+    removed_parts = preserved_parts = 0
     for folder in (root / "captures", root / "media"):
         if not folder.exists():
             continue
         for path in folder.rglob("*.part"):
+            # Media streaming stores its validated prefix in a .part file
+            # paired with .part.resume.json. Repair must not silently discard
+            # resumable bytes; the downloader validates metadata on next use.
+            if path.with_name(path.name + ".resume.json").is_file():
+                preserved_parts += 1
+                continue
             path.unlink(missing_ok=True)
             removed_parts += 1
 
@@ -105,9 +120,10 @@ def repair_project(
             f"Media captures reset from downloading: {media_reset}",
             f"Scan runs marked interrupted: {scan_reset}",
             f"Operation runs marked interrupted: {operation_reset}",
-            f"Missing or empty documents queued for redownload: {missing}",
+            f"Missing or empty document bodies queued for redownload (historical scan evidence retained): {missing}",
             f"Full-text rows rebuilt: {rebuilt}",
-            f"Temporary .part files removed: {removed_parts}",
+            f"Untracked temporary .part files removed: {removed_parts}",
+            f"Metadata-backed resumable media parts preserved: {preserved_parts}",
             "WAL checkpoint and SQLite optimize completed",
         ]
     )

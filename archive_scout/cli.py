@@ -15,7 +15,7 @@ from .ai.settings import resolve_provider_settings
 from .config import AIConfig, ProjectConfig, ResearchConfig, load_project_config
 from .constants import VERSION
 from .events import ProgressEvent, Stopped
-from .operations import SUPPORTED_MODES, is_recoverable_pause, run_project
+from .operations import SUPPORTED_MODES, IncompleteCoverage, is_recoverable_pause, run_project
 from .research.ai import run_grounded_answer
 from .research.search import search_research
 
@@ -23,6 +23,7 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_DEFERRED = 3
+EXIT_INCOMPLETE = 4
 EXIT_INTERRUPTED = 130
 FORMATS = ("text", "json", "jsonl")
 COMMANDS = {"run", "status", "search", "results", "errors", "ai-review", "research", "research-index", "init"}
@@ -268,6 +269,16 @@ def _run_command(args: argparse.Namespace) -> int:
             for name, path in paths.items():
                 print(f"{name}: {path}")
         return EXIT_OK
+    except IncompleteCoverage as exc:
+        payload = {"type": "incomplete", "status": "incomplete", "message": str(exc),
+                   "paths": {name: str(path) for name, path in exc.paths.items()}}
+        if args.format in {"json", "jsonl"}:
+            _print_json(payload)
+        else:
+            print(f"INCOMPLETE: {exc}", file=sys.stderr)
+            for name, path in exc.paths.items():
+                print(f"{name}: {path}")
+        return EXIT_INCOMPLETE
     except Stopped as exc:
         if args.format in {"json", "jsonl"}:
             _print_json({"type": "interrupted", "status": "interrupted", "message": str(exc) or "Stopped by user"})

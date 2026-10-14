@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from uuid import uuid4
 from pathlib import Path
 
 from ..database.connection import DATABASE_NAME
@@ -20,7 +21,10 @@ def create_project_backup(root: Path, reason: str = "manual", keep: int = 5) -> 
         raise FileNotFoundError(source)
     backup_dir = root / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    destination = backup_dir / f"archive_scout_{_timestamp()}_{reason.replace(' ', '_')}.sqlite3"
+    # Second-resolution names silently overwrote earlier snapshots if two
+    # backups of the same type ran in one second. Never reuse an existing
+    # safety snapshot path (including during rapid scripted operations).
+    destination = backup_dir / f"archive_scout_{_timestamp()}_{reason.replace(' ', '_')}_{uuid4().hex}.sqlite3"
     source_db = sqlite3.connect(source)
     destination_db = sqlite3.connect(destination)
     try:
