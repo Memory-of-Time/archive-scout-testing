@@ -1,4 +1,0 @@
-Processing /workspace/scratch/ea6ae0bb1dbb/release-work/validation/wheels/archive_scout-1.2.3-py3-none-any.whl
-Installing collected packages: archive-scout
-Successfully installed archive-scout-1.2.3
-WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
