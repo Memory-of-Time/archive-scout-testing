@@ -516,8 +516,16 @@ def _can_split_cdx_window(current: PendingWindow, exc: TransientRequestError) ->
 
 
 def transient_backoff(config: ProjectConfig, failures: int) -> float:
-    """Failure-only short wait; never escalate healthy-request pacing."""
-    return min(5.0, config.network.normalized().retry_base_seconds)
+    """Per-query no-progress backoff, not a delay on healthy CDX traffic.
+
+    Persisted window failures survive process restart. Repeating 60-second
+    gateway failures at a fixed five-second interval produces no evidence and
+    unnecessarily revisits every year. Respect the configured retry ceiling.
+    """
+    network = config.network.normalized()
+    base = max(1.0, float(network.retry_base_seconds))
+    ceiling = max(base, float(network.retry_max_seconds))
+    return min(ceiling, base * (2.0 ** min(12, max(0, int(failures) - 1))))
 
 
 def save_state(
@@ -1121,8 +1129,12 @@ def index_archive(
                 task_queue.append(task)
                 # Never spin through an all-cooling queue; the Stop event
                 # interrupts this small bounded wait immediately.
-                if not any(due.get((t[0], t[3], t[4], t[5], t[6]), 0.0) <= now for t in task_queue):
-                    stop_event.wait(min(1.0, ready - now))
+                future_times = [due.get((t[0], t[3], t[4], t[5], t[6]), 0.0)
+                                for t in task_queue]
+                if future_times and min(future_times) > now:
+                    # Remain almost idle during shared outages, but permit
+                    # immediate user Stop and prompt recovery at eligibility.
+                    stop_event.wait(min(5.0, max(0.05, min(future_times) - now)))
                 continue
             turn_started = time.monotonic()
             requests_this_turn = 0
@@ -1465,7 +1477,7 @@ def index_archive(
                             yield_to_other_tasks=bool(task_queue),
                         )
                         if task_queue:
-                            due[task_key] = time.monotonic() + min(30.0, transient_backoff(target_config, current.failures))
+                            due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
                             task_queue.append(task)
                             yielded = True
                             break
@@ -1539,7 +1551,7 @@ def index_archive(
                         yield_to_other_tasks=bool(task_queue),
                     )
                     if task_queue:
-                        due[task_key] = time.monotonic() + min(30.0, transient_backoff(target_config, current.failures))
+                        due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
                         task_queue.append(task)
                         yielded = True
                         break
@@ -1623,7 +1635,7 @@ def index_archive(
                             total_windows, stop_event, yield_to_other_tasks=bool(task_queue),
                         )
                         if task_queue:
-                            due[task_key] = time.monotonic() + min(30.0, transient_backoff(target_config, current.failures))
+                            due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
                             task_queue.append(task)
                             yielded = True
                             break
@@ -1656,7 +1668,7 @@ def index_archive(
                         yield_to_other_tasks=bool(task_queue),
                     )
                     if task_queue:
-                        due[task_key] = time.monotonic() + min(30.0, transient_backoff(target_config, current.failures))
+                        due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
                         task_queue.append(task)
                         yielded = True
                         break

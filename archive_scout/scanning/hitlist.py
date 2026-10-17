@@ -17,6 +17,8 @@ from ..utils import utc_now
 from ..utils import normalize_search
 from .hitlist_matcher import LiteralAutomaton
 
+SEARCH_INTERPRETATION_VERSION = 3
+
 
 def _normalized_keywords(values: list[str]) -> list[str]:
     unique: dict[str, str] = {}
@@ -57,14 +59,14 @@ def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> 
     now = utc_now()
     if row:
         run_id = int(row["id"])
-        if int(row["coverage_version"] or 0) != 2:
+        if int(row["coverage_version"] or 0) != SEARCH_INTERPRETATION_VERSION:
             # Older checkpoints did not prove the identity of on-disk bytes.
             # Recheck them once, preserving an existing corpus boundary.
             database.execute("DELETE FROM quick_search_hits WHERE run_id=?", (run_id,))
             database.execute("DELETE FROM quick_search_coverage WHERE run_id=?", (run_id,))
             database.execute("""UPDATE quick_search_runs SET status='running',last_capture_id=0,indexed_checked=0,
                 local_checked=0,unavailable_count=0,discarded_count=0,missing_count=0,non_text_count=0,
-                incomplete_count=0,match_count=0,capture_limit=CASE WHEN coverage_version>0 THEN capture_limit ELSE (SELECT COALESCE(MAX(id),0) FROM captures) END,coverage_version=2,updated_at=? WHERE id=?""", (now,run_id))
+                incomplete_count=0,match_count=0,capture_limit=CASE WHEN coverage_version>0 THEN capture_limit ELSE (SELECT COALESCE(MAX(id),0) FROM captures) END,coverage_version=?,updated_at=? WHERE id=?""", (SEARCH_INTERPRETATION_VERSION,now,run_id))
             return run_id,0,0
         database.execute(
             "UPDATE quick_search_runs SET status='running',updated_at=? WHERE id=?", (now, run_id)
@@ -72,8 +74,8 @@ def _resume_or_create_run(database: sqlite3.Connection, keywords: list[str]) -> 
         return run_id, int(row["last_capture_id"] or 0), int(row["match_count"] or 0)
     cursor = database.execute(
         """INSERT INTO quick_search_runs(fingerprint,keywords_json,status,started_at,updated_at,coverage_version,capture_limit)
-           VALUES(?,?,'running',?,?,2,(SELECT COALESCE(MAX(id),0) FROM captures))""",
-        (fingerprint, json.dumps(keywords, ensure_ascii=False), now, now),
+           VALUES(?,?,'running',?,?,?,(SELECT COALESCE(MAX(id),0) FROM captures))""",
+        (fingerprint, json.dumps(keywords, ensure_ascii=False), now, now, SEARCH_INTERPRETATION_VERSION),
     )
     return int(cursor.lastrowid), 0, 0
 
@@ -108,8 +110,9 @@ def _payload_source(row: sqlite3.Row, root: Path) -> tuple[Path | None, str]:
 def _coverage_fingerprint(row: sqlite3.Row, body_identity: str) -> str:
     metadata = [str(row[name] or "") for name in (
         "original_url", "timestamp", "local_path", "document_path", "mimetype",
-        "detected_encoding", "resource_class", "payload_availability",
+        "response_content_type", "detected_encoding", "resource_class", "payload_availability",
     )]
+    metadata.append(f"search-interpretation-v{SEARCH_INTERPRETATION_VERSION}")
     metadata.append(body_identity)
     return hashlib.sha256(json.dumps(metadata, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -131,9 +134,9 @@ def _verify_covered_prefix(database: sqlite3.Connection, run_id: int, last_id: i
         if stop_event.is_set():
             raise Stopped
         rows = database.execute(
-            """SELECT c.*,d.path AS local_path,d.path AS document_path,'' AS detected_encoding,COALESCE(r.resource_class,'unknown') AS resource_class,CASE WHEN c.state IN ('downloaded','downloaded_unscanned') THEN 'available' ELSE 'unavailable' END AS payload_availability,0 AS body_revision,q.content_fingerprint
+            """SELECT c.*,d.path AS local_path,d.path AS document_path,'' AS detected_encoding,COALESCE(v.response_content_type,'') AS response_content_type,v.content_hash AS expected_hash,v.bytes_saved AS expected_size,COALESCE(r.resource_class,'unknown') AS resource_class,CASE WHEN c.state IN ('downloaded','downloaded_unscanned') THEN 'available' ELSE 'unavailable' END AS payload_availability,0 AS body_revision,q.content_fingerprint
                FROM quick_search_coverage q JOIN captures c ON c.id=q.capture_id
-               LEFT JOIN documents d ON d.id=c.document_id LEFT JOIN capture_routing r ON r.capture_id=c.id
+               LEFT JOIN documents d ON d.id=c.document_id LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id LEFT JOIN capture_routing r ON r.capture_id=c.id
                WHERE q.run_id=? AND c.id>? AND c.id<=? ORDER BY c.id LIMIT ?""",
             (run_id, cursor_id, last_id, max(1, int(batch_size))),
         ).fetchall()
@@ -252,9 +255,9 @@ def search_with_hitlist(
                 raise Stopped
             revisiting = False
             rows = database.execute(
-                """SELECT c.*,d.path AS local_path,d.path AS document_path,'' AS detected_encoding,COALESCE(r.resource_class,'unknown') AS resource_class,CASE WHEN c.state IN ('downloaded','downloaded_unscanned') THEN 'available' ELSE 'unavailable' END AS payload_availability,0 AS body_revision,
+                """SELECT c.*,d.path AS local_path,d.path AS document_path,'' AS detected_encoding,COALESCE(v.response_content_type,'') AS response_content_type,v.content_hash AS expected_hash,v.bytes_saved AS expected_size,COALESCE(r.resource_class,'unknown') AS resource_class,CASE WHEN c.state IN ('downloaded','downloaded_unscanned') THEN 'available' ELSE 'unavailable' END AS payload_availability,0 AS body_revision,
                           0 AS old_mask
-                   FROM captures c LEFT JOIN documents d ON d.id=c.document_id LEFT JOIN capture_routing r ON r.capture_id=c.id
+                   FROM captures c LEFT JOIN documents d ON d.id=c.document_id LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id LEFT JOIN capture_routing r ON r.capture_id=c.id
                    WHERE c.id>? AND c.id<=? ORDER BY c.id LIMIT ?""",
                 (last_id,capture_limit,max(1,int(batch_size))),
             ).fetchall()
@@ -264,10 +267,10 @@ def search_with_hitlist(
                 with database:
                     database.execute("BEGIN IMMEDIATE")
                     rows = database.execute(
-                        """SELECT c.*,d.path AS local_path,d.path AS document_path,'' AS detected_encoding,COALESCE(r.resource_class,'unknown') AS resource_class,CASE WHEN c.state IN ('downloaded','downloaded_unscanned') THEN 'available' ELSE 'unavailable' END AS payload_availability,0 AS body_revision,
+                        """SELECT c.*,d.path AS local_path,d.path AS document_path,'' AS detected_encoding,COALESCE(v.response_content_type,'') AS response_content_type,v.content_hash AS expected_hash,v.bytes_saved AS expected_size,COALESCE(r.resource_class,'unknown') AS resource_class,CASE WHEN c.state IN ('downloaded','downloaded_unscanned') THEN 'available' ELSE 'unavailable' END AS payload_availability,0 AS body_revision,
                                   q.coverage_mask AS old_mask
                            FROM quick_search_coverage q JOIN captures c ON c.id=q.capture_id
-                           LEFT JOIN documents d ON d.id=c.document_id LEFT JOIN capture_routing r ON r.capture_id=c.id
+                           LEFT JOIN documents d ON d.id=c.document_id LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id LEFT JOIN capture_routing r ON r.capture_id=c.id
                            WHERE q.run_id=? AND q.body_revision<>0 ORDER BY c.id LIMIT ?""",
                         (run_id,max(1,int(batch_size))),
                     ).fetchall()
@@ -322,11 +325,17 @@ def search_with_hitlist(
                     try:
                         data = path.read_bytes()
                         body_identity = hashlib.sha256(data).hexdigest()
+                        if (row["expected_hash"] and str(row["query_signature"]) != "local-import"
+                            and (body_identity != str(row["expected_hash"])
+                                or len(data) != int(row["expected_size"] or 0))):
+                            body_identity = "integrity_failure:" + body_identity
+                            data = None
+                            incomplete += 1
                     except OSError:
                         body_identity = "missing"
                         missing += 1
                 content_fingerprint = _coverage_fingerprint(row, body_identity)
-                content_type = str(row["mimetype"] or "")
+                content_type = str(row["response_content_type"] or row["mimetype"] or "")
                 if row["detected_encoding"]:
                     content_type += "; charset=" + str(row["detected_encoding"])
                 if data is not None and looks_textual_bytes(data[:16384], content_type):
@@ -353,9 +362,10 @@ def search_with_hitlist(
                                 counts_by_pattern[pattern] += count
                                 fields_by_pattern[pattern].add("rendered")
                 else:
-                    unavailable += 1
-                    if data is not None:
-                        non_text += 1
+                    if not body_identity.startswith("integrity_failure:"):
+                        unavailable += 1
+                        if data is not None:
+                            non_text += 1
 
                 after_counts = (local_checked,unavailable,discarded,missing,non_text,incomplete)
                 mask = sum((1 << index) for index,(before,after) in enumerate(zip(before_counts,after_counts)) if after>before)

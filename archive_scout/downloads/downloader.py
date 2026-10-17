@@ -774,18 +774,24 @@ def download_archive(
                                                exc.resource_class,suffix)], target,
                                     media_query_signature(config),source_type="text_replay_deferred",
                                 )
-                    except RateLimitDeferred:
-                        stop_event.set()
+                    except RateLimitDeferred as exc:
+                        # A finite per-request rate-limit wait budget is not
+                        # an explicit user Stop. Preserve the URL as due later;
+                        # let independent local scans and permitted work continue.
+                        failures += 1
                         with database_write_lock, database:
-                            database.execute(
-                                """UPDATE captures SET state='pending',
-                                   download_attempts=CASE WHEN download_attempts>0 THEN download_attempts-1 ELSE 0 END,
-                                   updated_at=? WHERE state='downloading' OR id=?""",
-                                (utc_now(), row["id"]),
-                            )
-                        for pending in futures:
-                            pending.cancel()
-                        raise
+                            database.execute("UPDATE captures SET state='error',updated_at=? WHERE id=?",
+                                (utc_now(), row["id"]))
+                            record_error(database, "download", "rate_limit", repr(exc),
+                                capture_id=int(row["id"]), http_status=getattr(exc,"status",429), retryable=True)
+                            record_failure(database, int(row["id"]), "rate_limit",
+                                getattr(exc,"status",429), True,
+                                max(config.network.retry_base_seconds, float(getattr(exc,"waited",0) or 0)),
+                                config.network.retry_max_seconds)
+                        if callback:
+                            callback(ProgressEvent("rate_limit",
+                                "Wayback request turn reached its rate-limit wait budget; "
+                                "capture remains scheduled for automatic retry. Local scanning continues."))
                     except Stopped:
                         with database_write_lock, database:
                             database.execute("UPDATE captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))

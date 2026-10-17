@@ -75,6 +75,31 @@ def _scan_one(row: dict, jobs: list[ScanJob]) -> dict:
     }
 
 
+def _reconcile_legacy_pending(database: sqlite3.Connection, config) -> None:
+    """Once per connection, migrate legacy saved-without-document states into the
+    indexed explicit pending queue. Never sweep completed history at every wake.
+
+    The one-time scan is safe for existing project databases and new target
+    signatures: any future save without a document must use
+    ``downloaded_unscanned`` at the time of the acquisition commit.
+    """
+    database.execute("CREATE TEMP TABLE IF NOT EXISTS scout_scan_reconciled(signature TEXT,pattern TEXT,PRIMARY KEY(signature,pattern)) WITHOUT ROWID")
+    for target in config.targets:
+        signature = cdx_query_signature(config.for_target(target))
+        done = database.execute("SELECT 1 FROM scout_scan_reconciled WHERE signature=? AND pattern=?", (signature,target)).fetchone()
+        if done:
+            continue
+        # Update only the legacy gap, without materializing IDs in Python.
+        # The indexed hot queue is the *only* discovery path after this.
+        with database:
+            database.execute("""UPDATE captures SET state='downloaded_unscanned',updated_at=?
+                WHERE state='downloaded' AND query_signature=?
+                AND target_id IN (SELECT id FROM targets WHERE pattern=?)
+                AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.capture_id=captures.id)""",
+                (utc_now(),signature,target))
+            database.execute("INSERT OR IGNORE INTO scout_scan_reconciled(signature,pattern) VALUES(?,?)", (signature,target))
+
+
 def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
     """Keyset scan over the active inventory; cursor memory is bounded."""
     signature = cdx_query_signature(config)
@@ -91,8 +116,7 @@ def _pending_rows(database: sqlite3.Connection, config) -> Iterator[dict]:
                FROM captures c JOIN targets t ON t.id=c.target_id
                LEFT JOIN documents d ON d.capture_id=c.id
                LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
-               WHERE (c.state='downloaded_unscanned' OR
-                     (c.state='downloaded' AND d.id IS NULL))
+               WHERE c.state='downloaded_unscanned'
                AND c.query_signature=? AND t.pattern IN (""" + target_slots + """)
                AND c.id>? ORDER BY c.id LIMIT 500""",
             (signature, *targets, cursor_id),
@@ -127,15 +151,29 @@ def scan_pending_saved(
     if not targets:
         return 0
     target_slots = ",".join("?" for _ in targets)
-    count = int(database.execute(
-        """SELECT COUNT(*) FROM captures c JOIN targets t ON t.id=c.target_id
-           LEFT JOIN documents d ON d.capture_id=c.id
-           WHERE (c.state='downloaded_unscanned' OR (c.state='downloaded' AND d.id IS NULL))
-             AND c.query_signature=? AND t.pattern IN (""" + target_slots + ")",
+    # The expensive historical gap reconciliation is strictly once per
+    # connection/scope, not on every background scanner wake.
+    while True:
+        try:
+            with (write_lock if write_lock is not None else nullcontext()):
+                _reconcile_legacy_pending(database, config)
+            break
+        except sqlite3.OperationalError as exc:
+            if not _sqlite_write_busy(exc):
+                raise
+            database.rollback()  # Retry a fresh write transaction, not BUSY_SNAPSHOT.
+            if stop_event.wait(0.15):
+                raise Stopped
+    # Indexed existence test replaces an unconditional project-wide COUNT.
+    has_pending = database.execute(
+        """SELECT 1 FROM captures c JOIN targets t ON t.id=c.target_id
+           WHERE c.state='downloaded_unscanned'
+             AND c.query_signature=? AND t.pattern IN (""" + target_slots + ") LIMIT 1",
         (signature, *targets),
-    ).fetchone()[0])
-    if not count:
+    ).fetchone()
+    if not has_pending:
         return 0
+    count = None  # No count on the acquisition hot path; cursor is bounded.
     worker_count = max(1, min(32, int(workers or min(8, os.cpu_count() or 4))))
     max_inflight = worker_count * 2
     estimated_budget = SCAN_BYTE_BUDGET
@@ -256,10 +294,10 @@ def scan_pending_saved(
                 futures.pop(future)
                 in_flight_bytes -= estimate
             completed += len(ready)
-            if callback and (completed % 100 == 0 or completed == count):
+            if callback and completed % 100 == 0:
                 callback(ProgressEvent(
-                    "scan", f"Locally scanned {completed:,}/{count:,} saved bodies",
-                    completed, count,
+                    "scan", f"Locally scanned {completed:,} saved bodies in this pass",
+                    completed, None,
                 ))
     return completed
 

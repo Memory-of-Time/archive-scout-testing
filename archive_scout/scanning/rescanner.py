@@ -27,8 +27,15 @@ def _analyze_saved_document(row: dict[str, object], jobs: list[ScanJob]) -> dict
         return {"kind": "missing", "row": row, "path": path}
     try:
         saved_bytes = path.read_bytes()
-        raw = decode_bytes(saved_bytes)
         content_hash = hashlib.sha256(saved_bytes).hexdigest()
+        is_import = str(row.get("query_signature") or "") == "local-import"
+        authoritative = str(row.get("expected_hash") or "")
+        if not is_import and authoritative and (
+            content_hash != authoritative or len(saved_bytes) != int(row.get("expected_size") or 0)
+        ):
+            return {"kind": "integrity", "row": row,
+                    "error": "retained archive body differs from committed acquisition evidence"}
+        raw = decode_bytes(saved_bytes, str(row.get("response_content_type") or row.get("mimetype") or ""))
         document_changed = content_hash != str(row.get("content_hash") or "")
         if not document_changed:
             try:
@@ -92,8 +99,12 @@ def _document_rows(
         page_clauses = [*clauses, "d.id>?"]
         batch = database.execute(
             """
-            SELECT d.*,c.original_url,c.id AS capture_id FROM documents d
+            SELECT d.*,c.original_url,c.id AS capture_id,c.query_signature,c.mimetype,
+                v.content_hash AS expected_hash,v.bytes_saved AS expected_size,
+                v.response_content_type AS response_content_type
+            FROM documents d
             JOIN captures c ON c.id=d.capture_id
+            LEFT JOIN capture_payload_evidence v ON v.capture_id=c.id
             WHERE """ + " AND ".join(page_clauses) + " ORDER BY d.id LIMIT ?",
             [*params, last_id, max(1, int(batch_size))],
         ).fetchall()
@@ -243,6 +254,10 @@ def rescan_keyword_sets(
                         database.execute(
                             "UPDATE captures SET state='error' WHERE id=?", (capture_id,)
                         )
+                    elif kind == "integrity":
+                        record_error(database, "scan", "local_integrity_failure",
+                            str(result["error"]), capture_id=capture_id,
+                            document_id=document_id, retryable=False)
                     elif kind == "error":
                         record_error(
                             database,

@@ -148,8 +148,8 @@ class IndexOutageRecovery(unittest.TestCase):
             try:
                 self.assertEqual(client.rate_limit_attempts,3)
                 self.assertEqual(cfg.rate_limit_attempts,0)  # user config unchanged
-                self.assertEqual(transient_backoff(cfg,3),transient_backoff(cfg,1))
-                self.assertLessEqual(transient_backoff(cfg,100),60)
+                self.assertGreater(transient_backoff(cfg,3),transient_backoff(cfg,1))
+                self.assertLessEqual(transient_backoff(cfg,100),cfg.network.retry_max_seconds)
             finally:client.close()
 
 class CDXHostWidePause(unittest.TestCase):

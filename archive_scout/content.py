@@ -236,9 +236,21 @@ def classify_replay_content(raw: str, final_url: str) -> str | None:
     these reasons separate makes the UI useful: an exclusion or robots policy should not
     look like a transient network failure, while an unavailable origin can be retried later.
     """
-    lowered = raw[:20000].casefold()
+    beginning = raw[:20000]
+    # A quoted phrase in an ordinary historical article is not a Wayback
+    # error response. Restrict shell detection to a service title/heading or
+    # a short plain-text error response whose first line is the marker.
+    headings = re.findall(r"(?is)<(?:title|h[1-3])\b[^>]*>(.*?)</(?:title|h[1-3])\s*>", beginning)
+    heading_text = [clean_space(html.unescape(TAG_PATTERN.sub(" ", value))).casefold() for value in headings]
+    stripped = beginning.lstrip()
+    plain_error = not stripped.startswith("<") and len(stripped) < 4096
+    first_line = stripped.splitlines()[0].strip().casefold() if plain_error and stripped else ""
+    service_title = any(value.strip() in {"wayback machine", "internet archive wayback machine",
+                                            "internet archive"} for value in heading_text[:1])
     for marker, category in REPLAY_ERROR_MARKERS:
-        if marker in lowered:
+        if (any(marker in value for value in heading_text)
+            or (plain_error and first_line.startswith(marker))
+            or (service_title and marker in beginning[:2500].casefold())):
             return category
     if "/web/" not in final_url and "web.archive.org" in final_url:
         return "invalid_wayback_replay"

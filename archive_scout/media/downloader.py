@@ -377,18 +377,18 @@ def download_media(
                             save_media_success(
                                 database, result["id"], result["path"], result["bytes"], result["hash"], result["status"], result["final_url"]
                             )
-                    except RateLimitDeferred:
-                        stop_event.set()
+                    except RateLimitDeferred as exc:
+                        # Remote pause exhaustion belongs to the media retry
+                        # inventory, never to the user's global Stop event.
+                        errors += 1
                         with database:
-                            database.execute(
-                                """UPDATE media_captures SET state='pending',
-                                   download_attempts=CASE WHEN download_attempts>0 THEN download_attempts-1 ELSE 0 END,
-                                   updated_at=? WHERE state='downloading' OR id=?""",
-                                (utc_now(), row["id"]),
-                            )
-                        for pending in futures:
-                            pending.cancel()
-                        raise
+                            database.execute("UPDATE media_captures SET state='error',updated_at=? WHERE id=?",
+                                (utc_now(), row["id"]))
+                            record_error(database, "media_download", "rate_limit", repr(exc),
+                                media_capture_id=int(row["id"]), http_status=getattr(exc,"status",429),retryable=True)
+                        if callback:
+                            callback(ProgressEvent("rate_limit",
+                                "Media capture was rate-limited; retained for later retry without stopping local work."))
                     except Stopped:
                         with database:
                             database.execute("UPDATE media_captures SET state='pending',updated_at=? WHERE id=?", (utc_now(), row["id"]))

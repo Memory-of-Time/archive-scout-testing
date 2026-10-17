@@ -423,7 +423,13 @@ class LargeProjectStabilityTests(unittest.TestCase):
             ).normalized()
             with patch("archive_scout.downloads.retry.download_archive") as mocked:
                 retry_error_urls(config, database, 1, threading.Event(), None)
-            self.assertEqual(len(mocked.call_args.kwargs["capture_ids"]), 1200)
+            # Bounded manual retry batches preserve the same stable selection
+            # without creating a project-sized Python list.
+            issued = [capture_id for call in mocked.call_args_list
+                      for capture_id in call.kwargs["capture_ids"]]
+            self.assertEqual(issued, capture_ids)
+            self.assertTrue(all(len(call.kwargs["capture_ids"]) <= 1000
+                                for call in mocked.call_args_list))
             database.close()
 
     def test_large_media_retry_selection_avoids_sqlite_variable_limit(self):

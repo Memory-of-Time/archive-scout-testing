@@ -30,11 +30,12 @@ class LeanRebuildTests(unittest.TestCase):
         self.assertEqual(config.network.cdx_workers, 10)
         self.assertEqual(config.workers, 10)
 
-    def test_failed_index_waits_do_not_escalate(self):
+    def test_failed_index_waits_escalate_without_changing_healthy_pacing(self):
         from archive_scout.cdx.indexer import transient_backoff
         from archive_scout.media.indexer import _wait_seconds
         config = ProjectConfig(Path('.'), text_collapse_scope="year", targets=['example.com/*'], keywords=['needle']).normalized()
-        self.assertEqual(transient_backoff(config, 1), transient_backoff(config, 10_000))
+        self.assertGreater(transient_backoff(config, 10_000), transient_backoff(config, 1))
+        self.assertLessEqual(transient_backoff(config, 10_000), config.network.retry_max_seconds)
         self.assertEqual(_wait_seconds(config, 1), _wait_seconds(config, 10_000))
 
     def test_both_json_cdx_parsers_reject_missing_cells(self):
