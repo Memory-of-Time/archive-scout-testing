@@ -6,7 +6,7 @@ from unittest.mock import patch
 from archive_scout.config import ProjectConfig,NetworkConfig,MediaConfig,load_project_config,save_project_config
 from archive_scout.cdx.client import HttpClient,CDXRows,TransientRequestError
 from archive_scout.cdx.parameters import cdx_query_signature
-from archive_scout.cdx.indexer import (index_archive,IndexPlan,PendingWindow,encode_plan,
+from archive_scout.cdx.indexer import (index_archive,IndexPlan,PendingWindow,encode_plan,decode_plan,
     save_state,save_coverage_state,coalesce_untouched_range_plan,window_label)
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import get_or_create_target,get_or_create_media_target,upsert_captures
@@ -192,8 +192,9 @@ class MediaFullRangeIndexing(unittest.TestCase):
    calls=[]
    def respond(_client,endpoints,params,**kwargs):calls.append(dict(params));return CDXRows([])
    with patch.object(HttpClient,'get_cdx_any',respond):index_media(cfg,db,threading.Event())
-   self.assertEqual(calls[0].get('resumeKey'),'override-cursor')
-   self.assertEqual(calls[0]['to'],'20061231235959');self.assertEqual(len(calls),3);db.close()
+   self.assertIsNone(calls[0].get('resumeKey'))
+   self.assertEqual(calls[0]['from'],'20060101000000');self.assertEqual(calls[0]['to'],END);self.assertEqual(len(calls),1)
+   self.assertEqual(db.execute('SELECT COUNT(*) FROM media_index_state WHERE year=2006 AND complete=0').fetchone()[0],1);db.close()
 
  def test_committed_annual_media_cursor_is_preserved(self):
   with tempfile.TemporaryDirectory() as temp:
@@ -202,6 +203,10 @@ class MediaFullRangeIndexing(unittest.TestCase):
    calls=[]
    def respond(_client,endpoints,params,**kwargs):calls.append(dict(params));return CDXRows([])
    with patch.object(HttpClient,'get_cdx_any',respond):index_media(cfg,db,threading.Event())
-   self.assertEqual(calls[0].get('resumeKey'),'annual-exact');self.assertEqual(calls[0]['to'],'20051231235959');self.assertEqual(len(calls),4);db.close()
+   self.assertIsNone(calls[0].get('resumeKey'));self.assertEqual(calls[0]['to'],END);self.assertEqual(len(calls),1)
+   annual=db.execute('SELECT resume_key,complete FROM media_index_state WHERE year=2005').fetchone()
+   self.assertEqual(decode_plan(annual['resume_key'],[(START,'20051231235959')]).pending[0].resume_key,'annual-exact')
+   self.assertEqual(annual['complete'],0)
+   self.assertEqual(db.execute('SELECT complete FROM media_index_state WHERE year=0').fetchone()[0],1);db.close()
 
 if __name__=='__main__':unittest.main()

@@ -450,6 +450,7 @@ def _request_media_paged_batch(
     stop_event: threading.Event,
     consume_success: Callable[[PageFetchResult], None] | None = None,
     completed_pages: set[int] | None = None,
+    deadline: float | None = None,
 ) -> PagedBatch:
     endpoints = cdx_paged_endpoints(config)
     network = config.network.normalized()
@@ -477,7 +478,7 @@ def _request_media_paged_batch(
                   else max(64 * 1024 * 1024, current.page_blocks * 12 * 1024 * 1024))
     page_workers = memory_limited_page_workers(effective_page_workers(network.cdx_workers, current.page_blocks),
                                                body_limit, network.cdx_memory_budget_mb)
-    pages, next_page = _select_page_batch(current, max(page_workers, PAGED_PIPELINE_PAGES))
+    pages, next_page = _select_page_batch(current, min(PAGED_PIPELINE_PAGES, max(page_workers, page_workers * 2)))
     completed_pages = completed_pages or set()
     requested_pages = [page for page in pages if page not in completed_pages]
     if not requested_pages:
@@ -498,12 +499,18 @@ def _request_media_paged_batch(
         workers=page_workers,
         max_bytes=body_limit,
         prefer_text=False,
+        deadline=deadline,
     ):
         if result.succeeded and consume_success is not None:
             consume_success(result)
         results.append(result)
-    current.page = next_page
+    # Selected but unsubmitted pages must never be skipped by the cursor.
+    # An expiry prevents new admission but permits committed successes to land.
+    admitted = {result.page for result in results}
+    not_admitted = [page for page in requested_pages if page not in admitted]
+    current.page = min(next_page, min(not_admitted)) if not_admitted else next_page
     retry_set = set(current.retry_pages)
+    retry_set.update(page for page in not_admitted if page < next_page)
     for result in results:
         if result.succeeded:
             retry_set.discard(result.page)
@@ -630,12 +637,19 @@ def index_direct_media(
                     empty_annual_states.append((existing_target[0], old["year"], old_state))
                 if legacy_progress:
                     break
-        if target_config.text_collapse_scope == "range" and target_config.from_year != target_config.to_year and not legacy_progress:
+        if target_config.text_collapse_scope == "range" and target_config.from_year != target_config.to_year:
             # Retire only empty failed plans; no successful page/cursor/capture
             # is discarded or relabeled complete. Errors remain in history.
-            with database:
-                database.executemany("DELETE FROM media_index_state WHERE target_id=? AND year=? AND query_signature=?",
-                                     empty_annual_states)
+            # Range selection has a different collapse scope from annual selection.
+            # Do not replay legacy years indefinitely or relabel their cursors as
+            # range progress. Keep all old annual states and bodies untouched;
+            # only the separate year=0 range state can prove range coverage.
+            if not legacy_progress and empty_annual_states:
+                with database:
+                    database.executemany(
+                        "DELETE FROM media_index_state WHERE target_id=? AND year=? AND query_signature=?",
+                        empty_annual_states,
+                    )
             tasks.append((target, target_config, 0, [(target_config.from_date, target_config.to_date)]))
         else:
             for year in range(target_config.from_year, target_config.to_year + 1):
@@ -771,7 +785,7 @@ def index_direct_media(
                         nonlocal received, accepted_count, changed, write_seconds, seen
                         if result.resume_key is not None:
                             raise TransientRequestError("numbered media page advertised unresolved continuation", splittable=False)
-                        validate_cdx_scope(result.rows,target,current.start,current.end,target_config.cdx_filters)
+                        validate_cdx_scope(result.rows,target,current.start,current.end,target_config.cdx_filters,target_config.cdx_match_type)
                         page_received = len(result.rows)
                         accepted = _accept_media_rows(result.rows, media)
                         write_started = time.monotonic()
@@ -804,6 +818,8 @@ def index_direct_media(
                     batch = _request_media_paged_batch(
                         target_config, client, target, current, extensions, stop_event,
                         store_completed_media_page, completed_pages,
+                        deadline=(turn_started + budget_limit - spent.get(target, 0.0))
+                            if budget_limit is not None else None,
                     )
                     request_seconds = max(0.0, time.monotonic() - request_started - write_seconds)
                     successes = batch.successful
@@ -894,7 +910,7 @@ def index_direct_media(
                 rows, finished, next_cursor = _request_media_resume(
                     target_config, client, target, current, extensions
                 )
-                validate_cdx_scope(rows,target,current.start,current.end,target_config.cdx_filters)
+                validate_cdx_scope(rows,target,current.start,current.end,target_config.cdx_filters,target_config.cdx_match_type)
                 connection_failure_streak = 0
                 transient_failure_streak = 0
                 request_seconds = time.monotonic() - request_started

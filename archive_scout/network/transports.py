@@ -1070,8 +1070,9 @@ class ResilientTransport:
                 failures.append((name, exc))
             except Exception as exc:
                 failures.append((name, exc))
-            self._backend_result(name, False)
             last_error = failures[-1][1]
+            # A read/first-byte timeout does not establish a broken backend.
+            self._backend_result(name, is_transport_read_timeout(last_error))
             if is_transport_read_timeout(last_error):
                 # Once a server has accepted the connection and stalled while
                 # returning a CDX body, changing Python HTTP stacks normally
@@ -1160,7 +1161,7 @@ class ResilientTransport:
                     self.recovery_probes.discard(name)
                     self.condition.notify_all()
             else:
-                self._backend_result(name, False)
+                self._backend_result(name, is_transport_read_timeout(failures[-1][1]))
             last_error = failures[-1][1]
             if partial_ready or is_transport_read_timeout(last_error):
                 # Never overwrite identity-bound prefixes or repeat a remote

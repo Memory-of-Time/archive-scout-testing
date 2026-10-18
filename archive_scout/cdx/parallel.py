@@ -67,6 +67,7 @@ def iter_cdx_pages(
     max_bytes: int = 64 * 1024 * 1024,
     prefer_text: bool = True,
     json_only: bool = False,
+    deadline: float | None = None,
 ) -> Iterator[PageFetchResult]:
     """Yield independent CDX pages as soon as each page completes.
 
@@ -125,7 +126,9 @@ def iter_cdx_pages(
     def fill() -> None:
         # Bound *results*, not merely worker threads. Submitting all 1,000 page
         # numbers lets completed bodies pile up while SQLite consumes a page.
-        while len(pending) < worker_count * 2 and not stop_event.is_set() and not pool_cancel.is_set():
+        while (len(pending) < worker_count * 2 and not stop_event.is_set()
+               and not pool_cancel.is_set()
+               and (deadline is None or time.monotonic() < deadline)):
             page = next(remaining, None)
             if page is None:
                 break

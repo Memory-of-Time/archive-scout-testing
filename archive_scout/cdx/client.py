@@ -632,13 +632,20 @@ class HttpClient:
                     # not finish the body. Repeating the same expensive query
                     # against every endpoint multiplies the stall; let the page
                     # queue requeue or subdivide it immediately instead.
-                    if exc.read_timed_out or exc.timed_out:
+                    if exc.read_timed_out or exc.timed_out or (
+                        exc.status in {502, 503, 504} and all(
+                            urllib.parse.urlsplit(url).hostname == urllib.parse.urlsplit(endpoint).hostname
+                            for url in endpoints
+                        )
+                    ):
                         self._remember_endpoint_failure(endpoint)
                         exc.endpoint = endpoint
                         raise
                     # Other transient failures may be endpoint-specific, so try
                     # the next service without reissuing another representation.
                     break
+                except Stopped:
+                    raise
                 except RuntimeError as exc:
                     if str(exc).startswith("HTTP ") or str(exc).startswith("response exceeds"):
                         raise
@@ -758,12 +765,18 @@ class HttpClient:
                         exc.connection_failed
                         or exc.read_timed_out
                         or exc.timed_out
+                        or (exc.status in {502, 503, 504} and all(
+                            urllib.parse.urlsplit(url).hostname == urllib.parse.urlsplit(endpoint).hostname
+                            for url in endpoints
+                        ))
                         or "safe in-memory budget" in str(exc)
                     ):
                         self._remember_endpoint_failure(endpoint)
                         exc.endpoint = endpoint
                         raise
                     break
+                except Stopped:
+                    raise
                 except RuntimeError as exc:
                     if str(exc).startswith("HTTP ") or str(exc).startswith("response exceeds"):
                         raise
@@ -874,11 +887,17 @@ class HttpClient:
                     exc.connection_failed
                     or exc.read_timed_out
                     or exc.timed_out
+                    or (exc.status in {502, 503, 504} and all(
+                        urllib.parse.urlsplit(url).hostname == urllib.parse.urlsplit(endpoint).hostname
+                        for url in endpoints
+                    ))
                     or "safe in-memory budget" in str(exc)
                 ):
                     self._remember_endpoint_failure(endpoint)
                     raise
                 failure = exc
+            except Stopped:
+                raise
             except RuntimeError as exc:
                 if str(exc).startswith("HTTP ") or str(exc).startswith("response exceeds"):
                     raise

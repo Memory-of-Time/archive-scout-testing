@@ -36,7 +36,7 @@ from .parameters import (
 )
 
 
-PAGED_PIPELINE_PAGES = 1000
+PAGED_PIPELINE_PAGES = 24
 PAGED_REQUEST_ATTEMPTS = 5
 PAGED_PAGE_FAILURE_LIMIT = 5
 # Only persistent HTTP 504 on a *broad, not-yet-paginated* range qualifies.
@@ -716,7 +716,7 @@ def _defer_transient_window(
         error_id = record_error(
             database,
             "index",
-            "transient_index_delay",
+            "invalid_index_response" if isinstance(exc, MalformedCDXResponse) else "transient_index_delay",
             f"{window_label(current.start, current.end)}: {message}",
             retryable=True,
         )
@@ -773,7 +773,8 @@ def _defer_transient_window(
         return error_id
     if not _can_split_cdx_window(current, exc):
         emit(callback, ProgressEvent(
-            "index", f"CDX service failure for {window_label(current.start, current.end)}: "
+            "index", ("CDX response failed validation" if isinstance(exc, MalformedCDXResponse) else "CDX service failure")
+            + f" for {window_label(current.start, current.end)}: "
             f"keeping original saved date range and page size; {type(exc).__name__}: {str(exc)[:180]}",
             completed_windows, total_windows,
         ))
@@ -781,7 +782,9 @@ def _defer_transient_window(
         callback,
         ProgressEvent(
             "index",
-            f"Wayback is temporarily unavailable. Archive Scout remains active and will retry in {wait_seconds:.1f}s (attempt {current.failures + 1}).",
+            ("CDX response remains unverified; checkpoint retained" if isinstance(exc, MalformedCDXResponse)
+             else "Wayback request remains unavailable; checkpoint retained")
+            + f". Retrying in {wait_seconds:.1f}s (attempt {current.failures + 1}).",
             completed_windows,
             total_windows,
         ),
@@ -856,35 +859,72 @@ def _resolve_strategy(current: PendingWindow, config: ProjectConfig, target: str
 
 def validate_cdx_scope(
     rows: list, target: str, start: str, end: str,
-    filters: list[str],
+    filters: list[str], match_type: str = "",
 ) -> None:
-    """Reject demonstrably wrong-scope responses before accepting a page.
+    """Reject *provable* CDX scope contradictions, not valid IA canonicalization.
 
-    The original server-side regex and collapse semantics remain authoritative;
-    this validator checks only invariants we can establish cheaply without
-    attempting a potentially incompatible Python rewrite of a Java regex.
+    The service implements host/domain/prefix/exact and URL-key canonicalization.
+    Local shell matching against ``netloc`` mistakenly rejected default ports,
+    root hosts and genuine subdomain results after successful HTTP 200 replies.
+    Only enforce inexpensive, demonstrable hostname boundaries and explicitly
+    unambiguous literal paths. Server regexes remain server-owned semantics.
     """
-    require_200 = any(str(value).casefold() == "statuscode:200" for value in filters)
-    # Normalize URL wildcard scopes conservatively. A leading *. may include
-    # root-host captures in Wayback; do not reject those solely on spelling.
-    pattern = str(target).casefold().removeprefix("http://").removeprefix("https://")
-    root_domain = pattern[2:].split("/", 1)[0] if pattern.startswith("*.") else ""
+    require_200 = any(str(v).casefold() == "statuscode:200" for v in filters)
+    raw = str(target).strip()
+    raw_without_scheme = raw.split("://", 1)[-1]
+    host_pattern = raw_without_scheme.split("/", 1)[0].casefold().rstrip(".")
+    # A wildcard host's root domain is eligible as well as its subdomains.
+    target_port = None
+    if ":" in host_pattern and not host_pattern.startswith("["):
+        possible_host, _, possible_port = host_pattern.rpartition(":")
+        if possible_port.isdigit():
+            host_pattern, target_port = possible_host, int(possible_port)
+    suffix = host_pattern[2:] if host_pattern.startswith("*.") else ""
+    literal_host = not any(ch in host_pattern for ch in "*?[]")
+    mode = str(match_type or "").casefold()
+    # Never assume Java's default SURT matching equals a Python glob.
+    path = raw_without_scheme.partition("/")[2]
+    simple_path = (mode in {"prefix", "exact"} and path and not any(ch in path for ch in "*?[]%"))
     for row in rows:
         timestamp, url, _mime, status, _digest, _length = row
-        if len(timestamp) != 14 or not timestamp.isascii() or not timestamp.isdigit() or not (start <= timestamp <= end):
+        if (len(timestamp) != 14 or not timestamp.isascii() or not timestamp.isdigit()
+                or not (start <= timestamp <= end)):
             raise MalformedCDXResponse("CDX returned a timestamp outside the requested range", splittable=False)
         if require_200 and str(status) != "200":
             raise MalformedCDXResponse("CDX returned a capture outside statuscode:200", splittable=False)
-        parsed = urlsplit(str(url))
-        if not parsed.hostname:
+        try:
+            parsed = urlsplit(str(url))
+            hostname = (parsed.hostname or "").casefold().rstrip(".")
+            port = parsed.port
+        except ValueError as exc:
+            raise MalformedCDXResponse("CDX capture contains an invalid host or port", splittable=False) from exc
+        if not hostname:
             raise MalformedCDXResponse("CDX returned a capture without a valid host", splittable=False)
-        relative = (parsed.netloc + parsed.path).casefold()
-        if "?" in str(url):
-            relative += "?" + (parsed.query or "")
-        if "(" not in pattern and "[" not in pattern and not fnmatch.fnmatchcase(relative, pattern):
-            if not (root_domain and parsed.hostname.casefold() == root_domain and
-                    fnmatch.fnmatchcase(relative, root_domain + ("/" + pattern.split("/", 1)[1] if "/" in pattern else ""))):
-                raise MalformedCDXResponse("CDX returned a capture outside the selected target pattern", splittable=False)
+        # URL's :80/:443 is not a different hostname. For a configured
+        # *non-default* target port, compare it only when explicitly specified.
+        if target_port is not None:
+            actual_port = port if port is not None else (443 if parsed.scheme == "https" else 80)
+            if actual_port != target_port:
+                raise MalformedCDXResponse("CDX returned a capture outside the selected target port", splittable=False)
+        if suffix:
+            host_ok = hostname == suffix or hostname.endswith("." + suffix)
+        elif mode == "domain" and literal_host:
+            host_ok = hostname == host_pattern or hostname.endswith("." + host_pattern)
+        elif literal_host:
+            host_ok = hostname == host_pattern
+        else:
+            host_ok = fnmatch.fnmatchcase(hostname, host_pattern)
+        if not host_ok:
+            raise MalformedCDXResponse(
+                f"CDX local scope check rejected unrelated host {hostname!r} for target {target!r} "
+                f"(matchType={mode or 'implicit'}); this is not evidence of an IA outage",
+                splittable=False,
+            )
+        if simple_path and mode in {"prefix", "exact"} and "%" not in parsed.path:
+            candidate = parsed.path.lstrip("/").casefold()
+            requested = path.casefold()
+            if not (candidate.startswith(requested) if mode == "prefix" else candidate == requested):
+                raise MalformedCDXResponse("CDX returned a capture outside the selected literal path", splittable=False)
 
 
 def cdx_response_budget(page_size: int) -> int:
@@ -937,6 +977,7 @@ def _request_paged_batch(
     stop_event: threading.Event,
     consume_success: Callable[[PageFetchResult], None] | None = None,
     completed_pages: set[int] | None = None,
+    deadline: float | None = None,
 ) -> PagedBatch:
     endpoints = cdx_paged_endpoints(config)
     network = config.network.normalized()
@@ -968,10 +1009,10 @@ def _request_paged_batch(
         effective_page_workers(network.cdx_workers, current.page_blocks),
         body_limit, network.cdx_memory_budget_mb,
     )
-    # Keep a long rolling queue behind the worker pool, just like the reference
-    # downloader's 1,000-page task chunks. A single slow Timemap page no longer
-    # creates a barrier that leaves the other nine workers idle.
-    pages, next_page = _select_page_batch(current, max(page_workers, PAGED_PIPELINE_PAGES))
+    # Bound each turn to at most two worker waves (and 24 pages). A rolling
+    # worker pool remains saturated, but target time budgets and fairness
+    # cannot be trapped behind 1,000 unrelated pages.
+    pages, next_page = _select_page_batch(current, min(PAGED_PIPELINE_PAGES, max(page_workers, page_workers * 2)))
     completed_pages = completed_pages or set()
     requested_pages = [page for page in pages if page not in completed_pages]
     if not requested_pages:
@@ -993,12 +1034,18 @@ def _request_paged_batch(
         max_bytes=body_limit,
         prefer_text=False,
         json_only=True,
+        deadline=deadline,
     ):
         if result.succeeded and consume_success is not None:
             consume_success(result)
         results.append(result)
-    current.page = next_page
+    # Selected but unsubmitted pages must never be skipped by the cursor.
+    # An expiry prevents new admission but permits committed successes to land.
+    admitted = {result.page for result in results}
+    not_admitted = [page for page in requested_pages if page not in admitted]
+    current.page = min(next_page, min(not_admitted)) if not_admitted else next_page
     retry_set = set(current.retry_pages)
+    retry_set.update(page for page in not_admitted if page < next_page)
     for result in results:
         if result.succeeded:
             retry_set.discard(result.page)
@@ -1339,7 +1386,7 @@ def index_archive(
                                     "numbered CDX page returned an unexpected continuation; preserving incomplete coverage",
                                     splittable=False,
                                 )
-                            validate_cdx_scope(result.rows, target, current.start, current.end, target_config.cdx_filters)
+                            validate_cdx_scope(result.rows, target, current.start, current.end, target_config.cdx_filters, target_config.cdx_match_type)
                             page_received = len(result.rows)
                             write_started = time.monotonic()
                             # Capture rows and their page checkpoint are one
@@ -1382,7 +1429,9 @@ def index_archive(
                             result.rows.clear()
 
                         batch = _request_paged_batch(
-                            client, target_config, target, current, stop_event, store_completed_page, completed_pages
+                            client, target_config, target, current, stop_event, store_completed_page, completed_pages,
+                            deadline=(turn_started + budget_limit - spent.get(target, 0.0))
+                                if budget_limit is not None else None,
                         )
                         request_seconds = max(0.0, time.monotonic() - request_started - write_seconds)
                         successes = batch.successful
@@ -1524,7 +1573,7 @@ def index_archive(
                         continue
 
                     rows, finished, next_cursor = _request_resume(client, target_config, target, current)
-                    validate_cdx_scope(rows, target, current.start, current.end, target_config.cdx_filters)
+                    validate_cdx_scope(rows, target, current.start, current.end, target_config.cdx_filters, target_config.cdx_match_type)
                     connection_failure_streak = 0
                     transient_failure_streak = 0
                     request_seconds = time.monotonic() - request_started
