@@ -1,0 +1,113 @@
+{
+  "version": "1.2.4",
+  "schema": 9,
+  "baseline_zip": "archive-scout-testing-main(5).zip",
+  "baseline_sha256": "5312d3fe51ccbb4992e0e35c1f48cb501b32b8556ac4ab217a85649ab26ad52e",
+  "canonical_suite": {
+    "version": "1.2.4",
+    "generated_utc": "2026-10-17T13:50:08.496905+00:00",
+    "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+    "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+    "tests_run": 395,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 4,
+    "successful": true,
+    "test_environment": "Local fixture and mock traffic; live Wayback throughput not tested"
+  },
+  "targeted_full_range_tests": 16,
+  "compileall": "passed",
+  "verify_release": "passed",
+  "offline_benchmark": {
+    "cdx_rows_inserted": 1000,
+    "database_size_bytes": 1323008,
+    "database_transactions": 3,
+    "duplicate_work": 0,
+    "fixture": {
+      "body_bytes": 1024,
+      "cdx_chunk_rows": 50000,
+      "cdx_rows": 1000,
+      "cdx_upsert_skipped": false,
+      "keyword_patterns": 5000,
+      "keyword_score_runs": 100,
+      "keyword_searches": 1000,
+      "live_network": false,
+      "result_rows": 100
+    },
+    "http_attempts": 0,
+    "metrics": [
+      {
+        "elapsed_seconds": 0.023554,
+        "name": "parse_cdx_chunks",
+        "peak_memory_bytes": 470687,
+        "result": 1000
+      },
+      {
+        "elapsed_seconds": 0.494654,
+        "name": "literal_prefilter",
+        "peak_memory_bytes": 5388481,
+        "result": 1
+      },
+      {
+        "elapsed_seconds": 0.536942,
+        "name": "literal_scoring",
+        "peak_memory_bytes": 5279297,
+        "result": 200
+      },
+      {
+        "elapsed_seconds": 0.044691,
+        "name": "parse_and_upsert_cdx_chunks",
+        "peak_memory_bytes": 634424,
+        "result": 2000
+      },
+      {
+        "elapsed_seconds": 0.029714,
+        "name": "repeat_parse_and_noop_upsert",
+        "peak_memory_bytes": 412605,
+        "result": 0
+      },
+      {
+        "elapsed_seconds": 0.001547,
+        "name": "browse_500",
+        "peak_memory_bytes": 123114,
+        "result": 100
+      },
+      {
+        "elapsed_seconds": 0.009807,
+        "name": "export_json",
+        "peak_memory_bytes": 205348,
+        "result": 45245
+      }
+    ],
+    "unchanged_cdx_writes": 0
+  },
+  "limits": [
+    "No live Wayback verification",
+    "No hosted Windows/macOS CI execution",
+    "Four GUI/display cases skipped",
+    "No overnight throughput measurement"
+  ],
+  "changed_existing_files": [
+    "AGENTS.md",
+    "archive_scout/cdx/indexer.py",
+    "archive_scout/config.py",
+    "archive_scout/media/indexer.py",
+    "archive_scout/ui/main_window.py",
+    "tests/unit/test_v123_restoration.py"
+  ],
+  "added_files": [
+    "tests/unit/test_v124_full_range_indexing.py",
+    "docs/range-indexing-fix.md",
+    "validation/range-indexing-fix.json"
+  ],
+  "content_hashes": {
+    "AGENTS.md": "cb95f03f771c7400724a36e0502bd855a7e5c3f4f61646b3d7356747e9c085ec",
+    "archive_scout/cdx/indexer.py": "61da54a16e1779682663a7697854d81a00894c0b6b18ef22a566d1fe23dd8bc3",
+    "archive_scout/config.py": "49771b507706c7a063d64aa94082538edb976b07c13117527f7e6d5a43e7270b",
+    "archive_scout/media/indexer.py": "f44ea80b60f61bc97f1ec03a85b0141e3906dfa298385eeb09e13e0c5546b21c",
+    "archive_scout/ui/main_window.py": "c04377c0fa06528028248afc0ad96dfd92d1191f7737f7522637f6fafd6f37f0",
+    "tests/unit/test_v123_restoration.py": "e0214a21d9e15f538fcb9ea8b7531c50a1ef0c245ae074f57254504afd8afa76",
+    "tests/unit/test_v124_full_range_indexing.py": "96abb3d59f04ae94a234ec2aec4497be91fb21902340244717724e2a6a834527",
+    "docs/range-indexing-fix.md": "71e80f1a429103fa67cb405ea25328a285f66d590084fcf6233c871061b1643d"
+  }
+}

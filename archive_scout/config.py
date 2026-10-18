@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import sqlite3
+from contextlib import closing
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -445,6 +447,7 @@ class ProjectConfig:
     backup_keep: int = 5
     hitlist_keywords: list[str] = field(default_factory=list)
     text_collapse_scope: str = "range"
+    index_scope_revision: int = 1
     download_external_redirects: bool = False
     hitlist_file: str = ""
     dashboard_refresh_mode: str = "manual"
@@ -579,6 +582,7 @@ class ProjectConfig:
             hitlist_keywords=list(dict.fromkeys(str(value).strip() for value in self.hitlist_keywords if str(value).strip())),
             download_external_redirects=bool(self.download_external_redirects),
             text_collapse_scope="year" if str(self.text_collapse_scope).casefold()=="year" else "range",
+            index_scope_revision=1,
             hitlist_file=str(self.hitlist_file).strip(),
             dashboard_refresh_mode="auto" if str(self.dashboard_refresh_mode).casefold() == "auto" else "manual",
             dashboard_refresh_seconds=min(3600,max(5,int(self.dashboard_refresh_seconds))),
@@ -625,6 +629,54 @@ def save_project_config(config: ProjectConfig) -> Path:
     path = config.output_dir / "project.json"
     atomic_write_text(path, json.dumps(config.to_payload(), indent=2, ensure_ascii=False) + "\n")
     return path
+
+
+def _loaded_index_scope(payload: dict, root: Path) -> str:
+    """Upgrade only legacy work which has no durable inventory progress.
+
+    Annual collapse and range collapse select different memberships. Never
+    transfer a committed annual cursor or completed page to a broader query.
+    A revision-one scope is an explicit current setting and is preserved.
+    Read-only inspection must not create/migrate a project just to load it.
+    """
+    try:
+        version = tuple(int(part) for part in str(payload.get("version", "")).split("."))
+    except ValueError:
+        version = ()
+    default_range = payload.get("index_scope_revision") == 1 or version >= (1, 2, 3)
+    scope = str(payload.get("text_collapse_scope") or ("range" if default_range else "year")).casefold()
+    if scope != "year" or payload.get("index_scope_revision") == 1:
+        return scope
+    path = root / "archive_scout.sqlite3"
+    if not path.exists():
+        return "range"
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("captures", "media_captures", "index_pages", "media_index_pages"):
+                if table in tables and db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    return "year"
+            for table, plan_field in (("index_state", "resume_key"), ("index_coverage", "plan_json"),
+                                      ("media_index_state", "resume_key")):
+                if table not in tables:
+                    continue
+                for complete, seen, saved in db.execute(f"SELECT complete,seen,{plan_field} FROM {table}"):
+                    if complete or seen:
+                        return "year"
+                    if saved:
+                        try:
+                            plan = json.loads(saved)
+                            windows = plan.get("pending")
+                            if windows is None:
+                                windows = [plan]
+                            if plan.get("completed") or any(w.get("resume_key") or w.get("page", 0)
+                                                           or w.get("retry_pages") for w in windows):
+                                return "year"
+                        except (TypeError, ValueError, AttributeError):
+                            return "year"  # opaque/malformed evidence must not be reset
+    except sqlite3.Error:
+        return "year"
+    return "range"
 
 
 def load_project_config(path: Path) -> ProjectConfig:
@@ -826,7 +878,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         backup_keep=int(payload.get("backup_keep", 5)),
         hitlist_keywords=list(payload.get("hitlist_keywords") or []),
         download_external_redirects=bool(payload.get("download_external_redirects", False)),
-        text_collapse_scope=str(payload.get("text_collapse_scope") or ("range" if payload.get("version")=="1.2.4" else "year")),
+        text_collapse_scope=_loaded_index_scope(payload, saved_root),
         hitlist_file=str(payload.get("hitlist_file", "")),
         dashboard_refresh_mode=str(payload.get("dashboard_refresh_mode", "manual")),
         dashboard_refresh_seconds=int(payload.get("dashboard_refresh_seconds", 10)),

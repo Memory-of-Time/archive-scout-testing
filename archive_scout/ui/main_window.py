@@ -251,6 +251,7 @@ class ArchiveScoutApp(tk.Tk):
         self.network_backend_var = tk.StringVar(value="auto")
         self.network_endpoint_var = tk.StringVar(value="auto")
         self.network_strategy_var = tk.StringVar(value="auto")
+        self.index_scope_var = tk.StringVar(value="range")
         self.network_page_blocks_var = tk.StringVar(value="0")
         self.network_cdx_workers_var = tk.StringVar(value="10")
         self.network_memory_mb_var = tk.StringVar(value="512")
@@ -1191,6 +1192,13 @@ class ArchiveScoutApp(tk.Tk):
         ttk.Checkbutton(connection, text="Honor system proxy and certificate environment", variable=self.network_trust_env_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=3)
         ttk.Label(connection, text="Auto starts with resumable requests. Paged mode uses bounded native JSON requests and saves completed pages independently.", style="Muted.TLabel", wraplength=520, justify="left").grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
+        ttk.Label(connection, text="Index date scope:").grid(row=9, column=0, sticky="w", pady=3)
+        ttk.Combobox(connection, textvariable=self.index_scope_var, values=("range", "year"),
+                     state="readonly").grid(row=9, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(connection, text="range = all selected dates, resumable batches; year = legacy annual selection. "
+                  "Changing a progressed collapsed selection creates a different inventory; history is retained.",
+                  style="Muted.TLabel", wraplength=520, justify="left").grid(row=10, column=0, columnspan=2, sticky="ew")
+
         recovery = ttk.LabelFrame(tab, text="Automatic archive recovery", padding=10)
         recovery.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=8)
         recovery.columnconfigure(1, weight=1)
@@ -1865,7 +1873,8 @@ class ArchiveScoutApp(tk.Tk):
                 hitlist_keywords=self.lines_from(self.hitlist_text),
                 hitlist_file=self.hitlist_file_var.get(),
                 download_external_redirects=self.download_external_redirects_var.get(),
-                text_collapse_scope=(self.loaded_project_config.text_collapse_scope if self.loaded_project_config else "range"),
+                text_collapse_scope=(self.index_scope_var.get() if hasattr(self, "index_scope_var") else
+                    self.loaded_project_config.text_collapse_scope if self.loaded_project_config else "range"),
                 dashboard_refresh_mode=self.dashboard_refresh_mode_var.get(),
                 dashboard_refresh_seconds=int(self.dashboard_refresh_seconds_var.get()),
                 dashboard_eta_enabled=self.dashboard_eta_enabled_var.get(),
@@ -2902,6 +2911,7 @@ class ArchiveScoutApp(tk.Tk):
         self.network_page_blocks_var.set(str(network.page_blocks))
         self.network_cdx_workers_var.set(str(network.cdx_workers))
         self.network_memory_mb_var.set(str(network.cdx_memory_budget_mb))
+        self.index_scope_var.set(config.text_collapse_scope)
         self.skip_slow_index_targets_var.set(config.skip_slow_index_targets)
         self.index_target_minutes_var.set(str(config.index_target_minutes))
         self.network_trust_env_var.set(network.trust_environment)

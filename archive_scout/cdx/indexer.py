@@ -460,11 +460,11 @@ def window_label(start: str, end: str) -> str:
         if start_date.hour == end_date.hour and start_date.minute == end_date.minute:
             return f"{start_date:%Y-%m-%d %H:%M:%S}–{end_date:%H:%M:%S}"
         return f"{start_date:%Y-%m-%d %H:%M}–{end_date:%H:%M}"
-    if start_date.day == 1 and end_date.month == start_date.month:
+    if start_date.year == end_date.year and start_date.day == 1 and end_date.month == start_date.month:
         last_day = calendar.monthrange(start_date.year, start_date.month)[1]
         if end_date.day == last_day:
             return start_date.strftime("%Y-%m")
-    if start_date.month == 1 and start_date.day == 1 and end_date.month == 12 and end_date.day == 31:
+    if start_date.year == end_date.year and start_date.month == 1 and start_date.day == 1 and end_date.month == 12 and end_date.day == 31:
         return start_date.strftime("%Y")
     return f"{start_date:%Y-%m-%d}–{end_date:%Y-%m-%d}"
 
@@ -1070,12 +1070,32 @@ def _is_permanent_page_error(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError)
 
 
+def coalesce_untouched_range_plan(plan: IndexPlan, start: str, end: str, seen: int) -> bool:
+    """Reassemble an empty inherited range, not a progressed traversal."""
+    if seen or plan.completed or plan.gateway_splits_without_response or len(plan.pending) < 2:
+        return False
+    windows = sorted(plan.pending, key=lambda w: w.start)
+    if windows[0].start != start or windows[-1].end != end:
+        return False
+    for i, window in enumerate(windows):
+        if (window.resume_key or window.page or window.page_count >= 0 or window.page_layout
+                or window.retry_pages or window.strategy not in {"auto", "resume"}):
+            return False
+        if i and _shift_timestamp(windows[i - 1].end, 1) != window.start:
+            return False
+    plan.pending = [PendingWindow(start, end, failures=max(w.failures for w in windows),
+                                  page_size=min((w.page_size for w in windows if w.page_size), default=0),
+                                  next_eligible_at=max(w.next_eligible_at for w in windows))]
+    plan.planned = 1
+    return True
+
+
 def index_archive(
     config: ProjectConfig,
     database: sqlite3.Connection,
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None = None,
-) -> None:
+) -> bool:
     config = config.normalized()
     client = _client_for_config(config, stop_event, callback)
     if not config.cdx_collapses:
@@ -1093,6 +1113,8 @@ def index_archive(
             with database:
                 _adopt_compatible_range_coverage(database, target_id, target_config, signature)
         if target_config.text_collapse_scope == "year":
+            emit(callback, ProgressEvent("index", f"Legacy yearly scope is active for {target}; existing selection/checkpoints are preserved. "
+                "Settings → Connection and indexing → Index date scope controls range versus year."))
             for year in range(target_config.from_year, target_config.to_year + 1):
                 windows = index_windows(target_config, target, year)
                 if windows:
@@ -1114,6 +1136,7 @@ def index_archive(
     due: dict[tuple[str, str, int | None, str, str], float] = {}
     spent: dict[str, float] = {}
     budget_deferred: set[str] = set()
+    accounted: dict[tuple, tuple[int, int]] = {}
     try:
         while task_queue:
             if stop_event.is_set():
@@ -1191,6 +1214,18 @@ def index_archive(
             seen = int(state["seen"] or 0) if state else 0
             error_id = int(state["error_id"]) if state and state["error_id"] else None
             plan = decode_plan(state_plan, default_windows)
+            if state_kind == "range" and not seen and not plan.completed:
+                durable = database.execute(
+                    "SELECT 1 FROM captures WHERE target_id=? AND query_signature=? LIMIT 1",
+                    (target_id, signature),
+                ).fetchone() or database.execute(
+                    "SELECT 1 FROM index_pages WHERE target_id=? AND query_signature=? LIMIT 1",
+                    (target_id, signature),
+                ).fetchone()
+                if not durable and coalesce_untouched_range_plan(plan, task_start, task_end, seen):
+                    with database:
+                        persist_task_state(encode_plan(plan), False, seen, error_id)
+                    emit(callback, ProgressEvent("index", "Reassembled untouched legacy windows into the full selected date range; no committed work changed."))
             old_pending, old_planned = plan.pending, plan.planned
             removed = coalesce_unstarted_micro_windows(
                 plan, seen=seen, collapse_enabled=bool(target_config.cdx_collapses))
@@ -1208,8 +1243,11 @@ def index_archive(
             elif target_config.cdx_collapses and seen and len(plan.pending) >= 8:
                 emit(callback, ProgressEvent("index", "Existing fragmented collapsed CDX checkpoint retained: "
                     "automatic reassembly could change which timestamp represents a URL."))
-            completed_windows += plan.completed
-            total_windows += max(0, plan.planned - len(default_windows))
+            counted_complete, counted_extra = accounted.get(task_key, (0, 0))
+            completed_windows += plan.completed - counted_complete
+            extra = plan.planned - len(default_windows)
+            total_windows += extra - counted_extra
+            accounted[task_key] = (plan.completed, extra)
 
             while plan.pending:
                 active = spent.get(target, 0.0) + (time.monotonic() - turn_started)
@@ -1230,7 +1268,6 @@ def index_archive(
                     task_queue.append(task)
                     yielded = True
                     break
-                requests_this_turn += 1
                 if stop_event.is_set():
                     with database:
                         persist_task_state(encode_plan(plan), False, seen, error_id)
@@ -1246,6 +1283,7 @@ def index_archive(
                     if stop_event.is_set():
                         raise Stopped
                     continue
+                requests_this_turn += 1
                 _resolve_strategy(current, target_config, target)
                 label = window_label(current.start, current.end)
                 if current.strategy == "paged":
@@ -1259,7 +1297,9 @@ def index_archive(
                 elif current.resume_key:
                     phase = "resume-key continuation"
                 else:
-                    phase = "combined-range resume traversal"
+                    phase = ("legacy yearly resume traversal" if state_kind == "year" else
+                             "full-range resume traversal" if (current.start, current.end) ==
+                             (target_config.from_date, target_config.to_date) else "saved-window resume traversal")
                 emit(callback, ProgressEvent(
                     "index",
                     f"{target} • {label} • {phase}; seen {seen:,}",
@@ -1721,6 +1761,7 @@ def index_archive(
                         )
                         persist_task_state(encode_plan(plan), False, seen, error_id)
                     raise
+            accounted[task_key] = (plan.completed, plan.planned - len(default_windows))
             spent[target] = spent.get(target, 0.0) + (time.monotonic() - turn_started)
             if not plan.pending:
                 emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} • {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))

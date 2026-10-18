@@ -269,6 +269,8 @@ def _adopt_compatible_media_state(
     ).fetchone()
     if existing:
         return
+    if year == 0:
+        return  # range state has a disjoint slot; annual evidence is not range evidence
     start, end = cdx_year_window(config, year) or (f"{year:04d}0101000000", f"{year:04d}1231235959")
     for candidate_signature, candidate_state in media_signature_candidates(config):
         if candidate_state == state_signature:
@@ -316,6 +318,8 @@ def _reuse_completed_main_index(
     if not target_row:
         return False, 0, 0
     normal_target_id = int(target_row["id"])
+    if year == 0:
+        return False, 0, 0  # an annual completion cannot certify this range
     reusable_signature = None
     for candidate in cdx_query_signatures(config):
         row = database.execute(
@@ -589,17 +593,55 @@ def index_direct_media(
     callback: Callable[[ProgressEvent], None] | None,
     signature: str,
     state_signature: str,
-) -> None:
+) -> bool:
     media = config.media.normalized()
     targets = media.targets or config.targets
     extensions = selected_extensions(media)
     tasks: list[tuple[str, ProjectConfig, int, list[tuple[str, str]]]] = []
     for target in targets:
         target_config = config.for_target(target) if target in config.targets else config
-        for year in range(target_config.from_year, target_config.to_year + 1):
-            windows = index_windows(target_config, target, year)
-            if windows:
-                tasks.append((target, target_config, year, windows))
+        existing_target = database.execute("SELECT id FROM media_targets WHERE pattern=?", (target,)).fetchone()
+        legacy_progress = False
+        empty_annual_states = []
+        range_state = bool(existing_target and database.execute(
+            "SELECT 1 FROM media_index_state WHERE target_id=? AND year=0 AND query_signature=?",
+            (existing_target[0], state_signature),
+        ).fetchone())
+        if existing_target and not range_state:
+            candidates = dict.fromkeys([(signature, state_signature),
+                *media_signature_candidates(config), *media_signature_candidates(target_config)])
+            for candidate_signature, old_state in candidates:
+                if database.execute("SELECT 1 FROM media_captures WHERE target_id=? AND query_signature=? LIMIT 1",
+                                    (existing_target[0], candidate_signature)).fetchone():
+                    legacy_progress = True
+                    break
+                for old in database.execute(
+                    "SELECT year,complete,seen,resume_key FROM media_index_state "
+                    "WHERE target_id=? AND year>0 AND query_signature=?",
+                    (existing_target[0], old_state),
+                ):
+                    saved = decode_plan(old["resume_key"], index_windows(target_config, target, old["year"]))
+                    if (old["complete"] or old["seen"] or saved.completed or any(
+                        w.resume_key or w.page or w.retry_pages or w.page_layout for w in saved.pending
+                    ) or database.execute("SELECT 1 FROM media_index_pages WHERE target_id=? AND year>0 AND state_signature=? LIMIT 1",
+                                          (existing_target[0], old_state)).fetchone()):
+                        legacy_progress = True
+                        break
+                    empty_annual_states.append((existing_target[0], old["year"], old_state))
+                if legacy_progress:
+                    break
+        if target_config.text_collapse_scope == "range" and target_config.from_year != target_config.to_year and not legacy_progress:
+            # Retire only empty failed plans; no successful page/cursor/capture
+            # is discarded or relabeled complete. Errors remain in history.
+            with database:
+                database.executemany("DELETE FROM media_index_state WHERE target_id=? AND year=? AND query_signature=?",
+                                     empty_annual_states)
+            tasks.append((target, target_config, 0, [(target_config.from_date, target_config.to_date)]))
+        else:
+            for year in range(target_config.from_year, target_config.to_year + 1):
+                windows = index_windows(target_config, target, year)
+                if windows:
+                    tasks.append((target, target_config, year, windows))
     total = sum(len(windows) for _, _, _, windows in tasks)
     completed = 0
     connection_failure_streak = 0
@@ -640,7 +682,7 @@ def index_direct_media(
         if state and state["complete"]:
             completed += len(default_windows)
             if callback:
-                callback(ProgressEvent("media_index", f"Already indexed selected media for {target} in {year}", completed, total))
+                callback(ProgressEvent("media_index", f"Already indexed selected media for {target} during {window_label(*default_windows[0]) if year == 0 else year}", completed, total))
             continue
 
         # If the normal site index is already complete, media discovery is a

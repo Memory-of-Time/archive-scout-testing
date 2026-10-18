@@ -186,15 +186,15 @@ class IndexRestorationTests(unittest.TestCase):
             finally:
                 database.close()
 
-    def test_old_config_uses_original_year_collapse_and_roundtrips_settings(self):
+    def test_unstarted_old_config_upgrades_range_and_roundtrips_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp); path=root/'project.json'
             path.write_text(json.dumps({'version':'1.2.2','output_dir':temp,'targets':['example.org/*'],'from_date':'2001','to_date':'2002','cdx_filters':['statuscode:200','mimetype:text/.*'],'cdx_collapses':['urlkey'],'network':{'backend':'urllib3','trust_environment':False}}))
             config=load_project_config(path)
-            self.assertEqual(config.text_collapse_scope,'year')
+            self.assertEqual(config.text_collapse_scope,'range')
             save_project_config(config)
             reloaded=load_project_config(path)
-            self.assertEqual(reloaded.text_collapse_scope,'year')
+            self.assertEqual(reloaded.text_collapse_scope,'range')
             self.assertEqual((reloaded.cdx_filters,reloaded.cdx_collapses,reloaded.network.backend,reloaded.network.trust_environment),(config.cdx_filters,config.cdx_collapses,'urllib3',False))
 
     def test_signature_adoption_retains_colliding_capture_ids_and_routing(self):
