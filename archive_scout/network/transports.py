@@ -474,6 +474,22 @@ def _copy_headers(items: Iterable[tuple[object, object]]) -> dict[str, str]:
     return headers
 
 
+def _pace_redirect_hop(backend, stop_event: threading.Event) -> None:
+    """Each additional HTTP GET must respect the same shared physical pacer.
+
+    The initial GET is admitted by ResilientTransport. Direct backend callers
+    intentionally remain unaffected unless an explicit pacer is provided.
+    """
+    pacer = getattr(backend, "redirect_pacer", None)
+    if pacer is not None:
+        pacer.wait(stop_event)
+    checker = getattr(backend, "redirect_permit_checker", None)
+    if checker is not None and not checker():
+        raise PermitRevoked("host permit expired before a redirected physical request")
+    if stop_event.is_set():
+        raise Stopped
+
+
 class HttpxBackend:
     name = "httpx"
 
@@ -514,12 +530,16 @@ class HttpxBackend:
         started = time.monotonic()
         current_url = url
         for _ in range(11):
-            options = {"follow_redirects": False} if redirect_validator is not None else {}
+            options = {"follow_redirects": False} if (redirect_validator is not None or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))) else {}
             with self.client.stream("GET", current_url, headers=headers, **options) as response:
                 location = response.headers.get("Location")
-                if redirect_validator is not None and response.status_code in {301, 302, 303, 307, 308} and location:
+                if response.status_code in {301, 302, 303, 307, 308} and location and (
+                    redirect_validator is not None or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))
+                ):
                     destination = urllib.parse.urljoin(current_url, location)
-                    redirect_validator(current_url, destination)
+                    if redirect_validator is not None:
+                        redirect_validator(current_url, destination)
+                    _pace_redirect_hop(self, stop_event)
                     current_url = destination
                     continue
                 if response.status_code in {429, 503}:
@@ -567,13 +587,15 @@ class HttpxBackend:
         if _redirect_depth > 10:
             raise RuntimeError(f"too many redirects: {url}")
         with self.client.stream("GET", url, headers=request_headers,
-                                **({"follow_redirects": False} if redirect_validator else {})) as response:
-            if redirect_validator and int(response.status_code) in {301,302,303,307,308}:
+                                **({"follow_redirects": False} if redirect_validator or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None)) else {})) as response:
+            if (redirect_validator or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))) and int(response.status_code) in {301,302,303,307,308}:
                 location = response.headers.get("location")
                 if location:
                     next_url = urllib.parse.urljoin(url, location)
-                    redirect_validator(url, next_url)
+                    if redirect_validator:
+                        redirect_validator(url, next_url)
                     response.close()  # release pool slot before following another hop
+                    _pace_redirect_hop(self, stop_event)
                     return self.download(next_url, headers, destination, max_bytes, stop_event,
                         retain_partial=False, expected_digest="", redirect_validator=redirect_validator,
                         _redirect_depth=_redirect_depth+1)
@@ -710,6 +732,7 @@ class Urllib3Backend:
                     redirect_validator(current_url, destination)
                 self._discard(response)
                 response = None
+                _pace_redirect_hop(self, stop_event)
                 current_url = destination
             else:
                 raise RuntimeError(f"too many redirects: {url}")
@@ -773,6 +796,7 @@ class Urllib3Backend:
                     redirect_validator(current_url, destination_url)
                 self._discard(response)
                 response = None
+                _pace_redirect_hop(self, stop_event)
                 current_url = destination_url
             else:
                 raise RuntimeError(f"too many redirects: {url}")
@@ -837,6 +861,35 @@ class CurlBackend:
                 if key.casefold() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
 
     @staticmethod
+    def _early_control_status(path: Path) -> tuple[int, dict[str, str]] | None:
+        """Read a bounded complete header block, never a potentially huge body.
+
+        Curl writes `--dump-header` as soon as response headers arrive. This
+        permits prompt handling of HTTP 429/503 even if their body stalls.
+        """
+        try:
+            with path.open("rb") as stream:
+                prefix = stream.read(64 * 1024)
+        except FileNotFoundError:
+            return None
+        if not prefix or len(prefix) >= 64 * 1024:
+            return None
+        normalized = prefix.replace(b"\r\n", b"\n")
+        blocks = [block for block in normalized.split(b"\n\n")[:-1] if block.startswith(b"HTTP/")]
+        if not blocks:
+            return None
+        last = blocks[-1].decode("iso-8859-1", "replace")
+        parts = last.splitlines()[0].split()
+        if len(parts) < 2 or parts[1] not in {"429", "503"}:
+            return None
+        fields = {}
+        for line in last.splitlines()[1:]:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                fields[key.strip().casefold()] = value.strip()
+        return int(parts[1]), fields
+
+    @staticmethod
     def _parse_headers(raw: str) -> dict[str, str]:
         blocks = [block for block in raw.replace("\r\n", "\n").split("\n\n") if block.strip()]
         block = blocks[-1] if blocks else raw
@@ -854,7 +907,7 @@ class CurlBackend:
     def request(self, url: str, headers: dict[str, str], max_bytes: int,
                 stop_event: threading.Event,
                 redirect_validator: Callable[[str, str], None] | None = None) -> TransportResponse:
-        if redirect_validator is None:
+        if redirect_validator is None and not (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None)):
             return self._request_once(url, headers, max_bytes, stop_event)
         started = time.monotonic()
         current_url = url
@@ -865,7 +918,9 @@ class CurlBackend:
                 response.elapsed = time.monotonic() - started
                 return response
             destination = urllib.parse.urljoin(current_url, location)
-            redirect_validator(current_url, destination)
+            if redirect_validator is not None:
+                redirect_validator(current_url, destination)
+            _pace_redirect_hop(self, stop_event)
             current_url = destination
         raise RuntimeError(f"too many redirects: {url}")
 
@@ -915,12 +970,21 @@ class CurlBackend:
                 text=True,
                 creationflags=creationflags, env=self._curl_environment(),
             )
+            early_control = None
             while proc.poll() is None:
+                early_control = self._early_control_status(header_path)
+                if early_control is not None:
+                    proc.kill()
+                    break
                 if stop_event.wait(0.2):
                     proc.kill()
                     proc.wait(timeout=5)
                     raise Stopped
             stdout, stderr = proc.communicate()
+            if early_control is not None:
+                status, fields = early_control
+                return TransportResponse(status, fields, url, b"", self.name,
+                    time.monotonic()-started)
             if proc.returncode != 0:
                 message = (stderr or stdout or f"curl exited {proc.returncode}").strip()
                 if proc.returncode == 28:
@@ -968,7 +1032,7 @@ class CurlBackend:
                 "--max-filesize", str(int(max_bytes)), "--dump-header", str(header_path),
                 "--output", str(raw_path), "--write-out", "%{http_code}\n%{url_effective}",
             ]
-            if redirect_validator:
+            if redirect_validator or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None)):
                 command.remove("--location")
             for key, value in headers.items():
                 command.extend(["--header", f"{key}: {value}"])
@@ -978,13 +1042,23 @@ class CurlBackend:
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 creationflags=creationflags, env=self._curl_environment(),
             )
+            early_control = None
             while proc.poll() is None:
+                early_control = self._early_control_status(header_path)
+                if early_control is not None:
+                    proc.kill()
+                    break
                 if stop_event.wait(0.2):
                     proc.kill()
                     proc.wait(timeout=5)
                     destination.unlink(missing_ok=True)
                     raise Stopped
             stdout, stderr = proc.communicate()
+            if early_control is not None:
+                status, fields = early_control
+                return TransportFileResponse(status, fields, url, destination, 0,
+                    hashlib.sha256(b"").hexdigest(), b"", self.name,
+                    time.monotonic()-started)
             if proc.returncode != 0:
                 destination.unlink(missing_ok=True)
                 message = (stderr or stdout or f"curl exited {proc.returncode}").strip()
@@ -997,11 +1071,13 @@ class CurlBackend:
             raw_headers = header_path.read_text(encoding="iso-8859-1", errors="replace") if header_path.exists() else ""
             parsed_headers = self._parse_headers(raw_headers)
             location = parsed_headers.get("location")
-            if redirect_validator and status in {301,302,303,307,308} and location:
+            if (redirect_validator or (getattr(self, "redirect_pacer", None) or getattr(self, "redirect_permit_checker", None))) and status in {301,302,303,307,308} and location:
                 if _redirect_depth >= 10:
                     raise RuntimeError(f"too many redirects: {url}")
                 next_url = urllib.parse.urljoin(url, location)
-                redirect_validator(url, next_url)
+                if redirect_validator:
+                    redirect_validator(url, next_url)
+                _pace_redirect_hop(self, stop_event)
                 return self.download(next_url, headers, destination, max_bytes, stop_event,
                     redirect_validator=redirect_validator, _redirect_depth=_redirect_depth+1)
             _check_full_range(status, parsed_headers)
@@ -1047,6 +1123,7 @@ class ResilientTransport:
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.recovery_probes: set[str] = set()
+        self.backend_waiters = 0
         self.cooldown_until: dict[str, float] = {}
         self.fallback_pacer = None
         self.last_success: str | None = None
@@ -1093,6 +1170,18 @@ class ResilientTransport:
             available.insert(0, preferred)
         return available
 
+    def snapshot(self) -> dict[str, object]:
+        """Bounded transport health counters for stall-only diagnostics."""
+        with self.condition:
+            now = time.monotonic()
+            return {
+                "backend_waiters": self.backend_waiters,
+                "cooling_backends": tuple(name for name, until in self.cooldown_until.items() if until > now),
+                "cooldown_seconds": round(max((until-now for until in self.cooldown_until.values()), default=0.0), 1),
+                "recovery_probes": len(self.recovery_probes),
+                "preferred_backend": self.last_success,
+            }
+
     def _await_backend(self, name: str, stop_event: threading.Event) -> None:
         """One recovery probe per cooling backend, without blocking healthy peers."""
         if not hasattr(self, "condition"):
@@ -1108,7 +1197,11 @@ class ResilientTransport:
                     return
                 delay = max(0.0, until - time.monotonic())
                 if delay > 0 or name in self.recovery_probes:
-                    self.condition.wait(timeout=min(0.5, max(0.05, delay)))
+                    self.backend_waiters += 1
+                    try:
+                        self.condition.wait(timeout=min(0.5, max(0.05, delay)))
+                    finally:
+                        self.backend_waiters -= 1
                     continue
                 self.recovery_probes.add(name)
                 return
@@ -1145,6 +1238,8 @@ class ResilientTransport:
                 if stop_event.is_set():
                     raise Stopped
                 backend = self.backends[name]
+                backend.redirect_pacer = pacer
+                backend.redirect_permit_checker = permit_checker
             except BaseException:
                 # The exclusive cooling-backend probe may already have been
                 # reserved by _await_backend before admission/pacing failed.
@@ -1164,6 +1259,11 @@ class ResilientTransport:
                 return response
             except RedirectPolicyError:
                 self._backend_result(name, True)  # successful response, policy refused redirect
+                raise
+            except PermitRevoked:
+                # Host generation changed between redirect hops. Do not retry
+                # through another backend while the shared service is paused.
+                self._backend_result(name, True)
                 raise
             except Stopped:
                 with self.condition:
@@ -1233,6 +1333,8 @@ class ResilientTransport:
                 if stop_event.is_set():
                     raise Stopped
                 backend = self.backends[name]
+                backend.redirect_pacer = pacer
+                backend.redirect_permit_checker = permit_checker
             except BaseException:
                 # The exclusive cooling-backend probe may already have been
                 # reserved by _await_backend before admission/pacing failed.
@@ -1259,6 +1361,11 @@ class ResilientTransport:
                 return response
             except RedirectPolicyError:
                 self._backend_result(name, True)  # successful response, policy refused redirect
+                raise
+            except PermitRevoked:
+                # Host generation changed between redirect hops. Do not retry
+                # through another backend while the shared service is paused.
+                self._backend_result(name, True)
                 raise
             except Stopped:
                 with self.condition:

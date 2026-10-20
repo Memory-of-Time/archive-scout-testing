@@ -249,6 +249,39 @@ def parse_page(raw: str, original: str) -> tuple[str, str, list[str]]:
     return title, visible, sorted(links)
 
 
+# A shared interpretation rule, used by acquisition, rescan, local import,
+# Hitlist and derived FTS body. A stray <token> in a .txt file is not HTML.
+MARKUP_PATH_SUFFIXES = frozenset({
+    ".html", ".htm", ".shtml", ".shtm", ".dhtml", ".dhtm", ".xhtml", ".xhtm",
+    ".phtml", ".phtm", ".php", ".php3", ".php4", ".php5", ".cgi",
+    ".asp", ".aspx", ".jsp", ".cfm",
+})
+
+
+def is_markup_representation(raw: str, original: str, content_type: str = "") -> bool:
+    mime = (content_type or "").split(";", 1)[0].strip().casefold()
+    if "html" in mime or mime == "application/xhtml+xml":
+        return True
+    parsed = safe_urlsplit(original)
+    path = urllib.parse.unquote(parsed.path if parsed else original).casefold()
+    if path.endswith(tuple(MARKUP_PATH_SUFFIXES)):
+        return True
+    # Historic captures frequently declare text/plain for HTML. Require
+    # unmistakable document structure rather than arbitrary angle brackets.
+    prefix = raw[:8192].lstrip().casefold()
+    if prefix.startswith(("<!doctype html", "<html", "<head", "<body")):
+        return True
+    return bool(re.search(r"<(?:(?:html|head|body)\b[^>]*>|title\b[^>]*>).*?</(?:html|head|body|title)\s*>",
+                          prefix, flags=re.S))
+
+
+def parse_text_representation(raw: str, original: str, content_type: str = "") -> tuple[str, str, list[str]]:
+    """Preserve actual plain text as FTS body; render only confirmed markup."""
+    if is_markup_representation(raw, original, content_type):
+        return parse_page(raw, original)
+    links = {normalize_link(value, original) for value in URL_PATTERN.findall(raw)}
+    return "", raw, sorted(link for link in links if link)
+
 def classify_replay_content(raw: str, final_url: str) -> str | None:
     """Return a specific Wayback replay problem when an error shell was saved as HTTP 200.
 

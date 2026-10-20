@@ -19,7 +19,7 @@ from ..database.classification import classify_indexed_captures
 from ..classification import classify_indexed_resource, classify_payload_kind
 from ..config import ProjectConfig
 from ..constants import REPLAY_URL
-from ..content import classify_replay_content, decode_bytes, is_text_candidate, looks_textual_bytes, parse_page
+from ..content import classify_replay_content, decode_bytes, is_text_candidate, looks_textual_bytes, parse_page, parse_text_representation
 from ..database.repositories import record_error, record_site_issue, resolve_errors, save_match, upsert_document
 from ..events import ProgressEvent, Stopped
 from ..parsing.embeds import extract_embed_candidates_fast
@@ -375,7 +375,7 @@ def fetch_parse_scan(row: sqlite3.Row, config: ProjectConfig, jobs: list[ScanJob
                 "bytes_saved": len(data), "content_hash": hashlib.sha256(data).hexdigest(),
                 "http_status": response["status"], "final_url": response["final_url"],
                 "response_content_type": content_type, "deferred_scan": True}
-    title, visible, links = parse_page(raw, original)
+    title, visible, links = parse_text_representation(raw, original, content_type)
     # Avoid a second full HTML parser pass in the download hot path. The page
     # parser above already found ordinary attributes; this lightweight source
     # pass recovers FlashVars/legacy player config. Dedicated media discovery
@@ -739,6 +739,9 @@ def download_archive(
                     now = time.monotonic()
                     if callback and now-last_completion >= 30.0 and now-last_stall_message >= 30.0:
                         status = client.host_gate.snapshot()
+                        transport_health = (client.transport.snapshot()
+                            if isinstance(getattr(client, "transport", None), ResilientTransport)
+                            else {})
                         callback(ProgressEvent(
                             "acquisition_stall",
                             f"No completed text requests for {now-last_completion:.0f}s; "
@@ -746,8 +749,11 @@ def download_archive(
                             f"workers waiting at Wayback gate {status['waiting_workers']}; "
                             f"probe active {status['recovery_probe']}; "
                             f"host pause {status['remaining_pause']:.1f}s; "
-                            f"last successful save {now-last_save:.0f}s ago. "
-                            "Other workers may be awaiting network responses or pacing."
+                            f"last successful save {now-last_save:.0f}s ago; "
+                            f"backend waiters {transport_health.get('backend_waiters', '?')}; "
+                            f"cooling backends {transport_health.get('cooling_backends', ())}; "
+                            f"backend cooldown max {transport_health.get('cooldown_seconds', '?')}s. "
+                            "Remaining worker occupancy may be network, filesystem, scanner, or DB work."
                         ))
                         last_stall_message = now
                     continue
@@ -811,8 +817,9 @@ def download_archive(
                                 from ..database.repositories import get_or_create_media_target, upsert_media_captures
                                 target = get_or_create_media_target(database, "__deferred_text_replay__")
                                 suffix = extension_from_url(str(row["original_url"]))
-                                if suffix not in {".png",".jpg",".jpeg",".gif",".webp",".bmp",".avif",".mp4",".webm",".avi",".mov",".mkv",".flv",".swf",".wmv"}:
-                                    suffix = ".png" if exc.resource_class == "image" else ".mp4"
+                                # Preserve the URL's real suffix (or absence
+                                # of one); a fallback .mp4/.png would invent
+                                # format identity for opaque historical bytes.
                                 upsert_media_captures(
                                     database,[({"original": row["original_url"],"timestamp":row["timestamp"],
                                                "mimetype":exc.content_type,"statuscode":row["statuscode"],
