@@ -1,4 +1,6 @@
-# Archive Scout v1.2.4 — indexing audit implementation and limits
+# Archive Scout v1.2.4 — historical indexing audit implementation and limits
+
+> Historical v1.2.4 notes. The current v1.2.5 release uses schema 10 and provides a guarded schema-9 upgrade. See `MIGRATION.md` and `CHANGELOG.md` for current compatibility.
 
 ## Authority, compatibility and release contract
 

@@ -35,6 +35,11 @@ def run(count:int=90)->dict:
             target=get_or_create_target(db,'example.net/*')
             with db:
                 upsert_captures(db,(("20010101000000",f"http://example.net/page/{n}","text/html","200",f"D{n}",len(body)) for n in range(count)),target,signature)
+                # The benchmark measures post-index acquisition. Record the
+                # complete synthetic inventory as a real committed phase gate.
+                from archive_scout.cdx.indexer import save_coverage_state
+                save_coverage_state(db,target,signature,config.from_date,config.to_date,
+                                    None,True,count,None)
             keyword_set_id=get_or_create_keyword_set(db,'Test',['needle'])
             run_id=start_scan_run(db,keyword_set_id,'loopback test',1,'all',{})
             db.commit()

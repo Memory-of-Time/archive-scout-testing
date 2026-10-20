@@ -1,11 +1,9 @@
 # Indexing recovery
 
-Archive Scout persists CDX work so a single slow or failed interval does not require a full restart.
+Archive Scout persists CDX traversal evidence, including target scope, date bounds, selection/collapse identity, cursor/page checkpoints, and incomplete/error state. A saved cursor is only advanced after the associated rows and validation evidence are durably committed.
 
-Broad targets can use page-based retrieval and other targets can use resume keys. Work state tracks target, date window, query signature, progress, resume key, completion state, and associated errors.
+A persistently failing index scope receives a progressively increasing persisted cooldown. Other eligible scopes can progress without cycling continuously through unsuccessful years. Endpoint aliases at the same Wayback host are not independent providers, and gateway 502/503/504 responses must not trigger a redundant same-host request cascade. Host-wide genuine rate limits are distinguished from query-specific errors.
 
-Transient failures can rotate network backends/endpoints and split the failed date interval into smaller windows. Successful sibling windows remain complete and are not repeated.
+An unresolved collapsed query **must not** be split into different date scopes or silently converted to numbered pages merely to obtain an HTTP response; that could change the selected representative capture. A transition to alternate paging is permitted only when equivalent selection and terminal evidence have been established. An exhausted scope stays visibly incomplete, even when the report writer succeeds.
 
-Connection-failure circuits prevent every queued item from independently repeating the same unavailable-network sequence. Rate-limit signals are shared through the request gate so concurrent workers stop issuing stale permits while recovery is in progress.
-
-Permanent Wayback policy conditions are surfaced as site issues. Confirmed excluded targets can be skipped for remaining work rather than retried as ordinary timeouts.
+Read-only cached inventory and saved-body scanning may continue during an index outage. v1.2.5 requires every selected initial index scope to be committed complete before any *new* replay acquisition is admitted. A deferred or blocked index does not authorize partial-scope downloading. This intentionally may delay the first download but adds no inventory-wide query per successfully acquired capture.
