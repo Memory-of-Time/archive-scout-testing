@@ -5,7 +5,7 @@ import json
 import hashlib
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Callable
 
@@ -14,7 +14,7 @@ from .cdx.indexer import index_archive
 from .cdx.parameters import cdx_query_signature
 from .database.classification import classify_indexed_captures
 from .analysis.workflow import run_analysis
-from .config import KeywordSetConfig, ProjectConfig, save_project_config
+from .config import KeywordSetConfig, MediaConfig, ProjectConfig, save_project_config
 from .database.connection import open_database
 from .database.lease import guard_project
 from .database.repositories import (finish_scan_run, get_or_create_keyword_set, latest_scan_run, start_scan_run, start_operation_run, finish_operation_run, update_operation_run)
@@ -22,7 +22,8 @@ from .downloads.downloader import download_archive
 from .downloads.retry import retry_error_urls
 from .events import ConnectivityPaused, ProgressEvent, Stopped
 from .media.downloader import download_media, retry_media_errors
-from .media.indexer import index_external_embedded_media, index_media, media_index_state_signature
+from .media.recovery import recover_active_media
+from .media.indexer import index_external_embedded_media, index_media, media_index_state_signature, media_query_signature
 from .media.reports import generate_media_reports
 from .projects.integrity import check_project_integrity
 from .projects.backups import create_project_backup
@@ -30,6 +31,7 @@ from .projects.repair import repair_project
 from .projects.diagnostics import export_diagnostics
 from .projects.importers import import_text_folder
 from .constants import VERSION
+from .coverage import IndexCoveragePending, require_text_coverage, require_media_coverage, text_coverage_gaps, media_coverage_gaps, record_admission
 from .projects.merge import merge_projects
 from .reports.text import generate_index_reports, generate_reports
 from .research.index import build_research_index
@@ -37,6 +39,41 @@ from .scanning.jobs import ScanJob
 from .scanning.rescanner import rescan_keyword_sets
 
 from .scanning.hitlist import load_hitlist, search_with_hitlist
+
+class OperationPaths(dict):
+    """Backward-compatible mapping of report paths with durable operation outcome."""
+
+    def __init__(self, paths, *, status="complete", message=""):
+        super().__init__(paths)
+        self.status = status
+        self.message = message
+
+
+def _media_unfinished(database: sqlite3.Connection, config: ProjectConfig,
+                      extra_signature: str | None = None) -> bool:
+    """A media stage cannot be complete with selected pending/error captures."""
+    signatures = [media_query_signature(config)]
+    if extra_signature:
+        signatures.append(extra_signature)
+    return bool((not extra_signature and media_coverage_gaps(database, config)) or database.execute(
+        "SELECT 1 FROM media_captures WHERE state IN ('pending','error','downloading') "
+        "AND query_signature IN (" + ",".join("?" for _ in signatures) + ") LIMIT 1",
+        signatures,
+    ).fetchone() or database.execute(
+        "SELECT 1 FROM media_index_state WHERE query_signature=? AND complete=0 LIMIT 1",
+        (media_index_state_signature(config),),
+    ).fetchone() or (extra_signature and database.execute(
+        "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
+        "AND state IN ('pending','error','resolving') LIMIT 1",
+        (extra_signature,),
+    ).fetchone()))
+
+
+def _incomplete_scan_ids(database: sqlite3.Connection, jobs: list[ScanJob]) -> list[int]:
+    return [job.scan_run_id for job in jobs if (row := database.execute(
+        "SELECT status FROM scan_runs WHERE id=?", (job.scan_run_id,),
+    ).fetchone()) is not None and row[0] != "complete"]
+
 
 class IncompleteCoverage(RuntimeError):
     """Files/reports are retained, but scan completeness could not be established."""
@@ -425,6 +462,28 @@ def run_project(
     (config.output_dir / "reports").mkdir(exist_ok=True)
     database = open_database(config.output_dir, migrate=True)
     jobs: list[ScanJob] = []
+    # Record the requested optional media *phase*, not just currently visible
+    # media settings. It survives a crash during indexing, scanning or media.
+    if mode in {"all", "external_media_after_scan"}:
+        policy = ("external" if mode == "external_media_after_scan" else
+                  "direct" if config.media.enabled else "")
+        if policy:
+            database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('pending_media_phase',?)", (policy,))
+            database.execute("INSERT OR REPLACE INTO project_meta(key,value) VALUES('pending_media_settings',?)",
+                             (json.dumps(asdict(config.media.normalized()), sort_keys=True),))
+        else:
+            database.execute("DELETE FROM project_meta WHERE key IN ('pending_media_phase','pending_media_settings')")
+    pending_media_phase = ""
+    if mode == "resume":
+        policy_row = database.execute("SELECT value FROM project_meta WHERE key='pending_media_phase'").fetchone()
+        pending_media_phase = str(policy_row[0]) if policy_row else ""
+        if pending_media_phase in {"direct", "external"}:
+            saved_media = database.execute("SELECT value FROM project_meta WHERE key='pending_media_settings'").fetchone()
+            if saved_media:
+                config.media = MediaConfig(**json.loads(saved_media[0])).normalized()
+            config.media = replace(config.media.normalized(), enabled=True,
+                discover_embedded=True if pending_media_phase == "external" else config.media.discover_embedded,
+                allow_external_embeds=True if pending_media_phase == "external" else config.media.allow_external_embeds)
     operation_run_id = start_operation_run(database, mode, VERSION)
     database.commit()
     original_callback = callback
@@ -468,6 +527,12 @@ def run_project(
             "report", f"{'Wrote' if done else 'Writing'} {name}.txt: {count:,} rows"
         ))
     report_finalization_started = False
+
+    def result_paths(paths: dict[str, Path]) -> OperationPaths:
+        row = database.execute("SELECT status,message FROM operation_runs WHERE id=?", (operation_run_id,)).fetchone()
+        return OperationPaths(paths, status=str(row[0]) if row else "complete",
+                              message=str(row[1] or "") if row else "")
+
     try:
         save_project_config(config)
         if mode == "hitlist":
@@ -516,7 +581,7 @@ def run_project(
             paths = run_analysis(config, database, stop_event, callback, forum_only=False)
             finish_operation_run(database, operation_run_id, "complete", "Analysis complete")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "research_index":
             summary = build_research_index(config, database, stop_event, callback)
             report = config.output_dir / "reports" / "research_index.json"
@@ -529,7 +594,7 @@ def run_project(
             paths = run_analysis(config, database, stop_event, callback, forum_only=True)
             finish_operation_run(database, operation_run_id, "complete", "Forum rebuild complete")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "merge_project":
             source = Path(config.analysis.normalized().merge_source).expanduser()
             if not str(source).strip() or not source.exists():
@@ -553,62 +618,58 @@ def run_project(
                 "incomplete" if index_deferred else "complete",
                 "Indexing deferred by configured target time budget; unfinished checkpoints retained" if index_deferred else "Index complete")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "report":
-            # Explicit report regeneration must not hide a partially completed
-            # scan behind an older successful scan. Keep status visible in the
-            # report summary and preserve the scan-specific run directory.
-            latest = database.execute("SELECT id FROM scan_runs ORDER BY id DESC LIMIT 1").fetchone()
-            existing = int(latest[0]) if latest else None
-            if existing is None:
-                if database.execute("SELECT COUNT(*) FROM captures").fetchone()[0]:
-                    paths = generate_index_reports(config, database,
-                        progress=report_progress, stop_event=stop_event)
-                else:
-                    raise RuntimeError("this project does not contain indexed captures or a completed scan run")
-            else:
-                paths = generate_reports(
-                    config, database, existing,
-                    progress=lambda name, count, done: emit(callback, ProgressEvent(
-                        "report", f"{'Wrote' if done else 'Writing'} {name}.txt: {count:,} rows"
-                    )),
-                    stop_event=stop_event,
-                )
-            emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-            finish_operation_run(database, operation_run_id, "complete", "Reports regenerated")
+            from .reports.snapshot import generate_project_report_files
+            paths = generate_project_report_files(config, database,
+                progress=report_progress, stop_event=stop_event)
+            finish_operation_run(database, operation_run_id, "complete", "Report export complete (project coverage unchanged)")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "media_index":
             index_media(config, database, stop_event, callback)
             paths = generate_media_reports(config, database)
-            gaps = bool(database.execute("SELECT 1 FROM media_index_state WHERE query_signature=? AND complete=0 LIMIT 1",
-                        (media_index_state_signature(config),)).fetchone())
+            gaps = bool(media_coverage_gaps(database, config))
             finish_operation_run(database, operation_run_id, "incomplete" if gaps else "complete",
                 "Media indexing incomplete; unfinished coverage retained" if gaps else "Media index complete")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "media_download":
+            if media_coverage_gaps(database, config):
+                index_media(config, database, stop_event, callback)
+            require_media_coverage(database, config)
             download_media(config, database, stop_event, callback)
+            recover_active_media(config, database, stop_event, callback)
             paths = generate_media_reports(config, database)
-            finish_operation_run(database, operation_run_id, "complete", "Media download complete")
+            unfinished = _media_unfinished(database, config)
+            finish_operation_run(database, operation_run_id, "incomplete" if unfinished else "complete",
+                                 "Media downloads remain pending or failed" if unfinished else "Media download complete")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "media_retry":
+            if media_coverage_gaps(database, config):
+                index_media(config, database, stop_event, callback)
+            require_media_coverage(database, config)
             retry_media_errors(config, database, stop_event, callback)
+            recover_active_media(config, database, stop_event, callback)
             paths = generate_media_reports(config, database)
-            finish_operation_run(database, operation_run_id, "complete", "Media retry complete")
+            unfinished = _media_unfinished(database, config)
+            finish_operation_run(database, operation_run_id, "incomplete" if unfinished else "complete",
+                                 "Media retries remain pending or failed" if unfinished else "Media retry complete")
             database.commit()
-            return paths
+            return result_paths(paths)
         if mode == "media_all":
             index_media(config, database, stop_event, callback)
+            require_media_coverage(database, config)
             download_media(config, database, stop_event, callback)
+            recover_active_media(config, database, stop_event, callback)
             paths = generate_media_reports(config, database)
-            gaps = bool(database.execute("SELECT 1 FROM media_index_state WHERE query_signature=? AND complete=0 LIMIT 1",
-                        (media_index_state_signature(config),)).fetchone())
-            finish_operation_run(database, operation_run_id, "incomplete" if gaps else "complete",
-                "Media indexing incomplete; unfinished coverage retained" if gaps else "Media operation complete")
+            gaps = bool(media_coverage_gaps(database, config))
+            unfinished = gaps or _media_unfinished(database, config)
+            finish_operation_run(database, operation_run_id, "incomplete" if unfinished else "complete",
+                "Media coverage/downloads incomplete; unfinished work retained" if unfinished else "Media operation complete")
             database.commit()
-            return paths
+            return result_paths(paths)
 
         # Filesystem and database are not one transaction. Recover complete
         # raw bodies after an interrupted SQLite/FTS commit before network work.
@@ -631,8 +692,21 @@ def run_project(
                                    stop_event, callback, workers=config.workers)
 
         index_deferred = False
-        if mode in {"all", "external_media_after_scan", "resume", "download_only"}:
-            index_deferred = index_archive(config, database, stop_event, callback)
+        if mode in {"all", "external_media_after_scan", "resume", "download_only", "download", "retry_errors", "retry_download_errors"}:
+            if text_coverage_gaps(database, config):
+                index_deferred = index_archive(config, database, stop_event, callback)
+            require_text_coverage(database, config)
+            record_admission(database, operation_run_id, "text", config)
+            # Direct media can be indexed without downloading text. Embedded
+            # candidates discovered from future documents need the later gate.
+            direct_media_phase = ((mode == "all" and config.media.enabled)
+                                  or (mode == "download_only" and config.media.enabled)
+                                  or (mode == "resume" and pending_media_phase == "direct"))
+            if direct_media_phase:
+                if media_coverage_gaps(database, config):
+                    index_media(config, database, stop_event, callback)
+                require_media_coverage(database, config)
+                record_admission(database, operation_run_id, "media", config)
 
         # Acquisition-only runs never create scan jobs, even without a keyword set.
         if mode in {"download_only", "retry_download_errors"}:
@@ -644,19 +718,21 @@ def run_project(
             else:
                 retry_capture_downloads(config, database, stop_event, callback)
             if mode == "download_only" and config.media.enabled:
-                index_media(config, database, stop_event, callback)
+                require_media_coverage(database, config)
                 download_media(config, database, stop_event, callback)
+                recover_active_media(config, database, stop_event, callback)
             paths = generate_index_reports(config, database,
                 operation="download_only", progress=report_progress, stop_event=stop_event)
             paths["project"] = config.output_dir / "project.json"
             if config.media.enabled and mode == "download_only":
                 paths.update(generate_media_reports(config, database))
             gaps = remaining_acquisition_gaps(config, database)
-            finish_operation_run(database, operation_run_id, "incomplete" if (gaps or index_deferred) else "complete",
+            media_gaps = mode == "download_only" and config.media.enabled and _media_unfinished(database, config)
+            finish_operation_run(database, operation_run_id, "incomplete" if (gaps or index_deferred or media_gaps) else "complete",
                                  f"Acquisition-only: {gaps:,} unresolved capture(s); indexing deferred={index_deferred}" if (gaps or index_deferred)
                                  else "Acquisition-only operation complete")
             database.commit()
-            return paths
+            return result_paths(paths)
 
         if not jobs:
             jobs = prepare_scan_jobs(database, config, mode)
@@ -684,9 +760,14 @@ def run_project(
         elif mode == "retry_errors":
             retry_error_urls(config, database, primary_run_id, stop_event, callback, jobs)
             media_error_count = database.execute(
-                "SELECT COUNT(*) FROM errors WHERE resolved=0 AND ignored=0 AND retryable=1 AND media_capture_id IS NOT NULL"
+                "SELECT COUNT(*) FROM errors e JOIN media_captures mc ON mc.id=e.media_capture_id "
+                "WHERE e.resolved=0 AND e.ignored=0 AND e.retryable=1 AND mc.query_signature=?",
+                (media_query_signature(config),),
             ).fetchone()[0]
             if media_error_count:
+                if media_coverage_gaps(database, config):
+                    index_media(config, database, stop_event, callback)
+                require_media_coverage(database, config)
                 retry_media_errors(
                     config,
                     database,
@@ -707,12 +788,19 @@ def run_project(
         database.commit()
         # Reporting may involve project-sized exports; keep the scan results
         # durable and report progress so the GUI does not appear frozen at 100%.
+        incomplete_runs = _incomplete_scan_ids(database, jobs)
         report_finalization_started = True
         emit(callback, ProgressEvent("report", "Scanning committed. Generating scan reports."))
         paths = generate_job_reports(config, database, jobs, callback=callback, stop_event=stop_event)
         if mode == "retry_errors" and database.execute("SELECT COUNT(*) FROM media_captures").fetchone()[0]:
             paths.update(generate_media_reports(config, database))
-        if mode == "external_media_after_scan":
+        if incomplete_runs:
+            raise IncompleteCoverage(
+                "Partial reports saved, but scan coverage is incomplete for run(s) "
+                + ", ".join(map(str, incomplete_runs)) + ". Media phase was not started.", paths)
+        external_media_signature = None
+        if mode == "external_media_after_scan" or (mode == "resume" and pending_media_phase == "external"):
+
             emit(
                 callback,
                 ProgressEvent(
@@ -721,6 +809,7 @@ def run_project(
                 ),
             )
             media_signature = index_external_embedded_media(config, database, stop_event, callback)
+            external_media_signature = media_signature
             media_total = int(database.execute(
                 "SELECT COUNT(*) FROM media_captures WHERE query_signature=?", (media_signature,)
             ).fetchone()[0])
@@ -737,11 +826,34 @@ def run_project(
                     pending_media,
                 ),
             )
-            download_media(config, database, stop_event, callback)
+            # Embedded lookups are required inventory, not merely optional hits.
+            if database.execute(
+                "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
+                "AND state IN ('pending','error','resolving') LIMIT 1", (media_signature,),
+            ).fetchone():
+                raise IndexCoveragePending("Embedded media lookup obligations remain unresolved")
+            record_admission(database, operation_run_id, "embedded", config)
+            download_media(config, database, stop_event, callback,
+                           media_signature=external_media_signature)
+            recover_active_media(config, database, stop_event, callback,
+                                 additional_signature=external_media_signature)
+            # Embedded inventory uses a distinct signature; it does not imply
+            # a completed *direct* media index for the same domain.
+            # Manual/scope-specific recovery retains the unresolved queue.
+
             paths.update(generate_media_reports(config, database))
-        elif mode == "all" and config.media.enabled:
-            index_media(config, database, stop_event, callback)
-            download_media(config, database, stop_event, callback)
+        elif (mode == "all" and config.media.enabled) or (mode == "resume" and pending_media_phase == "direct"):
+
+            require_media_coverage(database, config)
+            record_admission(database, operation_run_id, "embedded", config)
+            download_media(config, database, stop_event, callback,
+                           media_signature=external_media_signature)
+            recover_active_media(config, database, stop_event, callback,
+                                 additional_signature=external_media_signature)
+            # Embedded inventory uses a distinct signature; it does not imply
+            # a completed *direct* media index for the same domain.
+            # Manual/scope-specific recovery retains the unresolved queue.
+
             paths.update(generate_media_reports(config, database))
         if config.research.enabled and config.research.auto_build:
             research_summary = build_research_index(config, database, stop_event, callback)
@@ -750,31 +862,23 @@ def run_project(
             research_report.write_text(_json.dumps(research_summary.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
             paths["research_index"] = research_report
         emit(callback, ProgressEvent("report", f"Reports written to {config.output_dir / 'reports'}"))
-        incomplete_runs = []
-        for job in jobs:
-            run_state = database.execute(
-                "SELECT status FROM scan_runs WHERE id=?", (job.scan_run_id,)
-            ).fetchone()
-            # Compatibility harnesses can inject synthetic jobs without a
-            # persisted scan_runs row. Real jobs always have a durable row.
-            if run_state is not None and run_state[0] != "complete":
-                incomplete_runs.append(int(job.scan_run_id))
-        if incomplete_runs:
-            raise IncompleteCoverage(
-                f"Reports saved, but scan coverage is incomplete for run(s) "
-                f"{', '.join(map(str, incomplete_runs))}. Check unresolved scan errors "
-                "and rerun Rescan to recover missing bodies.", paths,
-            )
         unresolved = remaining_acquisition_gaps(config, database)
-        media_gaps = bool(config.media.enabled and database.execute(
-            "SELECT 1 FROM media_index_state WHERE query_signature=? AND complete=0 LIMIT 1",
-            (media_index_state_signature(config),)).fetchone())
+        media_gaps = (bool(config.media.enabled or pending_media_phase) and _media_unfinished(database, config, external_media_signature))
         finish_operation_run(database, operation_run_id,
                              "incomplete" if (unresolved or index_deferred or media_gaps) else "complete",
                              f"{unresolved:,} unresolved capture(s); indexing deferred={index_deferred}; media gaps={media_gaps}" if (unresolved or index_deferred or media_gaps)
                              else "Operation complete")
+        if mode in {"all", "external_media_after_scan", "resume"} and not (unresolved or index_deferred or media_gaps):
+            database.execute("DELETE FROM project_meta WHERE key IN ('pending_media_phase','pending_media_settings')")
         database.commit()
-        return paths
+        return result_paths(paths)
+    except IndexCoveragePending as exc:
+        # Unlike Stop, an unmet admission gate does not erase pending work or
+        # claim that report generation certified project completeness.
+        finish_operation_run(database, operation_run_id, "incomplete", str(exc))
+        database.commit()
+        emit(callback, ProgressEvent("index_incomplete", str(exc)))
+        return result_paths({"project": config.output_dir / "project.json"})
     except IncompleteCoverage as exc:
         finish_operation_run(database, operation_run_id, "incomplete", str(exc))
         database.commit()
@@ -820,13 +924,11 @@ def run_project(
         with database:
             database.execute("UPDATE captures SET state='pending' WHERE state='downloading'")
             database.execute("UPDATE media_captures SET state='pending' WHERE state='downloading'")
-            if jobs:
-                # A filesystem/report export failure after the last scan result
-                # is NOT a failed scan. Leave an explicit rescan retry point so
-                # the same run (and its existing zero-hit/match evidence) can
-                # be reused to regenerate the missing reports on next Rescan.
-                finish_jobs(database, jobs, "interrupted" if
-                            (mode == "rescan" and report_finalization_started) else "failed")
+            if jobs and not report_finalization_started:
+                # Only a failure during the scanning phase affects scan state.
+                # Once finish_jobs commits, an export failure must leave those
+                # durable outcomes unchanged (including incomplete scans).
+                finish_jobs(database, jobs, "failed")
         finish_operation_run(database, operation_run_id, "failed", f"{type(exc).__name__}: {exc}")
         database.commit()
         raise

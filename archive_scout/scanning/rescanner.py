@@ -143,13 +143,26 @@ def rescan_keyword_sets(
         clauses.append(f"(SELECT COUNT(DISTINCT m.scan_run_id) FROM document_matches m WHERE m.document_id=d.id AND m.scan_run_id IN ({placeholders}))<?")
         params.extend(job.scan_run_id for job in jobs)
         params.append(len(jobs))
+    # Scope membership is an indexed, connection-local relation rather than an
+    # ever-growing OR expression. Memory/SQL depth are independent of project size.
+    database.execute("DROP TABLE IF EXISTS temp.archive_scout_rescan_scope")
     if scope_pairs is not None:
         if not scope_pairs:
             return
-        clauses.append("EXISTS (SELECT 1 FROM targets t WHERE t.id=c.target_id AND (" +
-                       " OR ".join("(t.pattern=? AND c.query_signature=?)" for _ in scope_pairs) + "))")
-        for pair in scope_pairs:
-            params.extend(pair)
+        database.execute(
+            "CREATE TEMP TABLE archive_scout_rescan_scope("
+            "pattern TEXT NOT NULL, signature TEXT NOT NULL, "
+            "PRIMARY KEY(pattern, signature)) WITHOUT ROWID"
+        )
+        database.executemany(
+            "INSERT OR IGNORE INTO archive_scout_rescan_scope(pattern,signature) VALUES (?,?)",
+            ((str(pattern), str(signature)) for pattern, signature in scope_pairs),
+        )
+        clauses.append(
+            "EXISTS (SELECT 1 FROM targets t "
+            "JOIN archive_scout_rescan_scope s ON s.pattern=t.pattern "
+            "AND s.signature=c.query_signature WHERE t.id=c.target_id)"
+        )
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_document_selection")
     if document_ids:
         database.execute(

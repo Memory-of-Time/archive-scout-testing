@@ -11,6 +11,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+from dataclasses import replace
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -46,7 +47,7 @@ from ..events import ConnectivityPaused, ProgressEvent, Stopped
 from ..operations import IncompleteCoverage, run_project
 from ..reports.compare import generate_scan_comparison
 from ..reports.export import export_review_package, export_scan
-from ..reports.text import generate_reports
+from ..reports.snapshot import export_project_snapshot
 from ..research.ai import run_grounded_answer
 from ..research.search import search_research
 from ..runtime import FrozenBundleError, bundled_resource, ensure_frozen_bundle_available
@@ -68,11 +69,11 @@ MODE_HELP = {
     "download_only": "Indexes and saves text captures without scanning, keyword requirements or scan reports; optionally downloads supplemental media.",
     "retry_download_errors": "Retries unresolved text acquisition failures without creating scan jobs or scanning.",
     "download": "Downloads pending text captures and scans them with the keyword set marked Use in next scan.",
-    "resume": "Continues interrupted indexing, downloading and scans; performs one bounded retry sweep for previously recorded transient text errors.",
+    "resume": "Continues unfinished indexing, downloads, scans and the original optional media phase, with retained checkpoints.",
     "rescan": "Scans saved files locally, reusing an interrupted run with the same keywords and scope; no Wayback requests.",
     "retry_errors": "Retries unresolved text-page and media errors. Valid local text files are rescanned before redownloading.",
     "hitlist": "Searches all indexed URLs and saved text captures with a resumable literal hitlist; writes a CSV and coverage summary without downloading.",
-    "report": "Regenerates reports for the latest scan run (including incomplete scans, clearly labeled), without downloading or rescanning.",
+    "report": "Exports current text/index and available media reports without acquiring or rescanning. The Reports tab also supports independent snapshots during a run.",
     "integrity": "Checks saved files and database links without deleting project data.",
     "repair": "Creates a safety backup, repairs stuck states and missing-file records, and rebuilds full-text indexes.",
     "backup": "Creates a consistent SQLite backup inside the project backup folder.",
@@ -171,6 +172,8 @@ class ArchiveScoutApp(tk.Tk):
         self.events: CoalescingEventQueue[ProgressEvent] = CoalescingEventQueue(max_events=256)
         self.stop_event = threading.Event()
         self.worker_thread: threading.Thread | None = None
+        self.active_run_config: ProjectConfig | None = None
+        self.report_worker_thread: threading.Thread | None = None
         self.last_paths: dict[str, Path] = {}
         self.keyword_sets: list[dict] = []
         self.current_keyword_set = -1
@@ -890,7 +893,11 @@ class ArchiveScoutApp(tk.Tk):
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(3, weight=1)
         self.notebook.add(page, text="Reports")
-        ttk.Label(tab, text="Report contents", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        action_bar = ttk.Frame(tab)
+        action_bar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(action_bar, text="Report contents", style="Section.TLabel").pack(side="left")
+        self.write_report_now_button = ttk.Button(action_bar, text="Write report now", command=self.write_report_now)
+        self.write_report_now_button.pack(side="right")
         ttk.Label(
             tab,
             text=(
@@ -1022,10 +1029,15 @@ class ArchiveScoutApp(tk.Tk):
             "errors": set(REPORT_FIELD_NAMES["errors"]),
             "site_issues": set(REPORT_FIELD_NAMES["site_issues"]),
             "summary": set(REPORT_FIELD_NAMES["summary"]) - {"bodies_searched"},
+            "media_indexed": set(REPORT_FIELD_NAMES["media_indexed"]),
+            "media_downloaded": set(REPORT_FIELD_NAMES["media_downloaded"]),
+            "media_wayback_urls": set(REPORT_FIELD_NAMES["media_wayback_urls"]),
+            "media_errors": set(REPORT_FIELD_NAMES["media_errors"]),
+            "media_summary": set(REPORT_FIELD_NAMES["media_summary"]),
         }.get(output, set())
         for index, (name, variable) in enumerate(self.report_field_vars.get(output, {}).items()):
             available = name in supported
-            label = name.replace("_", " ") if available else name.replace("_", " ") + " (unavailable in schema 7)"
+            label = name.replace("_", " ") if available else name.replace("_", " ") + " (not supported by this renderer)"
             ttk.Checkbutton(self.report_fields_frame, text=label, variable=variable,
                             state="normal" if available else "disabled").grid(
                 row=index // 3, column=index % 3, sticky="w", padx=(0, 12), pady=2)
@@ -1961,12 +1973,18 @@ class ArchiveScoutApp(tk.Tk):
                 getattr(self, name).configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.log(f"Starting {mode} in {config.output_dir}")
+        self.active_run_config = config
         self.worker_thread = threading.Thread(target=self.run_worker, args=(config, mode), daemon=True)
         self.worker_thread.start()
 
     def run_worker(self, config: ProjectConfig, mode: str) -> None:
         try:
-            self.events.put(("complete", run_project(config, mode, self.stop_event, self.on_engine_event)))
+            paths = run_project(config, mode, self.stop_event, self.on_engine_event)
+            if getattr(paths, "status", "complete") == "incomplete":
+                self.events.put(("incomplete_result", {
+                    "message": getattr(paths, "message", "Unfinished work retained"), "paths": dict(paths)}))
+            else:
+                self.events.put(("complete", paths))
         except IncompleteCoverage as exc:
             self.events.put(("incomplete", {"message": str(exc), "paths": exc.paths}))
         except (RateLimitDeferred, ConnectivityPaused) as exc:
@@ -2017,6 +2035,25 @@ class ArchiveScoutApp(tk.Tk):
                     self.refresh_results()
                     self.refresh_errors()
                     messagebox.showinfo(APP_NAME, "The run is complete.")
+                elif kind == "incomplete_result":
+                    self.last_paths = payload["paths"]
+                    self.progress.stop()
+                    self.status_var.set("Incomplete: resumable work remains")
+                    self.log("Reports written, but requested work is incomplete: " + payload["message"])
+                    self.finish_run()
+                    self.refresh_history()
+                    self.refresh_errors()
+                    messagebox.showwarning(APP_NAME, "Reports were written, but unfinished work remains. Resume to continue.")
+                elif kind == "manual_report_done":
+                    self.write_report_now_button.configure(state="normal")
+                    self.report_worker_thread = None
+                    self.log(f"Report snapshot written: {payload}")
+                    messagebox.showinfo(APP_NAME, f"Report snapshot written to:\n{payload}")
+                elif kind == "manual_report_error":
+                    self.write_report_now_button.configure(state="normal")
+                    self.report_worker_thread = None
+                    self.log("Report snapshot failed: " + payload)
+                    messagebox.showerror(APP_NAME, "Report export failed: " + payload)
                 elif kind == "ai_complete":
                     run_id = int(payload["run_id"])
                     self.last_paths.update(payload.get("paths") or {})
@@ -2086,6 +2123,7 @@ class ArchiveScoutApp(tk.Tk):
             self.after(50, self.finish_run)
             return
         self.worker_thread = None
+        self.active_run_config = None
         self.start_button.configure(state="normal")
         if hasattr(self, "ai_start_button"):
             self.ai_start_button.configure(state="normal")
@@ -2729,15 +2767,34 @@ class ArchiveScoutApp(tk.Tk):
             database.close()
             self.refresh_history()
 
+    def write_report_now(self, *, scan_id: int | None = None) -> None:
+        """Snapshot current committed evidence without acquiring the project lease."""
+        if self.report_worker_thread and self.report_worker_thread.is_alive():
+            self.log("A report export is already running for this project.")
+            return
+        try:
+            # The active operation owns the path; an edited UI field cannot
+            # accidentally point an in-flight export at another project.
+            active = self.active_run_config if self.worker_thread and self.worker_thread.is_alive() else None
+            config = (active if active is not None else self.build_config(require_keywords=False))
+            config = replace(config, report=self.current_report_config())
+        except (ValueError, KeyError) as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.write_report_now_button.configure(state="disabled")
+        def report_worker() -> None:
+            try:
+                paths = export_project_snapshot(config, scan_run_id=scan_id)
+                self.events.put(("manual_report_done", str(paths["snapshot_folder"])))
+            except Exception as exc:
+                self.events.put(("manual_report_error", f"{type(exc).__name__}: {exc}"))
+        self.report_worker_thread = threading.Thread(target=report_worker, daemon=True)
+        self.report_worker_thread.start()
+
     def regenerate_selected_scan(self) -> None:
         scan_id = self.selected_history_id()
-        if not scan_id:
-            return
-        database = self.project_database()
-        try:
-            generate_reports(self.build_config(require_keywords=False), database, scan_id)
-        finally:
-            database.close()
+        if scan_id:
+            self.write_report_now(scan_id=scan_id)
 
     def delete_selected_scan(self) -> None:
         scan_id = self.selected_history_id()
