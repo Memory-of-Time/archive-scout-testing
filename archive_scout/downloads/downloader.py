@@ -523,6 +523,10 @@ def download_archive(
         if callback:
             callback(ProgressEvent("download", "Index-only mode selected; downloads skipped."))
         return
+    # Defense in depth: direct callers and manual retries cannot bypass a
+    # missing/unfinished inventory. One proof per batch, never per capture.
+    from ..coverage import require_text_coverage
+    require_text_coverage(database, config)
     jobs = [] if acquire_only else (scan_jobs or [ScanJob.create(scan_run_id, config.keyword_set_name, config.keywords)])
     if not acquire_only and (not jobs or any(not job.patterns for job in jobs)):
         raise ValueError("at least one keyword rule is required")

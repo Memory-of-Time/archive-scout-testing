@@ -26,7 +26,7 @@ def database_version(path: Path) -> int | None:
 
 
 def is_modern_database(path: Path) -> bool:
-    return database_version(path) in {2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION}
+    return database_version(path) in {2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION}
 
 
 def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
@@ -42,7 +42,7 @@ def open_database(root: Path, migrate: bool = True) -> sqlite3.Connection:
         from ..projects.migration import migrate_legacy_project
         migrate_legacy_project(root)
         version = database_version(path)
-    if migrate and version in {2, 3, 4, 5, 6, 7, 8}:
+    if migrate and version in {2, 3, 4, 5, 6, 7, 8, 9}:
         # Migration must not modify the only copy if a safety backup fails.
         from ..projects.backups import create_project_backup
         create_project_backup(root, reason=f"before_schema_{SCHEMA_VERSION}", keep=5)

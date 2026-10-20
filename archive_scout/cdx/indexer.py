@@ -1176,7 +1176,6 @@ def index_archive(
     completed_windows = 0
     connection_failure_streak = 0
     transient_failure_streak = 0
-    excluded_targets: set[str] = set()
     # A target gets bounded work turns. Stalled queries retain their exact
     # durable state, but may no longer monopolize the operation for hours.
     task_queue = deque(tasks)
@@ -1228,15 +1227,6 @@ def index_archive(
                                         seen_value, error_value, strategy, layout)
 
             scope_label = str(year) if state_kind == "year" else window_label(task_start, task_end)
-            if target in excluded_targets:
-                with database:
-                    persist_task_state(None, True, 0, None)
-                completed_windows += len(default_windows)
-                emit(callback, ProgressEvent("site_issue",
-                    f"Skipping {target} for {scope_label}: Wayback already reported this target as excluded.",
-                    completed_windows, total_windows))
-                continue
-
             if state_kind == "year":
                 assert year is not None
                 with database:

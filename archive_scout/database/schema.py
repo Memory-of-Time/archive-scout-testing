@@ -255,6 +255,24 @@ CREATE TABLE IF NOT EXISTS capture_payload_evidence(
     response_status INTEGER,
     updated_at TEXT NOT NULL
 );
+-- Durable, bounded automatic media recovery for active scope only.
+CREATE TABLE IF NOT EXISTS media_retry_schedule(
+    media_capture_id INTEGER PRIMARY KEY REFERENCES media_captures(id) ON DELETE CASCADE,
+    next_eligible_at REAL NOT NULL,
+    failure_count INTEGER NOT NULL DEFAULT 1,
+    last_category TEXT NOT NULL,
+    last_status INTEGER,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS media_retry_due_idx ON media_retry_schedule(next_eligible_at,media_capture_id);
+CREATE TABLE IF NOT EXISTS phase_admissions(
+    operation_run_id INTEGER NOT NULL REFERENCES operation_runs(id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    scope_digest TEXT NOT NULL,
+    admitted_at TEXT NOT NULL,
+    PRIMARY KEY(operation_run_id,phase)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS text_retry_schedule(
     capture_id INTEGER PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
     next_eligible_at REAL NOT NULL,
@@ -853,7 +871,7 @@ def initialize_schema(database: sqlite3.Connection) -> None:
             migrate_v7_to_v8(database)
         elif version == 7:
             migrate_v7_to_v8(database)
-        elif version == 8:
+        elif version in (8, 9):
             database.executescript(BASE_SCHEMA_SQL)
         elif version != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported Archive Scout schema version: {version}")

@@ -68,6 +68,17 @@ def media_query_signature(config: ProjectConfig, page_size: int | None = None) -
     payload = {
         "from": config.from_date,
         "to": config.to_date,
+        "match_type": config.cdx_match_type,
+        "effective_targets": [
+            (target, {
+                "from": effective.from_date, "to": effective.to_date,
+                "filters": effective.cdx_filters, "collapses": effective.cdx_collapses,
+                "match_type": effective.cdx_match_type, "extra": effective.cdx_extra_params,
+                "collapse_scope": effective.text_collapse_scope,
+            })
+            for target in (media.targets or config.targets)
+            for effective in [config.for_target(target) if target in config.targets else config]
+        ],
         "filters": config.cdx_filters,
         "collapses": config.cdx_collapses,
         "extra": config.cdx_extra_params,
@@ -75,6 +86,7 @@ def media_query_signature(config: ProjectConfig, page_size: int | None = None) -
         "targets": media.targets or config.targets,
         "extensions": selected_extensions(media),
         "strategy": media.snapshot_strategy,
+        "selection_proof": "unfiltered_timestamps_v1" if media.snapshot_strategy in {"earliest", "latest"} else "configured_collapse",
         "embedded": media.discover_embedded,
         "external": media.allow_external_embeds,
         "single_query_per_target": True,
@@ -143,7 +155,10 @@ def build_media_params(
     elif config.cdx_match_type:
         params.append(("matchType", config.cdx_match_type))
     params.extend(("filter", value) for value in config.cdx_filters)
-    params.extend(("collapse", value) for value in config.cdx_collapses)
+    # Earliest/latest cannot be established from an arbitrary collapsed
+    # representative. Keep the full timestamp universe until local selection.
+    if config.media.normalized().snapshot_strategy == "all":
+        params.extend(("collapse", value) for value in config.cdx_collapses)
     if not exact and extensions:
         # One regex filter covers every selected extension. Archive Scout never
         # performs an extension-by-extension CDX index.

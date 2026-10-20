@@ -35,6 +35,10 @@ def classify_exception(exc: Exception) -> tuple[str, int | None, bool]:
     explicit_category = str(getattr(exc, "category", "") or "")
     if explicit_category in {"wayback_excluded", "robots_blocked", "wayback_forbidden", "missing_capture", "http_client_error"}:
         return explicit_category, int(status) if status else None, False
+    if message.startswith(("incomplete_media_range", "incomplete_media_length")):
+        return "incomplete_media_representation", status, True
+    if message.startswith("invalid_media_range"):
+        return "invalid_media_representation", status, False
     replay_categories = {
         "wayback_excluded": ("wayback_excluded", None, False),
         "robots_blocked": ("robots_blocked", None, False),

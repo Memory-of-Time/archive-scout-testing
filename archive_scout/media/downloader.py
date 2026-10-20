@@ -23,6 +23,7 @@ from ..events import ProgressEvent, Stopped
 from ..site_status import host_from_url, should_surface_site_issue, site_issue_message
 from ..utils import utc_now
 from .indexer import media_query_signature
+from .recovery import record_media_failure, clear_media_retry
 
 INVALID_COMPONENT = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -112,6 +113,55 @@ def _disambiguate_media_path(path: Path, row: sqlite3.Row | dict) -> Path:
     return path.with_name(f"{path.stem}__{token}{path.suffix}")
 
 
+def _known_binary_prefix(prefix: bytes) -> bool:
+    """Positive binary evidence, never inspect arbitrary binary metadata as text."""
+    return (
+        prefix.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"FLV", b"ID3", b"\x1a\x45\xdf\xa3", b"OggS", b"fLaC", b"%PDF-", b"\x00\x00\x01\xba"))
+        or (len(prefix) >= 12 and prefix[4:8] == b"ftyp")
+        or (len(prefix) >= 12 and prefix[:4] == b"RIFF" and prefix[8:12] in (b"AVI ", b"WAVE", b"WEBP"))
+        or (len(prefix) >= 8 and prefix[4:8] in (b"moov", b"mdat", b"wide", b"free"))
+        or (len(prefix) >= 2 and prefix[0] == 0xff and (prefix[1] & 0xe0) == 0xe0)
+    )
+
+
+def validate_media_representation(response: dict, *, path_hint: str = "") -> None:
+    """Reject demonstrably non-media and incomplete transfers in constant memory.
+
+    Unknown containers remain eligible for their configured formats; this is
+    representation integrity, not a promise of universal codec playability.
+    """
+    headers = {str(k).casefold(): str(v).strip() for k, v in response.get("headers", {}).items()}
+    size = int(response.get("bytes") or 0)
+    prefix = bytes(response.get("preview") or b"")[:8192]
+    status = int(response.get("status") or 0)
+    if status not in (200, 206) or size <= 0:
+        raise RuntimeError("media response is not a complete successful representation")
+    content_range = headers.get("content-range", "")
+    if status == 206:
+        import re
+        matched = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range)
+        if not matched:
+            raise RuntimeError("incomplete_media_range: partial response has no verifiable complete range")
+        start, end, length = map(int, matched.groups())
+        if start != 0 or end + 1 != length or size != length:
+            raise RuntimeError("incomplete_media_range: only part of the requested media was received")
+    elif content_range:
+        # A complete 200 response must not contradict a partial range header.
+        raise RuntimeError("invalid_media_range: conflicting complete response headers")
+    encoding = headers.get("content-encoding", "identity").casefold()
+    declared = headers.get("content-length", "")
+    if declared.isdigit() and encoding in ("", "identity") and int(declared) != size:
+        raise RuntimeError("incomplete_media_length: received bytes differ from Content-Length")
+    if not _known_binary_prefix(prefix):
+        stripped = prefix.lstrip(b"\xef\xbb\xbf\t\r\n ").lower()
+        if (stripped.startswith((b"<!doctype html", b"<html", b"<?xml"))
+                or b"<html" in stripped[:512]
+                or b"<title>wayback machine" in stripped[:1024]):
+            raise RuntimeError("invalid_wayback_replay: HTML/service document instead of media payload")
+        if "text/html" in headers.get("content-type", "").casefold() and stripped.startswith(b"<"):
+            raise RuntimeError("invalid_wayback_replay: HTML document instead of media payload")
+
+
 def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
                 destination: Path | None = None) -> dict:
     path = Path(destination) if destination is not None else media_path(config.output_dir, row)
@@ -160,12 +210,13 @@ def fetch_media(row: sqlite3.Row, config: ProjectConfig, client: HttpClient,
     if not int(response["bytes"]):
         temp.unlink(missing_ok=True)
         raise RuntimeError("empty media response")
-    if "text/html" in content_type:
-        preview = bytes(response["preview"]).decode("utf-8", "ignore")
-        replay_problem = classify_replay_content(preview, str(response["final_url"]))
-        if replay_problem or "wayback machine" in preview.casefold() or "not archived" in preview.casefold():
-            temp.unlink(missing_ok=True)
-            raise RuntimeError(replay_problem or "invalid_wayback_replay")
+    try:
+        validate_media_representation(response, path_hint=str(row["original_url"]))
+    except Exception:
+        # A rejected response is never published over previously verified bytes.
+        # The error remains a recoverable capture obligation in the database.
+        temp.unlink(missing_ok=True)
+        raise
     os.replace(temp, path)
     return {
         "id": int(row["id"]),
@@ -228,7 +279,33 @@ def download_media(
     callback: Callable[[ProgressEvent], None] | None = None,
     states: tuple[str, ...] = ("pending",),
     media_capture_ids: list[int] | None = None,
+    media_signature: str | None = None,
 ) -> None:
+    # Direct and retry paths need the same positive index proof as orchestration.
+    # Embedded discovery carries its own distinct scope/admission from the
+    # preceding scan/discovery phase rather than a direct-media checkpoint.
+    from ..coverage import IndexCoveragePending, require_media_coverage
+    direct_signature = media_query_signature(config)
+    if media_signature is None or media_signature == direct_signature:
+        require_media_coverage(database, config)
+    else:
+        # Supplying an arbitrary signature must not act as an admission bypass.
+        # The only supported separate scope is externally embedded discovery
+        # resolved by the preceding text scan/index phase.
+        from dataclasses import replace
+        from .indexer import media_query_signature as signature_of
+        external_config = config.normalized()
+        external_config.media = replace(external_config.media.normalized(),
+                                        enabled=True, discover_embedded=True,
+                                        allow_external_embeds=True)
+        if media_signature != signature_of(external_config):
+            raise IndexCoveragePending("Unrecognized media inventory identity; acquisition is not admitted")
+        if database.execute(
+            "SELECT 1 FROM media_discovery_queue WHERE query_signature=? "
+            "AND state IN ('pending','error','resolving') LIMIT 1",
+            (media_signature,),
+        ).fetchone():
+            raise IndexCoveragePending("Embedded media lookup inventory is unfinished")
     clauses: list[str] = []
     params: list[object] = []
     database.execute("DROP TABLE IF EXISTS temp.archive_scout_media_selection")
@@ -243,9 +320,12 @@ def download_media(
         clauses.append(
             "EXISTS (SELECT 1 FROM archive_scout_media_selection s WHERE s.id=media_captures.id)"
         )
+        # Explicit retry IDs do not grant membership in a different inventory.
+        clauses.append("query_signature=?")
+        params.append(media_signature or media_query_signature(config))
     else:
         clauses.extend(["query_signature=?", "download_attempts<?"])
-        params.extend([media_query_signature(config), config.max_attempts])
+        params.extend([media_signature or media_query_signature(config), config.max_attempts])
     if states:
         clauses.append("state IN (" + ",".join("?" for _ in states) + ")")
         params.extend(states)
@@ -377,6 +457,7 @@ def download_media(
                             save_media_success(
                                 database, result["id"], result["path"], result["bytes"], result["hash"], result["status"], result["final_url"]
                             )
+                            clear_media_retry(database, int(result["id"]))
                     except RateLimitDeferred as exc:
                         # Remote pause exhaustion belongs to the media retry
                         # inventory, never to the user's global Stop event.
@@ -386,6 +467,7 @@ def download_media(
                                 (utc_now(), row["id"]))
                             record_error(database, "media_download", "rate_limit", repr(exc),
                                 media_capture_id=int(row["id"]), http_status=getattr(exc,"status",429),retryable=True)
+                            record_media_failure(database, int(row["id"]), "rate_limit", getattr(exc,"status",429), True, config)
                         if callback:
                             callback(ProgressEvent("rate_limit",
                                 "Media capture was rate-limited; retained for later retry without stopping local work."))
@@ -408,6 +490,7 @@ def download_media(
                                 database, "media_download", category, repr(exc), media_capture_id=int(row["id"]),
                                 http_status=status, retryable=retryable
                             )
+                            record_media_failure(database, int(row["id"]), category, status, retryable, config)
                             if should_surface_site_issue(category):
                                 record_site_issue(
                                     database,
@@ -462,17 +545,18 @@ def retry_media_errors(
         )
         selection_sql = " AND EXISTS (SELECT 1 FROM archive_scout_media_retry_selection s WHERE s.id=mc.id)"
     last_id = 0
+    active_signature = media_query_signature(config)
     while True:
         if stop_event.is_set():
             raise Stopped
         rows = database.execute(
-            """SELECT mc.id FROM media_captures mc WHERE mc.id>? AND
+            """SELECT mc.id FROM media_captures mc WHERE mc.query_signature=? AND mc.id>? AND
                 ((mc.state='error' AND EXISTS (
                     SELECT 1 FROM errors e WHERE e.media_capture_id=mc.id
                     AND e.resolved=0 AND e.ignored=0 AND e.retryable=1))
                   OR (mc.state='pending' AND mc.download_attempts>=?))"""
             + selection_sql + " ORDER BY mc.id LIMIT 1000",
-            (last_id, config.max_attempts),
+            (active_signature, last_id, config.max_attempts),
         ).fetchall()
         if not rows:
             break

@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 @contextmanager
-def project_lease(root):
+def project_lease(root, *, lock_name: str = "archive_scout.lock"):
     """Serialize whole operations and database replacement across processes.
 
     Advisory OS locks are released on crashes; the tiny lock file is reusable.
@@ -15,7 +15,7 @@ def project_lease(root):
     """
     root = Path(root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    handle = (root / "archive_scout.lock").open("a+b")
+    handle = (root / lock_name).open("a+b")
     locked = False
     try:
         if os.name == "nt":

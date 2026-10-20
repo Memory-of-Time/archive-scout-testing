@@ -260,15 +260,19 @@ def _run_command(args: argparse.Namespace) -> int:
 
     try:
         paths = run_project(config, args.mode, stop_event, progress)
-        result = {"status": "complete", "mode": args.mode, "paths": {key: str(value) for key, value in paths.items()}}
+        outcome = getattr(paths, "status", "complete")
+        result = {"status": outcome, "mode": args.mode,
+                  "paths": {key: str(value) for key, value in paths.items()}}
+        if outcome != "complete":
+            result["message"] = getattr(paths, "message", "Unfinished work retained")
         if args.format == "jsonl":
-            _print_json({"type": "complete", "data": result})
+            _print_json({"type": outcome, "data": result})
         elif args.format == "json":
             _print_json(result)
         else:
             for name, path in paths.items():
                 print(f"{name}: {path}")
-        return EXIT_OK
+        return EXIT_INCOMPLETE if outcome == "incomplete" else EXIT_OK
     except IncompleteCoverage as exc:
         payload = {"type": "incomplete", "status": "incomplete", "message": str(exc),
                    "paths": {name: str(path) for name, path in exc.paths.items()}}
