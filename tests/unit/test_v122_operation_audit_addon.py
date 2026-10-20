@@ -121,6 +121,8 @@ class OperationAuditRegressions(unittest.TestCase):
                 tid=get_or_create_target(db,config.targets[0]);sig=cdx_query_signature(config)
                 add_capture(db,tid,sig,'http://example.org/include.html')
                 add_capture(db,tid,sig,'http://example.org/skip.html')
+                from archive_scout.cdx.indexer import save_coverage_state
+                save_coverage_state(db, tid, sig, config.from_date, config.to_date, None, True, 2, None)
                 db.commit()
             with patch('archive_scout.operations.index_archive',side_effect=fixture_index), \
                  patch('archive_scout.downloads.downloader.HttpClient',FakeClient):

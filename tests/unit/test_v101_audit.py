@@ -57,7 +57,7 @@ class V101AuditTests(unittest.TestCase):
             order: list[str] = []
             job = ScanJob.create(1, "set", ["needle"])
             with (
-                patch("archive_scout.operations.index_archive", side_effect=lambda *a, **k: order.append("index")),
+                patch("archive_scout.operations.index_archive", side_effect=lambda *a, **k: (order.append("index"), _fixture_index_complete(*a))),
                 patch("archive_scout.operations.prepare_scan_jobs", return_value=[job]),
                 patch("archive_scout.operations.download_archive", side_effect=lambda *a, **k: order.append("download")),
                 patch("archive_scout.operations.finish_jobs"),
@@ -177,3 +177,17 @@ class V101AuditTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _fixture_index_complete(config, database, *_unused):
+    from archive_scout.cdx.parameters import cdx_query_signature
+    from archive_scout.cdx.indexer import save_coverage_state
+    from archive_scout.database.repositories import get_or_create_target
+    scoped = config.normalized()
+    for target in scoped.targets:
+        target_config = scoped.for_target(target)
+        target_id = get_or_create_target(database, target)
+        save_coverage_state(database, target_id, cdx_query_signature(target_config),
+                            target_config.from_date, target_config.to_date,
+                            None, True, 0, None)
+    database.commit()

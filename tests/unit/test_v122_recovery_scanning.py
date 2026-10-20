@@ -40,6 +40,9 @@ class InlineScanRestoration(unittest.TestCase):
             upsert_capture(db, {'original':'http://example.org/'+suffix,
                 'timestamp':'20010101000000','mimetype':'text/html',
                 'statuscode':'200','digest':'D1','length':'100'},target,cdx_query_signature(config))
+            from archive_scout.cdx.indexer import save_coverage_state
+            save_coverage_state(db, target, cdx_query_signature(config),
+                                config.from_date, config.to_date, None, True, 1, None)
         db.close()
 
     def test_download_and_scan_are_one_pass_and_report_has_match(self):

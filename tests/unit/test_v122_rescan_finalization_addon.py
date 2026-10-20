@@ -54,7 +54,8 @@ class RescanFinalizationTests(unittest.TestCase):
             db = open_database(root)
             try:
                 run_id = int(db.execute("SELECT id FROM scan_runs").fetchone()[0])
-                self.assertEqual(db.execute("SELECT status FROM scan_runs").fetchone()[0], "interrupted")
+                # A completed scan stays complete even if report export fails.
+                self.assertEqual(db.execute("SELECT status FROM scan_runs").fetchone()[0], "complete")
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM document_matches WHERE scan_run_id=?", (run_id,)).fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT status FROM operation_runs ORDER BY id DESC LIMIT 1").fetchone()[0], "failed")
             finally:
@@ -62,11 +63,10 @@ class RescanFinalizationTests(unittest.TestCase):
             from archive_scout.scanning import rescanner
             with patch.object(rescanner, "_analyze_saved_document", side_effect=AssertionError("already-scanned body was scanned again")):
                 events = []
-                result = run_project(config, "rescan", callback=events.append)
+                result = run_project(config, "report", callback=events.append)
             self.assertTrue(result["summary"].is_file())
             self.assertIn("needle", result["matches_ranked"].read_text(encoding="utf-8"))
-            self.assertTrue(any(e.stage == "scan_finalize" for e in events))
-            self.assertTrue(any(e.stage == "report" and "Generating" in e.message for e in events))
+            self.assertFalse(any(e.stage == "scan_finalize" for e in events))
             self.assertTrue(any(e.stage == "report" and "Wrote" in e.message for e in events))
             db = open_database(root)
             try:

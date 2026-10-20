@@ -115,6 +115,12 @@ class V105ReleaseTests(unittest.TestCase):
                 media=MediaConfig(enabled=True),
             ).normalized()
             database = open_database(root)
+            from archive_scout.database.repositories import get_or_create_media_target
+            from archive_scout.media.indexer import media_index_state_signature
+            tid=get_or_create_media_target(database,config.targets[0])
+            database.execute("INSERT INTO media_index_state(target_id,extension,year,query_signature,complete,updated_at) VALUES(?,?,?,?,1,'now')",
+                             (tid,'__all__',0,media_index_state_signature(config)))
+            database.commit()
             download_media(config, database, threading.Event())
             database.close()
             media = root / 'media'

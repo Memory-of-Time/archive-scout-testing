@@ -33,6 +33,9 @@ class RoutingRegressionTests(unittest.TestCase):
         signature = cdx_query_signature(config)
         with db:
             upsert_captures(db, [('20010101000000','http://example.net/page.html',mime,'200','digest',120)], target, signature)
+            from archive_scout.cdx.indexer import save_coverage_state
+            save_coverage_state(db, target, signature, config.from_date, config.to_date,
+                                None, True, 1, None)
         keyword_id = get_or_create_keyword_set(db, 'Test', ['needle'])
         scan_id = start_scan_run(db, keyword_id, 'Test run', 1, 'download', {})
         db.commit()

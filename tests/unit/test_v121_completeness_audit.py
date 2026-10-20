@@ -218,6 +218,9 @@ class ConcurrentMediaFilenameTests(unittest.TestCase):
                               'digest':base64.b32encode(hashlib.sha1(content).digest()).decode('ascii').rstrip('='),
                               'length':str(len(content))},'image','.jpg'))
             upsert_media_captures(db,rows,media_target,media_query_signature(cfg))
+            from archive_scout.media.indexer import media_index_state_signature
+            db.execute("INSERT INTO media_index_state(target_id,extension,year,query_signature,complete,updated_at) VALUES(?,?,?,?,1,'now')",
+                       (media_target,'__all__',0,media_index_state_signature(cfg)))
             db.commit()
             class MockHttpClient:
                 def __init__(self,*args,**kwargs):pass

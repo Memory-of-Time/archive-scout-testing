@@ -10,6 +10,7 @@ from archive_scout.config import MediaConfig, ProjectConfig
 from archive_scout.database.connection import open_database
 from archive_scout.database.repositories import record_error, upsert_media_capture
 from archive_scout.media.downloader import retry_media_errors
+from archive_scout.media.indexer import media_query_signature
 
 
 class MediaRetryTests(unittest.TestCase):
@@ -27,7 +28,7 @@ class MediaRetryTests(unittest.TestCase):
                 upsert_media_capture(database, {
                     "original": f"http://example.com/{name}", "timestamp": timestamp,
                     "mimetype": "image/jpeg", "statuscode": "200", "digest": "", "length": "10",
-                }, None, "sig", "image", ".jpg")
+                }, None, media_query_signature(config), "image", ".jpg")
             ids = [int(row[0]) for row in database.execute("SELECT id FROM media_captures ORDER BY id")]
             for media_id in ids:
                 record_error(database, "media_download", "timeout", "timeout", media_capture_id=media_id)

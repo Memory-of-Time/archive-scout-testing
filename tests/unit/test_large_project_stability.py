@@ -21,7 +21,7 @@ from archive_scout.downloads.downloader import prepare_download_rows
 from archive_scout.downloads.retry import retry_error_urls
 from archive_scout.downloads.rate_limit import FixedRateLimiter
 from archive_scout.media.downloader import retry_media_errors
-from archive_scout.media.indexer import _accept_media_rows
+from archive_scout.media.indexer import _accept_media_rows, media_query_signature
 from archive_scout.network.transports import TransportResponse, is_transport_connection_failure
 from archive_scout.events import Stopped
 from archive_scout.utils import utc_now
@@ -435,6 +435,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
     def test_large_media_retry_selection_avoids_sqlite_variable_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            config = ProjectConfig(text_collapse_scope="year", output_dir=root, targets=["example.com/*"], keywords=[]).normalized()
             database = open_database(root)
             try:
                 with database:
@@ -456,7 +457,7 @@ class LargeProjectStabilityTests(unittest.TestCase):
                             for index in range(1200)
                         ),
                         None,
-                        "media-retry-selection",
+                        media_query_signature(config),
                     )
                     media_ids = [int(row[0]) for row in database.execute("SELECT id FROM media_captures ORDER BY id")]
                     database.execute("UPDATE media_captures SET state='error'")
@@ -468,7 +469,6 @@ class LargeProjectStabilityTests(unittest.TestCase):
                         """,
                         ((media_id, now, now) for media_id in media_ids),
                     )
-                config = ProjectConfig(text_collapse_scope="year", output_dir=root, targets=["example.com/*"], keywords=[]).normalized()
                 with patch("archive_scout.media.downloader.download_media") as mocked:
                     retry_media_errors(
                         config, database, threading.Event(), media_capture_ids=media_ids

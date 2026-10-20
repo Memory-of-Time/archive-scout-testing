@@ -37,6 +37,9 @@ class V123AcquisitionIntegrity(unittest.TestCase):
         with db:
             upsert_captures(db, [('20010101000000', original, 'text/html', '200', 'digest', '123')],
                             target, cdx_query_signature(cfg))
+            from archive_scout.cdx.indexer import save_coverage_state
+            save_coverage_state(db, target, cdx_query_signature(cfg), cfg.from_date,
+                                cfg.to_date, None, True, 1, None)
         return cfg, db
 
     def test_all_76_requested_suffixes_skip_text_regardless_of_mime(self):

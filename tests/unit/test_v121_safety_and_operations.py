@@ -55,6 +55,8 @@ class V121RestorationTests(unittest.TestCase):
                     'timestamp': '20010101000000', 'mimetype': 'text/html',
                     'statuscode': '200', 'digest': 'D1', 'length': '50'},
                     t, cdx_query_signature(c))
+                from archive_scout.cdx.indexer import save_coverage_state
+                save_coverage_state(db, t, cdx_query_signature(c), c.from_date, c.to_date, None, True, 1, None)
                 db.commit()
             with patch('archive_scout.operations.index_archive', side_effect=fake_index), \
                  patch('archive_scout.downloads.downloader.HttpClient', FakeClient):

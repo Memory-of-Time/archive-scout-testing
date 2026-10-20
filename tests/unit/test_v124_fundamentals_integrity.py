@@ -124,6 +124,9 @@ class FundamentalsIntegrityTests(unittest.TestCase):
                 upsert_capture(db,{'original':'http://example.org/a.html',
                     'timestamp':'20060101000000','mimetype':'text/html',
                     'statuscode':'200','digest':'','length':'100'},tid,cdx_query_signature(cfg))
+                from archive_scout.cdx.indexer import save_coverage_state
+                save_coverage_state(db, tid, cdx_query_signature(cfg),cfg.from_date,
+                                    cfg.to_date,None,True,1,None)
                 db.commit()
                 user_stop=threading.Event()
                 failure=RateLimitDeferred('HTTP 429 finite wait budget',status=429,waited=0.5)
