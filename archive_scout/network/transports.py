@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import base64
+import zlib
 import os
 import shutil
 import socket
@@ -32,6 +33,10 @@ except ImportError:  # pragma: no cover - exercised in minimal source installs
 
 class BackendUnavailable(RuntimeError):
     pass
+
+
+class PermitRevoked(RuntimeError):
+    """A shared host pause began while awaiting the physical network slot."""
 
 
 class RedirectPolicyError(RuntimeError):
@@ -217,6 +222,76 @@ def _write_limited(
     except Exception:
         destination.unlink(missing_ok=True)
         raise
+
+
+class IncompleteRepresentationError(RuntimeError):
+    """The received bytes do not establish a complete HTTP representation."""
+
+
+def _check_full_range(status: int, headers: dict[str, str]) -> None:
+    """A standalone 206 prefix must never be published as an entire document."""
+    if status != 206:
+        return
+    value = headers.get("content-range", headers.get("Content-Range", ""))
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", value.strip(), re.I)
+    if not match:
+        raise IncompleteRepresentationError("partial HTTP 206 without a verifiable complete range")
+    start, end, total = map(int, match.groups())
+    if start != 0 or end + 1 != total:
+        raise IncompleteRepresentationError("HTTP 206 contains only part of the selected representation")
+
+
+def _decoded_verified_chunks(chunks: Iterable[bytes], headers: dict[str, str],
+                             stop_event: threading.Event) -> Iterable[bytes]:
+    """Bounded raw-wire decoder with gzip/deflate EOF and CRC verification.
+
+    Libraries' convenience decoded iterators may accept an incomplete gzip
+    stream with a valid HTTP Content-Length. Decode raw chunks ourselves so
+    every backend uses the same framing requirements, including multiple
+    concatenated gzip members. Ordinary identity bodies take the fast path.
+    """
+    encoding = headers.get("content-encoding", "identity").split(",", 1)[0].strip().casefold()
+    if encoding not in {"", "identity", "gzip", "x-gzip", "deflate"}:
+        raise IncompleteRepresentationError(f"unsupported HTTP content encoding: {encoding}")
+    advertised = headers.get("content-length", "")
+    expected_wire = int(advertised) if advertised.isdigit() else None
+    received_wire = 0
+    if encoding in {"", "identity"}:
+        for chunk in chunks:
+            if stop_event.is_set():
+                raise Stopped
+            received_wire += len(chunk)
+            yield chunk
+    else:
+        gzip_mode = encoding in {"gzip", "x-gzip"}
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS if gzip_mode else zlib.MAX_WBITS)
+        started = False
+        for chunk in chunks:
+            if stop_event.is_set():
+                raise Stopped
+            received_wire += len(chunk)
+            pending = chunk
+            while pending:
+                started = True
+                try:
+                    expanded = decoder.decompress(pending, 64 * 1024)
+                except zlib.error as exc:
+                    raise IncompleteRepresentationError(f"invalid {encoding} stream: {exc}") from exc
+                if expanded:
+                    yield expanded
+                if decoder.eof:
+                    pending = decoder.unused_data
+                    if pending:
+                        if not gzip_mode:
+                            raise IncompleteRepresentationError("unexpected bytes after deflate stream")
+                        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    continue
+                pending = decoder.unconsumed_tail
+        if not started or not decoder.eof:
+            raise IncompleteRepresentationError(f"incomplete {encoding} stream; end marker or checksum missing")
+    if expected_wire is not None and expected_wire != received_wire:
+        raise IncompleteRepresentationError(
+            f"HTTP Content-Length mismatch: received {received_wire}, expected {expected_wire}")
 
 
 def _partial_metadata_path(destination: Path) -> Path:
@@ -447,6 +522,10 @@ class HttpxBackend:
                     redirect_validator(current_url, destination)
                     current_url = destination
                     continue
+                if response.status_code in {429, 503}:
+                    return TransportResponse(int(response.status_code),
+                        _copy_headers(response.headers.items()), str(response.url), b"",
+                        self.name, time.monotonic()-started)
                 announced = response.headers.get("Content-Length")
                 if announced and announced.isdigit() and int(announced) > max_bytes:
                     raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
@@ -501,9 +580,22 @@ class HttpxBackend:
             announced = response.headers.get("Content-Length")
             if announced and announced.isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
+            fields = _copy_headers(response.headers.items())
+            if not retain_partial:
+                _check_full_range(int(response.status_code), fields)
+            # Error bodies need not be decoded before the 429/503 gate observes
+            # their status. Do not turn a malformed error page into a cooldown.
+            if int(response.status_code) in {429, 503}:
+                destination.unlink(missing_ok=True)
+                return TransportFileResponse(int(response.status_code), fields,
+                    str(response.url), destination, 0, hashlib.sha256(b"").hexdigest(),
+                    b"", self.name, time.monotonic()-started)
             try:
+                raw_chunks = response.iter_raw(64 * 1024) if not retain_partial else response.iter_bytes(64 * 1024)
+                verified_chunks = (_decoded_verified_chunks(raw_chunks, fields, stop_event)
+                                   if not retain_partial else raw_chunks)
                 total, content_hash, preview = _write_limited(
-                    response.iter_bytes(64 * 1024 if retain_partial else 1024 * 1024),
+                    verified_chunks,
                     destination, max_bytes, stop_event,
                     preserve_on_stream_error=retain_partial,
                 )
@@ -623,6 +715,14 @@ class Urllib3Backend:
                 raise RuntimeError(f"too many redirects: {url}")
 
             assert response is not None
+            if int(response.status) in {429, 503}:
+                fields = _copy_headers(response.headers.items())
+                status = int(response.status)
+                response.close()  # never drain an arbitrarily slow error body
+                response.release_conn()
+                response = None
+                return TransportResponse(status, fields, current_url, b"",
+                    self.name, time.monotonic()-started)
             announced = response.headers.get("Content-Length")
             if announced and str(announced).isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
@@ -680,8 +780,19 @@ class Urllib3Backend:
             announced = response.headers.get("Content-Length")
             if announced and str(announced).isdigit() and int(announced) > max_bytes:
                 raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
+            fields = _copy_headers(response.headers.items())
+            _check_full_range(int(response.status), fields)
+            if int(response.status) in {429, 503}:
+                status = int(response.status)
+                response.close()  # do not wait through the error body
+                response.release_conn()
+                response = None
+                return TransportFileResponse(status, fields,
+                    current_url, destination, 0, hashlib.sha256(b"").hexdigest(),
+                    b"", self.name, time.monotonic()-started)
             total, content_hash, preview = _write_limited(
-                response.stream(amt=1024 * 1024, decode_content=True),
+                _decoded_verified_chunks(response.stream(amt=64 * 1024, decode_content=False),
+                                         fields, stop_event),
                 destination, max_bytes, stop_event,
             )
             result = TransportFileResponse(
@@ -849,12 +960,13 @@ class CurlBackend:
         destination.unlink(missing_ok=True)
         with tempfile.TemporaryDirectory(prefix="archive-scout-curl-") as temp_dir:
             header_path = Path(temp_dir) / "headers.txt"
+            raw_path = Path(temp_dir) / "raw-response.bin"
             command = [
-                self.executable, "--disable", "--location", "--compressed", "--http1.1",
+                self.executable, "--disable", "--location", "--http1.1",
                 "--silent", "--show-error", "--connect-timeout", str(int(self.connect_timeout)),
                 "--max-time", str(int(self.connect_timeout + self.read_timeout)),
                 "--max-filesize", str(int(max_bytes)), "--dump-header", str(header_path),
-                "--output", str(destination), "--write-out", "%{http_code}\n%{url_effective}",
+                "--output", str(raw_path), "--write-out", "%{http_code}\n%{url_effective}",
             ]
             if redirect_validator:
                 command.remove("--location")
@@ -879,20 +991,6 @@ class CurlBackend:
                 if proc.returncode == 28:
                     raise TimeoutError(message)
                 raise OSError(message)
-            size = destination.stat().st_size if destination.exists() else 0
-            if size > max_bytes:
-                destination.unlink(missing_ok=True)
-                raise RuntimeError(f"response exceeds {max_bytes:,} bytes")
-            digest = hashlib.sha256()
-            preview = bytearray()
-            with destination.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    if stop_event.is_set():
-                        destination.unlink(missing_ok=True)
-                        raise Stopped
-                    digest.update(chunk)
-                    if len(preview) < 20_000:
-                        preview.extend(chunk[: 20_000 - len(preview)])
             lines = stdout.splitlines()
             status = int(lines[-2]) if len(lines) >= 2 and lines[-2].isdigit() else 0
             final_url = lines[-1] if lines else url
@@ -906,12 +1004,21 @@ class CurlBackend:
                 redirect_validator(url, next_url)
                 return self.download(next_url, headers, destination, max_bytes, stop_event,
                     redirect_validator=redirect_validator, _redirect_depth=_redirect_depth+1)
+            _check_full_range(status, parsed_headers)
+            if status in {429, 503}:
+                return TransportFileResponse(status, parsed_headers, final_url,
+                    destination, 0, hashlib.sha256(b"").hexdigest(), b"", self.name,
+                    time.monotonic()-started)
+            with raw_path.open("rb") as raw:
+                raw_chunks = iter(lambda: raw.read(64 * 1024), b"")
+                size, content_hash, preview = _write_limited(
+                    _decoded_verified_chunks(raw_chunks, parsed_headers, stop_event),
+                    destination, max_bytes, stop_event)
             return TransportFileResponse(
                 status=status, headers=parsed_headers, final_url=final_url,
-                path=destination, bytes_written=size, content_hash=digest.hexdigest(),
-                preview=bytes(preview), backend=self.name, elapsed=time.monotonic() - started,
+                path=destination, bytes_written=size, content_hash=content_hash,
+                preview=preview, backend=self.name, elapsed=time.monotonic() - started,
             )
-
 
 class ResilientTransport:
     """Persistent multi-backend HTTP transport.
@@ -1022,6 +1129,7 @@ class ResilientTransport:
         max_bytes: int,
         stop_event: threading.Event,
         redirect_validator: Callable[[str, str], None] | None = None,
+        permit_checker: Callable[[], bool] | None = None,
     ) -> TransportResponse:
         failures: list[tuple[str, BaseException]] = []
         # An alternate stack is a diagnosis/recovery trial, not three new
@@ -1029,8 +1137,11 @@ class ResilientTransport:
         for attempt_number, name in enumerate(self._ordered_names()[:2]):
             self._await_backend(name, stop_event)
             try:
-                if attempt_number and getattr(self, "fallback_pacer", None) is not None:
-                    self.fallback_pacer.wait(stop_event)
+                pacer = getattr(self, "physical_pacer", None) or getattr(self, "fallback_pacer", None)
+                if pacer is not None and (getattr(self, "physical_pacer", None) is not None or attempt_number):
+                    pacer.wait(stop_event)
+                if permit_checker is not None and not permit_checker():
+                    raise PermitRevoked("host permit expired before the physical request")
                 if stop_event.is_set():
                     raise Stopped
                 backend = self.backends[name]
@@ -1059,6 +1170,11 @@ class ResilientTransport:
                     self.recovery_probes.discard(name)
                     self.condition.notify_all()
                 raise
+            except OSError as exc:
+                if exc.errno in {28, 122} or getattr(exc, "winerror", None) in {39, 112}:
+                    self._backend_result(name, True)
+                    raise
+                failures.append((name, exc))
             except RuntimeError as exc:
                 # Size limits and other deterministic local validation failures
                 # must not be retried using another backend.
@@ -1072,7 +1188,9 @@ class ResilientTransport:
                 failures.append((name, exc))
             last_error = failures[-1][1]
             # A read/first-byte timeout does not establish a broken backend.
-            self._backend_result(name, is_transport_read_timeout(last_error))
+            self._backend_result(name, not is_transport_connection_failure(last_error))
+            if isinstance(last_error, IncompleteRepresentationError):
+                break
             if is_transport_read_timeout(last_error):
                 # Once a server has accepted the connection and stalled while
                 # returning a CDX body, changing Python HTTP stacks normally
@@ -1099,6 +1217,7 @@ class ResilientTransport:
         retain_partial: bool = False,
         expected_digest: str = "",
         redirect_validator: Callable[[str, str], None] | None = None,
+        permit_checker: Callable[[], bool] | None = None,
     ) -> TransportFileResponse:
         failures: list[tuple[str, BaseException]] = []
         names = (["httpx"] if retain_partial and destination.exists() and _partial_metadata_path(destination).is_file()
@@ -1106,8 +1225,11 @@ class ResilientTransport:
         for attempt_number, name in enumerate(names):
             self._await_backend(name, stop_event)
             try:
-                if attempt_number and getattr(self, "fallback_pacer", None) is not None:
-                    self.fallback_pacer.wait(stop_event)
+                pacer = getattr(self, "physical_pacer", None) or getattr(self, "fallback_pacer", None)
+                if pacer is not None and (getattr(self, "physical_pacer", None) is not None or attempt_number):
+                    pacer.wait(stop_event)
+                if permit_checker is not None and not permit_checker():
+                    raise PermitRevoked("host permit expired before the physical request")
                 if stop_event.is_set():
                     raise Stopped
                 backend = self.backends[name]
@@ -1143,6 +1265,11 @@ class ResilientTransport:
                     self.recovery_probes.discard(name)
                     self.condition.notify_all()
                 raise
+            except OSError as exc:
+                if exc.errno in {28, 122} or getattr(exc, "winerror", None) in {39, 112}:
+                    self._backend_result(name, True)
+                    raise
+                failures.append((name, exc))
             except RuntimeError as exc:
                 if str(exc).startswith("response exceeds") or "too many redirects" in str(exc):
                     # Local response-policy refusal means the route answered.
@@ -1161,9 +1288,9 @@ class ResilientTransport:
                     self.recovery_probes.discard(name)
                     self.condition.notify_all()
             else:
-                self._backend_result(name, is_transport_read_timeout(failures[-1][1]))
+                self._backend_result(name, not is_transport_connection_failure(failures[-1][1]))
             last_error = failures[-1][1]
-            if partial_ready or is_transport_read_timeout(last_error):
+            if partial_ready or isinstance(last_error, IncompleteRepresentationError) or is_transport_read_timeout(last_error):
                 # Never overwrite identity-bound prefixes or repeat a remote
                 # read/response failure via a different Python HTTP client.
                 break

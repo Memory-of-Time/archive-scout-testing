@@ -1,5 +1,16 @@
 # Changelog
 
+## Archive Scout v1.2.5 — text acquisition consistency corrections (20 October 2026)
+
+- Verify complete standalone HTTP 206 ranges and compressed-stream checksums/end markers before publishing text payloads across httpx, urllib3 and curl; reject truncated gzip instead of saving its valid-looking prefix.
+- Handle HTTP 429/503 control status before decoding its potentially malformed response body in pooled Python backends.
+- Prevent capture-specific decompression and local pool failures from cooling unrelated backend routes; pace physical request admission after backend recovery and on fallback.
+- Keep text retries eligible through interrupted reservation/attempt counts, and interleave bounded due retries with fresh work without rebuilding the long-lived thread pool.
+- Include overlapping target memberships in saved-body scanning, retry due-time selection and operation-completeness checks; resolve download versus scan errors at the successful operation boundary.
+- Preserve all 76 explicitly selected historical image/video-group extensions in media indexing; correctly parse `.dvr-ms`, accommodate percent-encoded dots in the CDX suffix prefilter, and recognize supported playlist text as a media descriptor rather than an HTML error.
+- Improve declared wide-character text admission, preview-boundary handling, XML encoding declarations, historical `.phtm` Hitlist fallback, and nested ENOSPC/EDQUOT failure propagation.
+- Preserve version 1.2.5 and schema 10. Benchmarks and unresolved limitations are provided in the accompanying patch validation ledger; offline throughput is not a live Wayback guarantee.
+
 ## Archive Scout v1.2.5 — strict acquisition and media integrity
 
 - Require completed selected index evidence before new download requests at operation and downloader entry points.

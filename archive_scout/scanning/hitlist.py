@@ -192,7 +192,7 @@ def _needs_rendered_fallback(
     name = (parsed.path.rsplit("/", 1)[-1] if parsed else "").casefold()
     html_suffixes = (
         ".html", ".htm", ".shtml", ".shtm", ".xhtml", ".xhtm",
-        ".php", ".php3", ".php4", ".php5", ".phtml", ".asp", ".aspx",
+        ".php", ".php3", ".php4", ".php5", ".phtml", ".phtm", ".asp", ".aspx",
         ".jsp", ".cfm", ".cgi", ".dhtml", ".dhtm",
     )
     if name.endswith(html_suffixes):

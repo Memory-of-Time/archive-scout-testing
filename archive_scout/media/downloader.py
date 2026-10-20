@@ -154,6 +154,14 @@ def validate_media_representation(response: dict, *, path_hint: str = "") -> Non
         raise RuntimeError("incomplete_media_length: received bytes differ from Content-Length")
     if not _known_binary_prefix(prefix):
         stripped = prefix.lstrip(b"\xef\xbb\xbf\t\r\n ").lower()
+        # Recognized playlist/metafile sources are legitimate media assets,
+        # even when a historical response labels them text/html. Preserving
+        # the descriptor does not certify any streams it references.
+        from ..classification import MEDIA_DESCRIPTOR_EXTENSIONS, path_extension
+        if path_extension(path_hint) in MEDIA_DESCRIPTOR_EXTENSIONS:
+            if stripped.startswith((b"#extm3u", b"[playlist]", b"<asx", b"<?xml")):
+                if b"<html" not in stripped[:1024] and b"<title>wayback machine" not in stripped[:1024]:
+                    return
         if (stripped.startswith((b"<!doctype html", b"<html", b"<?xml"))
                 or b"<html" in stripped[:512]
                 or b"<title>wayback machine" in stripped[:1024]):
