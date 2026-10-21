@@ -79,6 +79,22 @@ class TextInterpretationFollowthrough(unittest.TestCase):
 
 class RedirectPhysicalPacingTests(unittest.TestCase):
     def test_redirect_hops_all_backends(self):
+        # Measure request-slot admissions rather than server arrival deltas.
+        # The first HTTPX GET can spend time opening a TCP connection *after*
+        # obtaining its slot; redirects often reuse that connection. Server
+        # arrival spacing is therefore not the limiter's scheduling invariant.
+        class RecordingPacer(FixedRateLimiter):
+            def __init__(self, delay):
+                super().__init__(delay)
+                self.admitted_at = []
+
+            def wait(self, stop_event):
+                with self.slot(stop_event):
+                    # The slot reservation timestamp is recorded by the pacer
+                    # under its condition lock, independent of thread wake-up
+                    # or per-backend socket-connection overhead.
+                    self.admitted_at.append(self.next_request - self.delay)
+
         arrivals=[]
         class Handler(BaseHTTPRequestHandler):
             protocol_version='HTTP/1.1'
@@ -105,7 +121,8 @@ class RedirectPhysicalPacingTests(unittest.TestCase):
                     raise
                 try:
                     arrivals.clear()
-                    transport.physical_pacer=FixedRateLimiter(0.018)
+                    pacer=RecordingPacer(0.018)
+                    transport.physical_pacer=pacer
                     with tempfile.TemporaryDirectory() as temp:
                         response=transport.download(
                             f'http://127.0.0.1:{server.server_port}/first',
@@ -114,8 +131,13 @@ class RedirectPhysicalPacingTests(unittest.TestCase):
                         self.assertEqual(response.status,200)
                         self.assertEqual(response.path.read_bytes(),b'consistent')
                     self.assertEqual([p for p,_ in arrivals],['/first','/middle','/last'],mode)
-                    for (_,a),(_,b) in zip(arrivals,arrivals[1:]):
+                    # One physical slot is required for the initial GET and
+                    # one for *each* redirect, on every available backend.
+                    self.assertEqual(len(pacer.admitted_at), len(arrivals), mode)
+                    for a,b in zip(pacer.admitted_at,pacer.admitted_at[1:]):
                         self.assertGreaterEqual(b-a,0.012,mode)
+                    for (_,arrived),admitted in zip(arrivals,pacer.admitted_at):
+                        self.assertGreaterEqual(arrived,admitted,mode)
                 finally:transport.close()
         finally:
             server.shutdown();server.server_close();runner.join(timeout=2)
