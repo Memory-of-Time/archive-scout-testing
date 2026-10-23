@@ -101,7 +101,9 @@ from archive_scout.downloads.downloader import fetch_retain_streamed,capture_pat
 root=Path(sys.argv[1]);phase=sys.argv[2];db=open_database(root)
 cfg=ProjectConfig(root,targets=['example.org/*'],keywords=['needle']).normalized()
 row=db.execute('SELECT * FROM captures').fetchone();body=bytes.fromhex(sys.argv[3])
-path=capture_path(root,1,row['timestamp'],row['original_url']);original=os.replace
+# Match the normalized destination used by fetch_retain_streamed. macOS /var
+# aliases and Windows short paths can otherwise make the exit hook miss it.
+path=capture_path(cfg.output_dir,1,row['timestamp'],row['original_url']);original=os.replace
 def replace(source,destination):
  if Path(destination)==path and phase=='before_publish':os._exit(71)
  original(source,destination)
@@ -115,7 +117,12 @@ with patch('archive_scout.downloads.downloader.os.replace',side_effect=replace):
 if phase=='after_sql':
  with patch('archive_scout.downloads.downloader.discard_receipt',side_effect=lambda path:os._exit(73)):save_success(db,result)
 '''
-        result=subprocess.run([sys.executable,'-c',script,str(self.root),boundary,BODY.hex()],capture_output=True,text=True,timeout=15)
+        # Exercise an alternate spelling on every OS, including Linux where
+        # temporary-directory paths otherwise often happen to be canonical.
+        alias_parent = self.root / 'crash-path-alias'
+        alias_parent.mkdir(exist_ok=True)
+        project_arg = alias_parent / '..'
+        result=subprocess.run([sys.executable,'-c',script,str(project_arg),boundary,BODY.hex()],capture_output=True,text=True,timeout=15)
         self.assertEqual(result.returncode,{'before_publish':71,'after_publish':72,'after_sql':73}[boundary],result.stderr)
         if boundary=='after_sql':
             self.assertEqual(adopt_orphaned_bodies(self.db,self.cfg,threading.Event()),0)
