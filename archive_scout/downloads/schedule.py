@@ -67,3 +67,25 @@ def next_due(database: sqlite3.Connection, config=None, *, respect_selection=Fal
         (SELECT 1 FROM errors e WHERE e.capture_id=c.id AND e.retryable=1
          AND e.resolved=0 AND e.ignored=0)""" + scope + selection, params).fetchone()
     return float(row[0]) if row and row[0] is not None else None
+
+
+def select_due_retry(database: sqlite3.Connection, now: float):
+    """One due, active-scope retry; schedule order bounds work on healthy queues.
+
+    Prepared scope/queue tables belong to the acquisition owner. Keep the exact
+    membership and open-download-error predicates when changing this query.
+    """
+    return database.execute("""SELECT c.* FROM text_retry_schedule sched
+                            CROSS JOIN captures c ON c.id=sched.capture_id
+                            WHERE c.state='error' AND sched.next_eligible_at<=?
+                              AND NOT EXISTS (SELECT 1 FROM archive_scout_download_queue q WHERE q.id=c.id)
+                              AND EXISTS (SELECT 1 FROM errors e INDEXED BY errors_capture_lookup_idx WHERE e.capture_id=c.id
+                                   AND e.operation='download' AND e.retryable=1
+                                   AND e.resolved=0 AND e.ignored=0)
+                              AND EXISTS (SELECT 1 FROM targets t
+                                JOIN archive_scout_download_scopes sc ON sc.pattern=t.pattern
+                                    AND sc.signature=c.query_signature
+                                WHERE t.id=c.target_id OR EXISTS (
+                                  SELECT 1 FROM capture_target_membership m
+                                  WHERE m.capture_id=c.id AND m.target_id=t.id))
+                            ORDER BY sched.next_eligible_at,sched.capture_id LIMIT 1""", (now,)).fetchone()
