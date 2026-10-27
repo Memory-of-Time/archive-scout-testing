@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..retry_budget import NoProgressBudget, CursorHistory, incomplete_retry_message
+
 import concurrent.futures
 from collections import deque
 import hashlib
@@ -24,6 +26,7 @@ from ..cdx.indexer import (
     encode_plan,
     index_windows,
     validate_cdx_scope,
+    record_recovery_event,
     uncovered_index_ranges,
     _reconcile_paged_completion,
     _query_is_oversized,
@@ -748,6 +751,10 @@ def index_direct_media(
     task_queue = deque(tasks)
     due: dict[tuple[str,int],float] = {}
     spent: dict[str,float] = {}
+    accounted = {}
+    retry_budgets = {}
+    cursor_histories = {}
+    retry_deferred = set()
     budget_deferred: set[str] = set()
     while task_queue:
         if stop_event.is_set():
@@ -757,6 +764,8 @@ def index_direct_media(
         if target in budget_deferred:
             continue
         task_key = (target,year)
+        if task_key in retry_deferred:
+            continue
         now = time.monotonic()
         if due.get(task_key,0) > now:
             task_queue.append(task)
@@ -814,10 +823,21 @@ def index_direct_media(
         seen = int(state["seen"] or 0) if state else 0
         error_id = int(state["error_id"]) if state and state["error_id"] else None
         plan = decode_plan(state["resume_key"] if state else None, default_windows)
-        completed += plan.completed
-        total += max(0, plan.planned - len(default_windows))
+        previous_complete, previous_extra = accounted.get(task_key,(0,0))
+        completed += plan.completed - previous_complete
+        extra = max(0, plan.planned - len(default_windows))
+        total += extra - previous_extra
 
+        retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
         while plan.pending:
+            if retry_budget.exhausted:
+                with database:
+                    _save_media_state(database,target_id,year,state_signature,encode_plan(plan),False,seen,error_id)
+                retry_deferred.add(task_key)
+                if callback:
+                    callback(ProgressEvent("media_index_incomplete", incomplete_retry_message(target),
+                             completed, total, {"retain_notice": True}))
+                break
             active = spent.get(target,0.0) + time.monotonic() - turn_started
             if budget_limit is not None and active >= budget_limit:
                 with database:
@@ -860,6 +880,7 @@ def index_direct_media(
             if callback:
                 callback(ProgressEvent("media_index", f"Indexing all selected media for {target} during {label} ({detail})", completed, total))
             request_started = time.monotonic()
+            retry_budget.attempted()
             try:
                 if current.strategy == "paged":
                     received = 0
@@ -871,12 +892,19 @@ def index_direct_media(
                         nonlocal received, accepted_count, changed, write_seconds, seen
                         if result.resume_key is not None:
                             raise TransientRequestError("numbered media page advertised unresolved continuation", splittable=False)
-                        validate_cdx_scope(result.rows,target,current.start,current.end,target_config.cdx_filters,target_config.cdx_match_type)
                         page_received = len(result.rows)
+                        excluded_hosts = validate_cdx_scope(
+                            result.rows,target,current.start,current.end,
+                            target_config.cdx_filters,target_config.cdx_match_type,
+                            discard_adjacent_surt_hosts=True)
                         accepted = _accept_media_rows(result.rows, media)
                         write_started = time.monotonic()
                         with database:
                             changed += upsert_media_captures(database, accepted, target_id, signature)
+                            if excluded_hosts:
+                                record_recovery_event(database, "media_index", "cdx_adjacent_host_excluded",
+                                    f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from media page {result.page}",
+                                    details={"excluded":excluded_hosts,"page":result.page,"raw_rows":page_received})
                             # No page is accepted without its durable ledger.
                             database.execute("""INSERT OR REPLACE INTO media_index_pages
                                 (target_id,year,state_signature,window_start,window_end,layout_signature,page,row_count,updated_at)
@@ -887,6 +915,7 @@ def index_direct_media(
                             seen += page_received
                             _save_media_state(database,target_id,year,state_signature,
                                               encode_plan(plan),False,seen,error_id)
+                        retry_budget.progress()
                         completed_pages.add(int(result.page))
                         write_seconds += time.monotonic() - write_started
                         received += page_received
@@ -916,6 +945,7 @@ def index_direct_media(
                             connection_failure_streak = 0
                             transient_failure_streak = 0
                         if batch.finished and _reconcile_paged_completion(current, completed_pages):
+                            retry_budget.progress()
                             plan.pending.pop(0)
                             plan.completed += 1
                             completed += 1
@@ -983,7 +1013,7 @@ def index_direct_media(
                     error_id = _defer_media_window(
                         target_config, database, plan, current, target_id, year, state_signature,
                         seen, error_id, target, label, failure_exc, completed, total,
-                        stop_event, callback, yield_to_other_tasks=bool(task_queue),
+                        stop_event, callback, yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                     )
                     if task_queue:
                         due[task_key] = time.monotonic() + min(30.0,_wait_seconds(target_config,current.failures))
@@ -994,11 +1024,18 @@ def index_direct_media(
                 rows, finished, next_cursor = _request_media_resume(
                     target_config, client, target, current, extensions
                 )
-                validate_cdx_scope(rows,target,current.start,current.end,target_config.cdx_filters,target_config.cdx_match_type)
+                history_key = (task_key,current.start,current.end)
+                history = cursor_histories.setdefault(history_key, CursorHistory())
+                history.check(next_cursor)
+                raw_received = len(rows)
+                excluded_hosts = validate_cdx_scope(
+                    rows,target,current.start,current.end,
+                    target_config.cdx_filters,target_config.cdx_match_type,
+                    discard_adjacent_surt_hosts=True)
                 connection_failure_streak = 0
                 transient_failure_streak = 0
                 request_seconds = time.monotonic() - request_started
-                received = len(rows)
+                received = raw_received
                 accepted = _accept_media_rows(rows, media)
                 accepted_count = len(accepted)
                 write_started = time.monotonic()
@@ -1008,6 +1045,10 @@ def index_direct_media(
                 try:
                     with database:
                         changed = upsert_media_captures(database, accepted, target_id, signature)
+                        if excluded_hosts:
+                            record_recovery_event(database, "media_index", "cdx_adjacent_host_excluded",
+                                f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from media continuation",
+                                details={"excluded":excluded_hosts,"raw_rows":received})
                         seen += received
                         current.failures = 0
                         if next_cursor is not None:
@@ -1028,12 +1069,17 @@ def index_direct_media(
                     if finished and (not plan.pending or plan.pending[0] is not current):
                         plan.pending.insert(0, current)
                     raise
+                history.committed(next_cursor)
+                if finished:
+                    cursor_histories.pop(history_key, None)
+                retry_budget.progress()
                 write_seconds = time.monotonic() - write_started
                 if callback:
                     callback(
                         ProgressEvent(
                             "media_index",
-                            f"{target} {label}: received {received:,}, accepted {accepted_count:,}, stored {changed:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                            f"{target} {label}: received {received:,}, accepted {accepted_count:,}, stored {changed:,} — network {request_seconds:.1f}s, database {write_seconds:.2f}s"
+                            + (f"; excluded {excluded_hosts:,} adjacent out-of-scope host rows" if excluded_hosts else ""),
                             completed,
                             total,
                         )
@@ -1076,7 +1122,7 @@ def index_direct_media(
                         due[task_key] = time.monotonic() + max(1.0, wait)
                         task_queue.append(task)
                         break
-                    stop_event.wait(wait)
+                    stop_event.wait(retry_budget.wait_seconds(wait) if not retry_budget.exhausted else 0)
                     if stop_event.is_set():
                         raise Stopped
                     current.next_eligible_at = 0.0
@@ -1089,7 +1135,7 @@ def index_direct_media(
                 error_id = _defer_media_window(
                     target_config, database, plan, current, target_id, year, state_signature,
                     seen, error_id, target, label, exc, completed, total, stop_event, callback,
-                    yield_to_other_tasks=bool(task_queue),
+                    yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                 )
                 if task_queue:
                     due[task_key] = time.monotonic() + min(30.0,_wait_seconds(target_config,current.failures))
@@ -1140,8 +1186,9 @@ def index_direct_media(
                     )
                     _save_media_state(database, target_id, year, state_signature, encode_plan(plan), False, seen, error_id)
                 raise
+        accounted[task_key] = (plan.completed,max(0,plan.planned-len(default_windows)))
         spent[target] = spent.get(target,0.0) + time.monotonic()-turn_started
-    return bool(budget_deferred)
+    return bool(budget_deferred or retry_deferred)
 
 
 def _discover_document_media(
@@ -1533,24 +1580,52 @@ def index_embedded_media(
                     ))
                 submit_available()
 
-def _complete_embedded_media(config, database, client, stop_event, callback, signature, *, external_only=False):
+def _complete_embedded_media(config, database, client, stop_event, callback, signature, *, external_only=False, acquire_ready=False):
     """Retry lookup turns without repeating saved-document discovery each turn."""
     turn = 0
+    budget = NoProgressBudget(config)
+    def progress_token():
+        # Attempt counters and error timestamps are not successful progress.
+        row = database.execute("SELECT SUM(state='indexed'),"
+            "SUM(state='unavailable' AND COALESCE(last_error,'')='') FROM media_discovery_queue "
+            "WHERE query_signature=?", (signature,)).fetchone()
+        captures = database.execute('SELECT COUNT(*) FROM media_captures WHERE query_signature=?',
+                                    (signature,)).fetchone()[0]
+        return (int(captures), *tuple(row))
+    previous = progress_token()
     while True:
+        if stop_event.is_set():
+            raise Stopped
+        budget.attempted()
         try:
             index_embedded_media(config, database, client, stop_event, callback, signature,
                                  external_only=external_only, discover_documents=turn == 0)
         except RateLimitDeferred:
             if not config.network.persistent_retries:
-                raise
-        if not config.network.persistent_retries or not database.execute(
+                break
+        current = progress_token()
+        if current != previous:
+            budget.progress()
+        previous = current
+        remaining = database.execute(
             "SELECT 1 FROM media_discovery_queue WHERE query_signature=? AND state IN ('pending','error') LIMIT 1",
-            (signature,)).fetchone():
+            (signature,)).fetchone()
+        if remaining and acquire_ready:
+            from .downloader import download_media
+            download_media(config, database, stop_event, callback,
+                media_signature=signature, allow_partial_inventory=True)
+        if not remaining or not config.network.persistent_retries:
             return
-        wait = min(config.network.retry_max_seconds,
-                   config.network.retry_base_seconds * 2**min(turn, 12))
+        if budget.exhausted:
+            if callback:
+                callback(ProgressEvent('media_index_incomplete', incomplete_retry_message('Embedded lookups'),
+                                       detail={'retain_notice': True}))
+            return
+        wait = budget.wait_seconds(min(config.network.retry_max_seconds,
+                   config.network.retry_base_seconds * 2**min(turn, 12)))
         if callback:
-            callback(ProgressEvent("media_embed", f"Embedded lookup checkpoints retained; automatic retry in {wait:.1f}s. Media acquisition remains gated."))
+            callback(ProgressEvent("media_embed", f"Embedded lookup checkpoints retained; retry in {wait:.1f}s "
+                f"(no-progress budget {budget.attempts}/{budget.limit}). Ready media is independent of unresolved URLs."))
         if stop_event.wait(wait):
             raise Stopped
         turn += 1
@@ -1561,6 +1636,7 @@ def index_external_embedded_media(
     database: sqlite3.Connection,
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None = None,
+    acquire_ready: bool = False,
 ) -> str:
     """Index only external media URLs found after saved text pages have been scanned."""
     config = config.normalized()
@@ -1604,10 +1680,13 @@ def index_external_embedded_media(
     )
     try:
         _complete_embedded_media(
-            config, database, client, stop_event, callback, signature, external_only=True
+            config, database, client, stop_event, callback, signature, external_only=True, acquire_ready=acquire_ready
         )
-        from ..coverage import require_embedded_coverage
-        require_embedded_coverage(database, config, signature)
+        from ..coverage import require_embedded_coverage, IndexCoveragePending
+        try:
+            require_embedded_coverage(database, config, signature)
+        except IndexCoveragePending:
+            return signature
         _apply_snapshot_strategy(database, signature, config.media.snapshot_strategy)
         return signature
     finally:
@@ -1619,6 +1698,7 @@ def index_media(
     database: sqlite3.Connection,
     stop_event: threading.Event,
     callback: Callable[[ProgressEvent], None] | None = None,
+    acquire_ready: bool = False,
 ) -> str:
     config = config.normalized()
     media = config.media.normalized()
@@ -1664,7 +1744,7 @@ def index_media(
     )
     try:
         deferred = index_direct_media(config, database, client, stop_event, callback, signature, state_signature)
-        _complete_embedded_media(config, database, client, stop_event, callback, signature)
+        _complete_embedded_media(config, database, client, stop_event, callback, signature, acquire_ready=acquire_ready)
         from ..coverage import media_coverage_gaps, require_embedded_coverage, IndexCoveragePending
         pending = bool(media_coverage_gaps(database, config))
         try:

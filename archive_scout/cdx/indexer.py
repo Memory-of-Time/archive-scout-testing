@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..retry_budget import NoProgressBudget, CursorHistory, incomplete_retry_message
+
 import calendar
 import re
 import fnmatch
@@ -16,7 +18,7 @@ from typing import Callable
 from ..config import ProjectConfig
 from ..database.repositories import get_or_create_target, record_error, record_site_issue, upsert_captures
 from ..downloads.rate_limit import SharedFixedRateLimiter, shared_host_gate
-from ..events import ConnectivityPaused, IndexResponsePaused, ProgressEvent, Stopped
+from ..events import ProgressEvent, Stopped
 from ..site_status import host_from_url, site_issue_message
 from ..utils import utc_now
 from .client import HttpClient, MalformedCDXResponse, PermanentRequestError, RateLimitDeferred, TransientRequestError, is_timeout_error, request_cdx_rows, request_cdx_json_payload, summarize_cdx_error
@@ -752,13 +754,6 @@ def _defer_transient_window(
             plan.pending.append(plan.pending.pop(0))
         persist_task_state(encode_plan(plan), False, seen, error_id)
 
-    if not network.persistent_retries and current.failures >= max(3, config.retries):
-        raise TransientRequestError(
-            f"transient retry limit reached for {window_label(current.start, current.end)}: {exc}",
-            timed_out=is_timeout_error(exc),
-            splittable=False,
-        ) from exc
-
     threshold = network.failure_pause_threshold
     # Transient outages are not a terminal operation state. Every window remains
     # in the checkpoint and will be revisited automatically until stopped.
@@ -862,10 +857,25 @@ def _resolve_strategy(current: PendingWindow, config: ProjectConfig, target: str
         current.page_blocks = network.page_blocks
 
 
+def _is_adjacent_surt_host(hostname: str, suffix: str) -> bool:
+    """Recognize only adjacent URL-key prefix spill, not arbitrary other sites.
+
+    Certain CDX wildcard searches cross a SURT prefix boundary: querying
+    *.liveleak.com can yield www.liveleak+quran.com. Those records must not
+    be inserted or allowed to poison an otherwise verified continuation page.
+    """
+    label, dot, remainder = suffix.partition(".")
+    if not (dot and label and remainder and hostname.endswith("." + remainder)):
+        return False
+    adjacent_label = hostname[:-(len(remainder) + 1)].rsplit(".", 1)[-1]
+    return adjacent_label.startswith(label) and adjacent_label != label
+
+
 def validate_cdx_scope(
     rows: list, target: str, start: str, end: str,
     filters: list[str], match_type: str = "",
-) -> None:
+    *, discard_adjacent_surt_hosts: bool = False,
+) -> int | None:
     """Reject *provable* CDX scope contradictions, not valid IA canonicalization.
 
     The service implements host/domain/prefix/exact and URL-key canonicalization.
@@ -873,6 +883,13 @@ def validate_cdx_scope(
     root hosts and genuine subdomain results after successful HTTP 200 replies.
     Only enforce inexpensive, demonstrable hostname boundaries and explicitly
     unambiguous literal paths. Server regexes remain server-owned semantics.
+
+    By default this is strictly rejecting. An indexing caller may opt into
+    discarding only a recognized adjacent SURT host spill from a successfully
+    parsed CDX response. This does not change the continuation or terminal
+    validation, and date/status/path/other-host contradictions remain fatal.
+    The supplied list is compacted in place (no second 100k-row allocation).
+    Returns the number of excluded adjacent-host rows.
     """
     require_200 = any(str(v).casefold() == "statuscode:200" for v in filters)
     raw = str(target).strip()
@@ -894,6 +911,8 @@ def validate_cdx_scope(
     # Never assume Java's default SURT matching equals a Python glob.
     path = raw_without_scheme.partition("/")[2]
     simple_path = (mode in {"prefix", "exact"} and path and not any(ch in path for ch in "*?[]%"))
+    write_at = 0
+    discarded = 0
     for row in rows:
         timestamp, url, _mime, status, _digest, _length = row
         if (len(timestamp) != 14 or not timestamp.isascii() or not timestamp.isdigit()
@@ -927,6 +946,10 @@ def validate_cdx_scope(
             host_ok = fnmatch.fnmatchcase(hostname, host_pattern) or (
                 host_pattern.startswith("*.") and fnmatch.fnmatchcase(hostname, host_pattern[2:]))
         if not host_ok:
+            if (discard_adjacent_surt_hosts and suffix and target_port is None
+                    and _is_adjacent_surt_host(hostname, suffix)):
+                discarded += 1
+                continue
             raise MalformedCDXResponse(
                 f"CDX local scope check rejected unrelated host {hostname!r} for target {target!r} "
                 f"(matchType={mode or 'implicit'}); this is not evidence of an IA outage",
@@ -937,6 +960,19 @@ def validate_cdx_scope(
             requested = path.casefold()
             if not (candidate.startswith(requested) if mode == "prefix" else candidate == requested):
                 raise MalformedCDXResponse("CDX returned a capture outside the selected literal path", splittable=False)
+        if discarded:
+            rows[write_at] = row
+        write_at += 1
+    if discarded:
+        if write_at == 0:
+            # A wholly foreign nonempty response could indicate a misrouted
+            # request, not merely harmless prefix spill. Do not checkpoint it
+            # as terminal or resume progress without any target evidence.
+            raise MalformedCDXResponse(
+                "CDX returned only adjacent out-of-scope hosts; no in-scope "
+                "capture confirmed this continuation", splittable=False)
+        del rows[write_at:]
+    return discarded if discard_adjacent_surt_hosts else None
 
 
 def cdx_response_budget(page_size: int) -> int:
@@ -1196,6 +1232,9 @@ def index_archive(
     task_queue = deque(tasks)
     due: dict[tuple[str, str, int | None, str, str], float] = {}
     spent: dict[str, float] = {}
+    retry_budgets = {}
+    cursor_histories = {}
+    retry_deferred = set()
     budget_deferred: set[str] = set()
     accounted: dict[tuple, tuple[int, int]] = {}
     try:
@@ -1205,7 +1244,7 @@ def index_archive(
             task = task_queue.popleft()
             target, target_config, target_id, state_kind, year, task_start, task_end, default_windows, signature = task
             task_key = (target, state_kind, year, task_start, task_end)
-            if target in budget_deferred:
+            if target in budget_deferred or task_key in retry_deferred:
                 continue
             ready = due.get(task_key, 0.0)
             now = time.monotonic()
@@ -1301,7 +1340,15 @@ def index_archive(
             total_windows += extra - counted_extra
             accounted[task_key] = (plan.completed, extra)
 
+            retry_budget = retry_budgets.setdefault(task_key, NoProgressBudget(target_config))
             while plan.pending:
+                if retry_budget.exhausted:
+                    with database:
+                        persist_task_state(encode_plan(plan), False, seen, error_id)
+                    retry_deferred.add(task_key)
+                    emit(callback, ProgressEvent("index_deferred", incomplete_retry_message(target),
+                         completed_windows, total_windows, {"retain_notice": True}))
+                    break
                 active = spent.get(target, 0.0) + (time.monotonic() - turn_started)
                 if budget_limit is not None and active >= budget_limit:
                     with database:
@@ -1363,6 +1410,7 @@ def index_archive(
                     },
                 ))
                 request_started = time.monotonic()
+                retry_budget.attempted()
                 try:
                     if current.strategy == "paged":
                         received = 0
@@ -1391,14 +1439,22 @@ def index_archive(
                                     "numbered CDX page returned an unexpected continuation; preserving incomplete coverage",
                                     splittable=False,
                                 )
-                            validate_cdx_scope(result.rows, target, current.start, current.end, target_config.cdx_filters, target_config.cdx_match_type)
                             page_received = len(result.rows)
+                            excluded_hosts = validate_cdx_scope(
+                                result.rows, target, current.start, current.end,
+                                target_config.cdx_filters, target_config.cdx_match_type,
+                                discard_adjacent_surt_hosts=True,
+                            )
                             write_started = time.monotonic()
                             # Capture rows and their page checkpoint are one
                             # transaction: after a power loss the page is either
                             # wholly eligible for retry or already known complete.
                             with database:
                                 changed += upsert_captures(database, result.rows, target_id, signature)
+                                if excluded_hosts:
+                                    record_recovery_event(database, "index", "cdx_adjacent_host_excluded",
+                                        f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from CDX page {result.page}",
+                                        details={"excluded": excluded_hosts, "page": result.page, "raw_rows": page_received})
                                 database.execute(
                                     """INSERT INTO index_pages(query_signature,target_id,window_start,window_end,page,row_count,status,layout_signature,updated_at)
                                        VALUES(?,?,?,?,?,?,'complete',?,?)
@@ -1407,6 +1463,7 @@ def index_archive(
                                     (signature, target_id, current.start, current.end, int(result.page), page_received,
                                      cdx_layout_signature(target_config, current.start, current.end, 'paged', current.page_blocks), utc_now()),
                                 )
+                            retry_budget.progress()
                             completed_pages.add(int(result.page))
                             write_seconds += time.monotonic() - write_started
                             received += page_received
@@ -1454,6 +1511,7 @@ def index_archive(
                                 if not _reconcile_paged_completion(current, completed_pages):
                                     batch.finished = False
                                 else:
+                                    retry_budget.progress()
                                     plan.pending.pop(0)
                                     plan.completed += 1
                                     completed_windows += 1
@@ -1533,11 +1591,10 @@ def index_archive(
                                     details={"pages": current.retry_pages[:100], "attempts": highest_page_failures},
                                 )
                                 persist_task_state(encode_plan(plan), False, seen, error_id)
-                            raise IndexResponsePaused(
-                                f"{len(current.retry_pages)} Timemap page(s) remained unavailable after "
-                                f"{highest_page_failures} attempts. Successful pages were preserved and only the exact "
-                                "failed page queue was saved for Resume."
-                            ) from failure_exc
+                            retry_deferred.add(task_key)
+                            emit(callback, ProgressEvent('index_deferred', incomplete_retry_message(target),
+                                 completed_windows,total_windows,{'retain_notice':True}))
+                            break
                         with database:
                             record_recovery_event(
                                 database, "index", "transient_page_retry",
@@ -1568,7 +1625,7 @@ def index_archive(
                         error_id = _defer_transient_window(
                             target_config, database, plan, current, persist_task_state, seen, error_id,
                             failure_exc, callback, completed_windows, total_windows, stop_event,
-                            yield_to_other_tasks=bool(task_queue),
+                            yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                         )
                         if task_queue:
                             due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1578,12 +1635,21 @@ def index_archive(
                         continue
 
                     rows, finished, next_cursor = _request_resume(client, target_config, target, current)
-                    validate_cdx_scope(rows, target, current.start, current.end, target_config.cdx_filters, target_config.cdx_match_type)
+                    history_key = (task_key,current.start,current.end)
+                    history = cursor_histories.setdefault(history_key, CursorHistory())
+                    history.check(next_cursor)
+                    raw_received = len(rows)
+                    excluded_hosts = validate_cdx_scope(
+                        rows, target, current.start, current.end,
+                        target_config.cdx_filters, target_config.cdx_match_type,
+                        discard_adjacent_surt_hosts=True,
+                    )
                     connection_failure_streak = 0
                     transient_failure_streak = 0
                     request_seconds = time.monotonic() - request_started
-                    received = len(rows)
+                    received = raw_received
                     write_started = time.monotonic()
+                    upsert_seconds = checkpoint_seconds = commit_seconds = 0.0
                     # Roll back in-memory checkpoint changes if the SQLite write
                     # or commit fails. Otherwise an error handler might persist a
                     # cursor that skips an uncommitted CDX response.
@@ -1594,7 +1660,10 @@ def index_archive(
                     old_completed_windows, old_error_id = completed_windows, error_id
                     try:
                         with database:
+                            upsert_started = time.monotonic()
                             changed = upsert_captures(database, rows, target_id, signature)
+                            upsert_seconds = time.monotonic() - upsert_started
+                            checkpoint_started = time.monotonic()
                             seen += received
                             current.failures = 0
                             current.gateway_504_failures = 0
@@ -1607,9 +1676,15 @@ def index_archive(
                                 completed_windows += 1
                             complete = not plan.pending
                             persist_task_state(encode_plan(plan), complete, seen, None if complete else error_id)
+                            if excluded_hosts:
+                                record_recovery_event(database, "index", "cdx_adjacent_host_excluded",
+                                    f"{target} {label}: discarded {excluded_hosts} adjacent out-of-scope host rows from CDX continuation",
+                                    details={"excluded": excluded_hosts, "raw_rows": received})
                             if error_id:
                                 database.execute("UPDATE errors SET resolved=1,last_seen=? WHERE id=?", (utc_now(), error_id))
                                 error_id = None
+                            checkpoint_seconds = time.monotonic() - checkpoint_started
+                        commit_seconds = time.monotonic() - write_started - upsert_seconds - checkpoint_seconds
                     except BaseException:
                         seen, current.resume_key = old_seen, old_cursor
                         current.failures, plan.completed = old_failures, old_completed
@@ -1619,17 +1694,26 @@ def index_archive(
                         if finished and (not plan.pending or plan.pending[0] is not current):
                             plan.pending.insert(0, current)
                         raise
+                    history.committed(next_cursor)
+                    if finished:
+                        cursor_histories.pop(history_key, None)
+                    retry_budget.progress()
                     write_seconds = time.monotonic() - write_started
                     emit(
                         callback,
                         ProgressEvent(
                             "index",
-                            f"{target} {label}: received {received:,}, stored {changed:,}, seen {seen:,}; network/parse/scope {request_seconds:.1f}s, database {write_seconds:.2f}s",
+                            f"{target} {label}: received {received:,}, stored {changed:,}, seen {seen:,}; "
+                            f"network/parse/scope {request_seconds:.1f}s, database {write_seconds:.2f}s "
+                            f"(upsert {upsert_seconds:.2f}s, state {checkpoint_seconds:.2f}s, commit {commit_seconds:.2f}s)"
+                            + (f"; excluded {excluded_hosts:,} adjacent out-of-scope host rows" if excluded_hosts else ""),
                             completed_windows,
                             total_windows,
                             {"retain_notice": True, "received": received, "stored": changed,
                              "seen": seen, "request_parse_scope_seconds": request_seconds,
-                             "database_seconds": write_seconds},
+                             "database_seconds": write_seconds, "upsert_seconds": upsert_seconds,
+                             "checkpoint_seconds": checkpoint_seconds, "commit_seconds": commit_seconds,
+                             "out_of_scope_excluded": excluded_hosts},
                         ),
                     )
                     # Do not retain the previous 50k-row page while the next
@@ -1645,7 +1729,7 @@ def index_archive(
                     error_id = _defer_transient_window(
                         target_config, database, plan, current, persist_task_state, seen, error_id,
                         exc, callback, completed_windows, total_windows, stop_event,
-                        yield_to_other_tasks=bool(task_queue),
+                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                     )
                     if task_queue:
                         due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1694,7 +1778,7 @@ def index_archive(
                             task_queue.append(task)
                             yielded = True
                             break
-                        stop_event.wait(wait_seconds)
+                        stop_event.wait(retry_budget.wait_seconds(wait_seconds) if not retry_budget.exhausted else 0)
                         if stop_event.is_set():
                             raise Stopped
                         current.next_eligible_at = 0.0
@@ -1730,7 +1814,7 @@ def index_archive(
                         error_id = _defer_transient_window(
                             target_config, database, plan, current, persist_task_state,
                             seen, error_id, exc, callback, completed_windows,
-                            total_windows, stop_event, yield_to_other_tasks=bool(task_queue),
+                            total_windows, stop_event, yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                         )
                         if task_queue:
                             due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1765,7 +1849,7 @@ def index_archive(
                     error_id = _defer_transient_window(
                         target_config, database, plan, current, persist_task_state, seen, error_id,
                         exc, callback, completed_windows, total_windows, stop_event,
-                        yield_to_other_tasks=bool(task_queue),
+                        yield_to_other_tasks=bool(task_queue) or retry_budget.exhausted,
                     )
                     if task_queue:
                         due[task_key] = time.monotonic() + transient_backoff(target_config, current.failures)
@@ -1827,7 +1911,7 @@ def index_archive(
                 emit(callback, ProgressEvent("index", f"Finished indexed inventory for {target} • {scope_label}", completed_windows, total_windows, {"phase": "inventory complete", "target": target, "scope": scope_label}))
     finally:
         client.close()
-    return bool(budget_deferred)
+    return bool(budget_deferred or retry_deferred)
 
 def _request_paged_count(
     client: HttpClient,
